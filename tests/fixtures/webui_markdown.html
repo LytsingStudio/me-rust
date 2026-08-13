@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>ME WebUI Markdown visual fixture</title>
+  <link rel="stylesheet" href="../../src/webui/style.css">
+  <style>
+    body { height: auto; padding: 30px; }
+    main { width: min(920px, 100%); margin: 0 auto; }
+    section { margin: 0 0 24px; padding: 22px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); }
+    section > h2 { margin: 0 0 16px; color: var(--dim); font: 700 11px ui-monospace, monospace; letter-spacing: .08em; text-transform: uppercase; }
+  </style>
+</head>
+<body>
+  <main id="cases"></main>
+  <script src="../../src/webui/vendor/markdown-it.min.js"></script>
+  <script src="../../src/webui/markdown.js"></script>
+  <script>
+    const cases = [
+      ["Loose ordered list", "1. 第一项包含较长说明，用于确认松散列表仍保持连续编号。\n\n1. 第二项同样由 `1.` 开始，但浏览器应显示为 2。\n\n1. 第三项包含 **粗体** 和 *强调*。\n\n1. 第四项包含 [安全链接](https://example.com)。\n\n1. 第五项结束列表。"],
+      ["Nested and task lists", "3. 从三开始\n   - 无序子项\n   - [ ] 待办子项\n     1. 深层第一项\n     2. 深层第二项\n4. 后续项\n\n- [x] 已完成\n- [X] 也已完成"],
+      ["Headings and inline", "# 一级标题\n\n## 二级标题\n\n### 三级标题\n\n普通文本包含 ***粗斜体***、~~删除线~~、`inline code`、转义的 \\*星号\\* 与中文 👩🏽‍💻。"],
+      ["Quotes and breaks", "> 外层引用第一段\n>\n> > 嵌套引用\n>\n> 外层引用第二段  \n> 强制换行\n\n---\n\n分割线后的段落。"],
+      ["Table", "| 左对齐 | 居中 | 右对齐 |\n| :--- | :---: | ---: |\n| a\\|b | `c\\|d` | **123** |\n| 中文 | 👩🏽‍💻 | 9,999 |"],
+      ["Long fence", "````rust\nfn main() {\n    println!(\"``` 不是结束围栏\");\n    println!(\"<b>不会成为 HTML</b>\");\n}\n````"],
+      ["Start number and paragraphs", "7. 第七项\n8. 第八项有两个段落。\n\n   第二个段落仍属于第八项。\n9. 第九项\n\n结尾段落。"],
+      ["Incomplete streaming input", "未闭合的 **粗体和 [链接](https://example.com\n\n```text\n尚未闭合的代码围栏\n<unsafe>"],
+    ];
+    const root = document.getElementById("cases");
+    for (const [title, source] of cases) {
+      const section = document.createElement("section");
+      const label = document.createElement("h2");
+      const content = document.createElement("div");
+      label.textContent = title;
+      content.className = "markdown";
+      content.innerHTML = MeMarkdown.render(source);
+      section.append(label, content);
+      root.append(section);
+    }
+    document.documentElement.dataset.renderedCases = String(cases.length);
+  </script>
+</body>
+</html>

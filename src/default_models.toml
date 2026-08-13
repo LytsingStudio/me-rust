@@ -1,0 +1,157 @@
+version = 1
+default_model = "cometapi-deepseek-v4-flash"
+
+[[models]]
+name = "cometapi-claude-opus-5"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "claude-opus-5"
+source_url = "https://www.cometapi.com/what-is-claude-opus-5/"
+timeout_seconds = 120
+capabilities = { context_window = 1000000, max_output_tokens = 131072, input_modalities = ["text", "image", "document"], output_modalities = ["text"], reasoning_modes = ["adaptive"], reasoning_efforts = ["low", "medium", "high", "xhigh", "max"], tools = true, streaming = true }
+parameters = { max_tokens = 131072 }
+effort_parameters = { low = { effort = "low" }, medium = { effort = "medium" }, high = { effort = "high" }, xhigh = { effort = "xhigh" }, max = { effort = "max" } }
+
+[[models]]
+name = "cometapi-claude-opus-4-8"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "claude-opus-4-8"
+source_url = "https://www.cometapi.com/models/anthropic/claude-opus-4-8/"
+timeout_seconds = 120
+capabilities = { context_window = 1000000, max_output_tokens = 131072, input_modalities = ["text", "image", "document"], output_modalities = ["text"], reasoning_modes = ["adaptive"], reasoning_efforts = ["low", "medium", "high", "xhigh", "max"], tools = true, streaming = true }
+parameters = { max_tokens = 131072 }
+effort_parameters = { low = { effort = "low" }, medium = { effort = "medium" }, high = { effort = "high" }, xhigh = { effort = "xhigh" }, max = { effort = "max" } }
+
+[[models]]
+name = "cometapi-kimi-k3"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "kimi-k3"
+source_url = "https://www.cometapi.com/how-to-use-kimi-k3-api/"
+timeout_seconds = 120
+capabilities = { context_window = 1048576, max_output_tokens = 1048576, input_modalities = ["text", "image"], output_modalities = ["text"], reasoning_modes = ["always"], reasoning_efforts = ["max"], tools = true, streaming = true }
+parameters = { max_completion_tokens = 1048576 }
+effort_parameters = { max = { reasoning_effort = "max" } }
+
+[[models]]
+name = "cometapi-kimi-k2.7-code"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "kimi-k2.7-code"
+source_url = "https://www.cometapi.com/how-to-use-kimi-k2-7-code-api/"
+timeout_seconds = 120
+capabilities = { context_window = 262144, max_output_tokens = 262144, input_modalities = ["text", "image", "video"], output_modalities = ["text"], reasoning_modes = ["always"], reasoning_efforts = ["max"], tools = true, streaming = true }
+parameters = { max_completion_tokens = 262144 }
+
+[[models]]
+name = "cometapi-minimax-m3"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "minimax-m3"
+source_url = "https://www.cometapi.com/models/minimax/minimax-m3/"
+timeout_seconds = 120
+capabilities = { context_window = 1000000, max_output_tokens = 32768, input_modalities = ["text", "image", "video"], output_modalities = ["text"], reasoning_modes = ["none", "thinking"], reasoning_efforts = ["none", "high"], tools = true, streaming = true }
+parameters = { max_completion_tokens = 32768 }
+effort_parameters = { none = { thinking = { type = "disabled" } }, high = { thinking = { type = "enabled" }, reasoning_effort = "high" } }
+
+[[models]]
+name = "cometapi-deepseek-v4-pro"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "deepseek-v4-pro"
+source_url = "https://www.cometapi.com/models/deepseek/deepseek-v4/"
+timeout_seconds = 120
+capabilities = { context_window = 1000000, max_output_tokens = 393216, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["none", "thinking"], reasoning_efforts = ["none", "high", "max"], tools = true, streaming = true }
+parameters = { max_tokens = 393216 }
+effort_parameters = { none = { thinking = { type = "disabled" } }, high = { thinking = { type = "enabled" }, reasoning_effort = "high" }, max = { thinking = { type = "enabled" }, reasoning_effort = "max" } }
+
+[[models]]
+name = "cometapi-deepseek-v4-flash"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "deepseek-v4-flash"
+source_url = "https://www.cometapi.com/models/deepseek/deepseek-v4-flash/"
+timeout_seconds = 120
+capabilities = { context_window = 1000000, max_output_tokens = 393216, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["none", "thinking", "thinking-max"], reasoning_efforts = ["none", "high", "max"], tools = true, streaming = true }
+parameters = { max_tokens = 393216 }
+effort_parameters = { none = { thinking = { type = "disabled" } }, high = { thinking = { type = "enabled" }, reasoning_effort = "high" }, max = { thinking = { type = "enabled" }, reasoning_effort = "max" } }
+
+[[models]]
+name = "cometapi-claude-sonnet-4-6"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "claude-sonnet-4-6"
+source_url = "https://www.cometapi.com/models/anthropic/claude-sonnet-4-6/"
+timeout_seconds = 120
+capabilities = { context_window = 1000000, max_output_tokens = 131072, input_modalities = ["text", "image", "document"], output_modalities = ["text"], reasoning_modes = ["adaptive"], reasoning_efforts = ["low", "medium", "high", "max"], tools = true, streaming = true }
+parameters = { max_tokens = 131072 }
+effort_parameters = { low = { effort = "low" }, medium = { effort = "medium" }, high = { effort = "high" }, max = { effort = "max" } }
+
+[[models]]
+name = "cometapi-glm-5.2"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "glm-5.2"
+source_url = "https://www.cometapi.com/models/zhipuai/glm-5-2/"
+timeout_seconds = 120
+capabilities = { context_window = 1000000, max_output_tokens = 131072, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["thinking"], reasoning_efforts = ["high", "max"], tools = true, streaming = true }
+parameters = { max_tokens = 131072 }
+effort_parameters = { high = { thinking = { type = "enabled" }, reasoning_effort = "high" }, max = { thinking = { type = "enabled" }, reasoning_effort = "max" } }
+
+[[models]]
+name = "cometapi-qwen3.7-plus"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "qwen3.7-plus"
+source_url = "https://www.cometapi.com/models/aliyun/qwen3-7-plus/"
+timeout_seconds = 120
+capabilities = { context_window = 1000000, max_output_tokens = 65536, input_modalities = ["text", "image", "video"], output_modalities = ["text"], reasoning_modes = ["none", "thinking"], reasoning_efforts = ["none", "high"], tools = true, streaming = true }
+parameters = { max_tokens = 65536 }
+effort_parameters = { none = { enable_thinking = false }, high = { enable_thinking = true } }
+
+[[models]]
+name = "cometapi-qwen3.7-max"
+provider = "openai-compatible"
+base_url = "https://api.cometapi.com/v1"
+endpoint = "/chat/completions"
+model = "qwen3.7-max"
+source_url = "https://www.cometapi.com/models/aliyun/qwen3-7-max/"
+timeout_seconds = 120
+capabilities = { context_window = 1000000, max_output_tokens = 65536, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["none", "thinking"], reasoning_efforts = ["none", "high"], tools = true, streaming = true }
+parameters = { max_tokens = 65536 }
+effort_parameters = { none = { enable_thinking = false }, high = { enable_thinking = true } }
+
+[[models]]
+name = "xiaomi-mimi-v2.5-pro"
+provider = "openai-compatible"
+base_url = "https://api.xiaomimimo.com/v1"
+endpoint = "/chat/completions"
+model = "mimo-v2.5-pro"
+source_url = "https://mimo.mi.com/docs/zh-CN/quick-start/summary/first-api-call"
+timeout_seconds = 120
+capabilities = { context_window = 1048576, max_output_tokens = 131072, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["none", "thinking"], reasoning_efforts = ["none", "high"], tools = true, streaming = true }
+parameters = { max_completion_tokens = 131072 }
+effort_parameters = { none = { thinking = { type = "disabled" } }, high = { thinking = { type = "enabled" } } }
+
+[[models]]
+name = "xiaomi-mimo-v2.5"
+provider = "openai-compatible"
+base_url = "https://api.xiaomimimo.com/v1"
+endpoint = "/chat/completions"
+model = "mimo-v2.5"
+source_url = "https://mimo.mi.com/docs/zh-CN/quick-start/summary/first-api-call"
+timeout_seconds = 120
+capabilities = { context_window = 1048576, max_output_tokens = 131072, input_modalities = ["text", "image", "audio", "video"], output_modalities = ["text"], reasoning_modes = ["none", "thinking"], reasoning_efforts = ["none", "high"], tools = true, streaming = true }
+parameters = { max_completion_tokens = 131072 }
+effort_parameters = { none = { thinking = { type = "disabled" } }, high = { thinking = { type = "enabled" } } }

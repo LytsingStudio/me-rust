@@ -1,0 +1,2806 @@
+"use strict";
+
+const POLL_MS = 200;
+const INPUT_ANIMATION_QUIET_MS = 250;
+const TRANSCRIPT_BOTTOM_THRESHOLD_PX = 24;
+const API_ACTIVE = new Set(["Requesting", "Streaming", "Retrying"]);
+const API_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const COMMANDS = [
+  ["/agent-add", "新建会话"],
+  ["/agent-delete", "删除当前会话"],
+  ["/model", "切换当前模型"],
+  ["/effort", "选择推理强度"],
+  ["/clear", "清空当前上下文"],
+  ["/rewind", "撤回到较早的会话位置"],
+  ["/exit", "关闭当前页面"],
+];
+const PORTRAIT_LAYOUT = matchMedia("(orientation: portrait)");
+
+const state = {
+  snapshot: {
+    revision: 0, environment: null, agents: [], models: [], orchestrators: [], default_orchestrator: null,
+    tool_visibility: { hidden_names: [], hidden_prefixes: [], activity_names: [] },
+  },
+  stores: new Map(),
+  drafts: new Map(),
+  draftSync: new Map(),
+  selectedAgent: null,
+  apiActivity: { agentId: null, active: false, receivedSseEvents: 0 },
+  pendingAgentSelection: null,
+  view: { kind: "chat", sessionId: null },
+  terminals: [],
+  terminalRevisions: new Map(),
+  expandedTools: new Set(),
+  expandedHistoryObjectives: new Set(),
+  workerActivityIndexes: new Map(),
+  transcriptScrollFrame: null,
+  transcriptAutoFollow: true,
+  transcriptScrollSettleTimer: null,
+  pendingRender: emptyRenderRequest(),
+  inputResizeFrame: null,
+  apiAnimationTick: 0,
+  lastInputAt: Number.NEGATIVE_INFINITY,
+  composing: false,
+  slashIndex: 0,
+  userMenu: null,
+  agentMenu: null,
+  modal: null,
+  drawer: null,
+  contextDrawerOpen: false,
+  contextDrawerSignature: null,
+  contextCompactContent: null,
+  contextMemoryContent: null,
+  authRequired: false,
+  authenticated: false,
+  connected: false,
+  polling: false,
+};
+
+const $ = (selector) => document.querySelector(selector);
+const elements = {
+  app: $("#app"),
+  loginScreen: $("#login-screen"),
+  loginForm: $("#login-form"),
+  loginPassword: $("#login-password"),
+  loginError: $("#login-error"),
+  loginSubmit: $("#login-submit"),
+  connection: $("#connection-label"),
+  environment: $("#environment-footer"),
+  agents: $("#agent-list"),
+  addAgent: $("#add-agent"),
+  mobileDeleteAgent: $("#mobile-delete-agent"),
+  mobileSidebarToggle: $("#mobile-sidebar-toggle"),
+  mobileSidebarBackdrop: $("#mobile-sidebar-backdrop"),
+  tabs: $("#view-tabs"),
+  terminalTabs: $("#terminal-tabs"),
+  chatView: $("#chat-view"),
+  workmapView: $("#workmap-view"),
+  terminalView: $("#terminal-view"),
+  transcript: $("#transcript"),
+  scrollToBottom: $("#scroll-to-bottom"),
+  objective: $("#objective-summary"),
+  composer: $("#composer-shell"),
+  input: $("#prompt-input"),
+  stop: $("#stop-generation"),
+  send: $("#send-prompt"),
+  inputHint: $("#input-hint"),
+  slashMenu: $("#slash-menu"),
+  userMessageMenu: $("#user-message-menu"),
+  copyUserMessage: $("#copy-user-message"),
+  rewindUserMessage: $("#rewind-user-message"),
+  deleteUserTurn: $("#delete-user-turn"),
+  agentMenu: $("#agent-menu"),
+  deleteAgentMenu: $("#delete-agent-menu"),
+  workmap: $("#workmap-content"),
+  workmapCount: $("#workmap-count"),
+  terminalScreen: $("#terminal-screen"),
+  terminalMessage: $("#terminal-message"),
+  statusModelTrigger: $("#status-model-trigger"),
+  statusEffortTrigger: $("#status-effort-trigger"),
+  statusModel: $("#status-model"),
+  statusEffort: $("#status-effort"),
+  statusLiveTokens: $("#status-live-tokens"),
+  statusContext: $("#status-context"),
+  statusContextTrigger: $("#status-context-trigger"),
+  apiSpinner: $("#api-spinner"),
+  modalBackdrop: $("#modal-backdrop"),
+  modalTitle: $("#modal-title"),
+  modalDescription: $("#modal-description"),
+  modalContent: $("#modal-content"),
+  modalConfirm: $("#modal-confirm"),
+  modalCancel: $("#modal-cancel"),
+  modalClose: $("#modal-close"),
+  drawerBackdrop: $("#choice-drawer-backdrop"),
+  drawerTitle: $("#choice-drawer-title"),
+  drawerDescription: $("#choice-drawer-description"),
+  drawerContent: $("#choice-drawer-content"),
+  drawerClose: $("#choice-drawer-close"),
+  contextDrawerBackdrop: $("#context-drawer-backdrop"),
+  contextDrawerClose: $("#context-drawer-close"),
+  contextRing: $("#context-ring"),
+  contextPercent: $("#context-percent"),
+  contextUsageText: $("#context-usage-text"),
+  contextBreakdown: $("#context-breakdown"),
+  contextClear: $("#context-clear"),
+  compactSummaryBackdrop: $("#compact-summary-backdrop"),
+  compactSummaryTitle: $("#compact-summary-title"),
+  compactSummaryClose: $("#compact-summary-close"),
+  compactSummaryContent: $("#compact-summary-content"),
+  toasts: $("#toast-region"),
+};
+
+function eventParts(event) {
+  const entry = Object.entries(event)[0];
+  return entry || ["Unknown", {}];
+}
+
+function agentMeta() {
+  return state.snapshot.agents.find((agent) => agent.id === state.selectedAgent) || null;
+}
+
+function isWorkerAgent(meta = agentMeta()) {
+  return meta?.orchestrator === "worker-agent";
+}
+
+function canControlRuntime(meta = agentMeta()) {
+  return !!meta && (meta.kind !== "sub-agent" || isWorkerAgent(meta));
+}
+
+function currentStore() {
+  return state.selectedAgent ? state.stores.get(state.selectedAgent) || null : null;
+}
+
+function currentProjection() {
+  return currentStore()?.projection || emptyProjection();
+}
+
+function emptyProjection() {
+  return {
+    messages: [], apiState: null, apiUsage: null, model: null, effort: null, turnState: null,
+    _activeAssistant: null,
+    _activeTools: new Map(),
+    _turnStartedAt: new Map(),
+    _turnContextBaseline: new Map(),
+    _lastAssistantByPrompt: new Map(),
+    _completedApiUsage: new Map(),
+    _erroredApis: new Set(),
+    _completedCompactTools: new Set(),
+    _compactActivity: null,
+    _hiddenTools: new Set(),
+    _messageByKey: new Map(),
+    _turn: null,
+  };
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, { cache: "no-store", ...options });
+  const payload = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
+  if (!response.ok || payload.ok === false) {
+    const error = new Error(payload.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return payload;
+}
+
+function showLogin(message = "") {
+  state.authenticated = false;
+  state.connected = false;
+  elements.app.classList.add("hidden");
+  elements.loginScreen.classList.remove("hidden");
+  elements.loginError.textContent = message;
+  elements.loginPassword.focus();
+}
+
+function showApplication() {
+  elements.loginScreen.classList.add("hidden");
+  elements.app.classList.remove("hidden");
+  elements.loginError.textContent = "";
+}
+
+async function initializeAuthentication() {
+  try {
+    const status = await api("/api/auth/status");
+    state.authRequired = Boolean(status.required);
+    state.authenticated = Boolean(status.authenticated);
+    if (state.authRequired && !state.authenticated) {
+      showLogin();
+      return;
+    }
+    showApplication();
+    restoreDraft();
+    poll();
+  } catch (error) {
+    showLogin(`无法读取登录状态：${error.message}`);
+  }
+}
+
+async function submitLogin(event) {
+  event.preventDefault();
+  elements.loginSubmit.disabled = true;
+  elements.loginError.textContent = "";
+  try {
+    await api("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: elements.loginPassword.value }),
+    });
+    elements.loginPassword.value = "";
+    state.authenticated = true;
+    showApplication();
+    restoreDraft();
+    poll();
+  } catch (error) {
+    showLogin(error.message);
+    elements.loginPassword.select();
+  } finally {
+    elements.loginSubmit.disabled = false;
+  }
+}
+
+async function command(payload) {
+  return api("/api/command", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+async function poll() {
+  if (state.polling) return;
+  state.polling = true;
+  try {
+    const previousSnapshot = state.snapshot;
+    const wasConnected = state.connected;
+    const snapshot = await api("/api/snapshot");
+    const presentationChanged = snapshotPresentationSignature(previousSnapshot)
+      !== snapshotPresentationSignature(snapshot);
+    state.connected = true;
+    state.snapshot = snapshot;
+    const selectionChanged = reconcileAgents();
+    const apiActivityChanged = await syncApiActivity();
+    const eventChanges = await Promise.all(snapshot.agents.map(syncAgentEvents));
+    const selectedEventsChanged = eventChanges.some((change) =>
+      change.changed && change.agentId === state.selectedAgent);
+    const selectedWorkerChanged = eventChanges.some((change) =>
+      change.changed && isWorkerForSelectedAgent(change.agentId));
+    const agentSummaryChanged = eventChanges.some((change) => change.summaryChanged);
+    const terminalChanged = state.selectedAgent ? await syncTerminals() : false;
+    requestRender({
+      full: !wasConnected || selectionChanged,
+      connection: !wasConnected,
+      agents: presentationChanged || agentSummaryChanged,
+      tabs: presentationChanged || terminalChanged,
+      currentEvents: selectedEventsChanged,
+      workerEvents: selectedWorkerChanged,
+      apiActivity: apiActivityChanged,
+      status: apiActivityChanged,
+    });
+    if (!inputHasPriority()) flushPendingRender();
+    else if (state.view.kind === "terminal") void renderTerminal();
+  } catch (error) {
+    if (error.status === 401) {
+      showLogin("登录已失效，请重新登录。");
+      return;
+    }
+    if (state.connected) toast(`连接已断开：${error.message}`, true);
+    state.connected = false;
+    renderConnection();
+  } finally {
+    state.polling = false;
+    if (!state.authRequired || state.authenticated) setTimeout(poll, POLL_MS);
+  }
+}
+
+function inputHasPriority() {
+  return state.composing || performance.now() - state.lastInputAt < INPUT_ANIMATION_QUIET_MS;
+}
+
+function emptyRenderRequest() {
+  return {
+    full: false,
+    connection: false,
+    agents: false,
+    tabs: false,
+    currentEvents: false,
+    workerEvents: false,
+    apiActivity: false,
+    status: false,
+  };
+}
+
+async function syncApiActivity() {
+  const agentId = state.selectedAgent;
+  const next = agentId
+    ? await api(`/api/api-activity/${agentId}`)
+    : { active: false, received_sse_events: 0 };
+  const normalized = {
+    agentId,
+    active: Boolean(next.active),
+    receivedSseEvents: Math.max(0, Number(next.received_sse_events) || 0),
+  };
+  const changed = state.apiActivity.agentId !== normalized.agentId
+    || state.apiActivity.active !== normalized.active
+    || state.apiActivity.receivedSseEvents !== normalized.receivedSseEvents;
+  state.apiActivity = normalized;
+  return changed;
+}
+
+function requestRender(update) {
+  for (const key of Object.keys(state.pendingRender)) {
+    state.pendingRender[key] ||= Boolean(update[key]);
+  }
+}
+
+function snapshotPresentationSignature(snapshot) {
+  return JSON.stringify({
+    agents: (snapshot.agents || []).map((agent) => [
+      agent.id, agent.title, agent.kind, agent.parent_agent_id, agent.orchestrator,
+    ]),
+    models: (snapshot.models || []).map((model) => [
+      model.name, model.context_window, model.reasoning_efforts, model.output_token_reservations,
+    ]),
+    orchestrators: snapshot.orchestrators || [],
+    defaultOrchestrator: snapshot.default_orchestrator || null,
+  });
+}
+
+function isWorkerForSelectedAgent(agentId) {
+  const meta = state.snapshot.agents.find((agent) => agent.id === agentId);
+  return meta?.kind === "sub-agent" && meta.orchestrator === "worker-agent"
+    && meta.parent_agent_id === state.selectedAgent;
+}
+
+function reconcileAgents() {
+  const previousAgent = state.selectedAgent;
+  const previousView = `${state.view.kind}:${state.view.sessionId || ""}`;
+  let changed = false;
+  const ids = new Set(state.snapshot.agents.map((agent) => agent.id));
+  for (const id of state.stores.keys()) {
+    if (!ids.has(id)) {
+      state.stores.delete(id);
+      state.drafts.delete(id);
+      state.draftSync.delete(id);
+      state.workerActivityIndexes.delete(id);
+      changed = true;
+    }
+  }
+  if (state.pendingAgentSelection && ids.has(state.pendingAgentSelection)) {
+    state.selectedAgent = state.pendingAgentSelection;
+    state.pendingAgentSelection = null;
+    state.view = { kind: "chat", sessionId: null };
+  }
+  if (!state.selectedAgent || !ids.has(state.selectedAgent)) {
+    state.selectedAgent = state.snapshot.agents.find((agent) => agent.id === "main")?.id
+      || state.snapshot.agents[0]?.id || null;
+    state.view = { kind: "chat", sessionId: null };
+  }
+  return changed || previousAgent !== state.selectedAgent
+    || previousView !== `${state.view.kind}:${state.view.sessionId || ""}`;
+}
+
+async function syncAgentEvents(meta) {
+  let store = state.stores.get(meta.id);
+  let changed = false;
+  if (!store) {
+    store = {
+      events: [],
+      mutationRevision: meta.mutation_revision,
+      promptSubmissionRevision: Number(meta.prompt_submission_revision || 0),
+      inputDraftRevision: Number(meta.input_draft_revision || 0),
+      pendingPromptSubmissions: 0,
+      projection: emptyProjection(),
+      workmap: emptyWorkMap(),
+      turnHistory: null,
+      summary: { model: null, apiState: null },
+      projectedOrder: 0,
+      needsReplay: true,
+    };
+    state.stores.set(meta.id, store);
+    const initialDraft = String(meta.input_draft || "");
+    state.drafts.set(meta.id, initialDraft);
+    if (state.selectedAgent === meta.id && elements.input.value !== initialDraft) {
+      elements.input.value = initialDraft;
+      autoSizeInput();
+      renderSlashMenu();
+    }
+    changed = true;
+  }
+  observeInputDraft(meta, store);
+  if (store.events.length === meta.event_count && store.mutationRevision === meta.mutation_revision) {
+    observePromptSubmission(meta, store);
+    return { agentId: meta.id, changed, summaryChanged: false };
+  }
+  const payload = await api(`/api/events/${meta.id}?after=${store.events.length}&mutation=${store.mutationRevision}`);
+  const previousSummary = JSON.stringify(store.summary);
+  if (payload.reset) {
+    store.events = payload.events;
+    store.summary = projectAgentSummary(store.events);
+    store.projectedOrder = 0;
+    store.needsReplay = true;
+    state.workerActivityIndexes.delete(meta.id);
+  } else {
+    store.events.push(...payload.events);
+    updateAgentSummary(store.summary, payload.events);
+  }
+  store.mutationRevision = payload.mutation_revision;
+  if (payload.turn_history_updated) store.turnHistory = payload.turn_history ?? null;
+  observePromptSubmission(meta, store);
+  return {
+    agentId: meta.id,
+    changed: true,
+    summaryChanged: previousSummary !== JSON.stringify(store.summary),
+  };
+}
+
+function observeInputDraft(meta, store) {
+  const revision = Number(meta.input_draft_revision || 0);
+  if (revision <= store.inputDraftRevision) return false;
+  const sync = state.draftSync.get(meta.id);
+  if (sync?.sending || sync?.paused) return false;
+  if (sync?.desired !== sync?.sent) {
+    store.inputDraftRevision = revision;
+    return false;
+  }
+  store.inputDraftRevision = revision;
+  const content = String(meta.input_draft || "");
+  state.drafts.set(meta.id, content);
+  if (state.selectedAgent === meta.id && elements.input.value !== content) {
+    elements.input.value = content;
+    state.slashIndex = 0;
+    autoSizeInput();
+    renderSlashMenu();
+  }
+  return true;
+}
+
+function projectAgentSummary(events) {
+  const summary = { model: null, apiState: null };
+  updateAgentSummary(summary, events);
+  return summary;
+}
+
+function updateAgentSummary(summary, events) {
+  for (const event of events) {
+    const [kind, value] = eventParts(event);
+    if (kind === "ModelChanged") summary.model = value.model;
+    else if (kind === "ApiStateUpdate") summary.apiState = value.state;
+  }
+}
+
+function observePromptSubmission(meta, store) {
+  const revision = Number(meta.prompt_submission_revision || 0);
+  if (revision < store.promptSubmissionRevision) {
+    store.promptSubmissionRevision = revision;
+    return false;
+  }
+  if (revision === store.promptSubmissionRevision || store.pendingPromptSubmissions > 0) return false;
+  store.promptSubmissionRevision = revision;
+  return true;
+}
+
+async function syncTerminals() {
+  const payload = await api(`/api/terminals/${state.selectedAgent}`);
+  const sessions = payload.sessions || [];
+  let changed = terminalListSignature(state.terminals) !== terminalListSignature(sessions);
+  state.terminals = sessions;
+  if (state.view.kind === "terminal"
+      && !state.terminals.some((session) => session.session_id === state.view.sessionId)) {
+    state.view = { kind: "chat", sessionId: null };
+    changed = true;
+  }
+  return changed;
+}
+
+function terminalListSignature(sessions) {
+  return JSON.stringify(sessions.map((session) => [
+    session.session_id, session.creation_order, session.width, session.height,
+  ]));
+}
+
+function effectiveUiEvents(events) {
+  const active = [];
+  for (const event of events) {
+    const [kind] = eventParts(event);
+    if (kind === "AgentKindDef" || kind === "SystemPrompt") continue;
+    if (kind === "ContextCleared") {
+      active.length = 0;
+      active.push(event);
+    } else {
+      active.push(event);
+    }
+  }
+  const activeCalls = new Map();
+  const assistCalls = new Map();
+  const errored = new Set();
+  for (const event of active) {
+    const [kind, value] = eventParts(event);
+    if (kind === "ApiStateUpdate") {
+      if (value.state === "Requesting") activeCalls.set(value.prompt_id, value.api_call_id);
+      if (value.state === "Completed" || value.state === "Interrupted") {
+        if (activeCalls.get(value.prompt_id) === value.api_call_id) activeCalls.delete(value.prompt_id);
+      }
+      if (value.state === "Error") {
+        errored.add(value.api_call_id);
+        if (activeCalls.get(value.prompt_id) === value.api_call_id) activeCalls.delete(value.prompt_id);
+      }
+    } else if (kind === "AssistResponse" && activeCalls.has(value.prompt_id)) {
+      assistCalls.set(value.id, activeCalls.get(value.prompt_id));
+    }
+  }
+  return active.filter((event) => {
+    const [kind, value] = eventParts(event);
+    if (kind === "AssistResponse") return !errored.has(assistCalls.get(value.id));
+    if (kind === "ModelContextItem") return !errored.has(value.api_call_id);
+    return true;
+  });
+}
+
+function effectiveConversationEvents(events) {
+  const active = [];
+  for (const event of events) {
+    const [kind, value] = eventParts(event);
+    if (kind === "AgentKindDef" || kind === "SystemPrompt"
+        || kind === "ModelChanged" || kind === "ReasoningEffortChanged") continue;
+    if (kind === "ContextCleared") active.length = 0;
+    else if (kind === "CompactStateUpdate" && value.state === "Completed") {
+      active.length = 0;
+      active.push(event);
+    } else active.push(event);
+  }
+  return effectiveUiEvents(active);
+}
+
+function projectChat(events) {
+  const effective = effectiveUiEvents(events);
+  const projection = emptyProjection();
+  projection._completedCompactTools = new Set(effective.flatMap((event) => {
+    const [kind, value] = eventParts(event);
+    return kind === "CompactStateUpdate" && value.state === "Completed" ? [value.tool_call_id] : [];
+  }));
+  projection._hiddenTools = new Set(effective.flatMap((event) => {
+    const [kind, value] = eventParts(event);
+    return kind === "ToolCall" && !toolIsChatVisible(value.name)
+      && !toolIsWorkerActivity(value.name) ? [value.id] : [];
+  }));
+  consumeChatEvents(projection, effective);
+  projection.model ||= [...events].reverse().map(eventParts)
+    .find(([kind]) => kind === "ModelChanged")?.[1].model || null;
+  projection.effort ||= [...events].reverse().map(eventParts)
+    .find(([kind]) => kind === "ReasoningEffortChanged")?.[1].effort || null;
+  return projection;
+}
+
+function chatAppendNeedsReplay(events) {
+  return events.some((event) => {
+    const [kind, value] = eventParts(event);
+    return kind === "ContextCleared"
+      || (kind === "CompactStateUpdate" && value.state === "Completed")
+      || (kind === "ApiStateUpdate" && value.state === "Error");
+  });
+}
+
+function emptyProjectionChanges() {
+  return { transcript: false, transcriptFrom: null, status: false, turn: false };
+}
+
+function markTranscriptChanged(changes, index) {
+  changes.transcript = true;
+  changes.transcriptFrom = changes.transcriptFrom == null
+    ? index : Math.min(changes.transcriptFrom, index);
+}
+
+function appendProjectedMessage(projection, changes, message) {
+  message._projectionIndex = projection.messages.length;
+  projection.messages.push(message);
+  if (message.key) projection._messageByKey.set(message.key, message);
+  markTranscriptChanged(changes, message._projectionIndex);
+  return message;
+}
+
+function markProjectedMessageChanged(changes, message) {
+  const index = message?._projectionIndex;
+  if (index != null) markTranscriptChanged(changes, index);
+}
+
+function markProjectedToolChanged(projection, changes, tool) {
+  if (tool?._messageIndex != null) markTranscriptChanged(changes, tool._messageIndex);
+}
+
+function consumeChatEvents(projection, events) {
+  const changes = emptyProjectionChanges();
+
+  for (const event of events) {
+    const [kind, value] = eventParts(event);
+    switch (kind) {
+      case "ModelChanged":
+        projection.model = value.model;
+        projection.apiUsage = null;
+        changes.status = true;
+        if (value.cause !== "Initial") {
+          addNotice(projection, changes, `模型已变更为 ${value.model}`, value);
+        }
+        break;
+      case "ReasoningEffortChanged":
+        projection.effort = value.effort;
+        changes.status = true;
+        if (value.cause !== "Initial") {
+          addNotice(projection, changes,
+            value.cause === "ModelUnsupported" ? "思考强度不支持，已退回 unset" : `effort 已变更为 ${value.effort}`,
+            value);
+        }
+        break;
+      case "UserPrompt":
+        beginProjectedTurn(projection, value.id);
+        projection._turnStartedAt.set(value.id, value.timestamp_ms);
+        projection._turnContextBaseline.set(value.id, projection.apiUsage?.total_tokens ?? null);
+        appendProjectedMessage(projection, changes, {
+          key: `user:${value.id}`, revision: value.id, kind: "user",
+          content: value.content, timestamp: value.timestamp_ms, eventId: value.id,
+          rewindable: true,
+        });
+        projection._activeAssistant = null;
+        changes.turn = true;
+        break;
+      case "ManagerPrompt":
+      case "ParentAgentPrompt":
+        beginProjectedTurn(projection, value.id);
+        projection._turnStartedAt.set(value.id, value.timestamp_ms);
+        projection._turnContextBaseline.set(value.id, projection.apiUsage?.total_tokens ?? null);
+        appendProjectedMessage(projection, changes, {
+          key: `agent-prompt:${value.id}`, revision: value.id, kind: "user",
+          content: value.content, timestamp: value.timestamp_ms, eventId: value.id,
+          rewindable: false,
+        });
+        projection._activeAssistant = null;
+        changes.turn = true;
+        break;
+      case "FollowUpPrompt":
+        appendProjectedMessage(projection, changes, {
+          key: `user:${value.id}`, revision: value.id, kind: "user",
+          content: value.content, timestamp: value.timestamp_ms, eventId: value.id,
+          rewindable: false,
+        });
+        projection._activeAssistant = null;
+        break;
+      case "AssistResponse":
+        if (value.content) {
+          if (!projection._activeAssistant
+              || projection._activeAssistant.promptId !== value.prompt_id) {
+            const message = {
+              key: `assistant:${value.prompt_id}:${value.id}`, revision: value.id,
+              kind: "assistant", content: "", timestamp: value.timestamp_ms,
+            };
+            appendProjectedMessage(projection, changes, message);
+            projection._activeAssistant = { promptId: value.prompt_id, message };
+            projection._lastAssistantByPrompt.set(value.prompt_id, message);
+          }
+          projection._activeAssistant.message.content += value.content;
+          projection._activeAssistant.message.revision = value.id;
+          markProjectedMessageChanged(changes, projection._activeAssistant.message);
+        }
+        if (value.finished) {
+          projection._activeAssistant = null;
+          finishProjectedAssistant(projection, value.prompt_id);
+          changes.turn = true;
+        }
+        break;
+      case "AgentTurn": {
+        const stateName = normalize(value.state);
+        if (stateName === "completed") {
+          const assistant = projection._lastAssistantByPrompt.get(value.prompt_id);
+          const started = projection._turnStartedAt.get(value.prompt_id);
+          if (assistant && started != null && projection.messages.at(-1) === assistant
+              && assistant.content.trim()) {
+            appendProjectedMessage(projection, changes, {
+              key: `turn-toolbar:${value.turn_id}`, revision: value.id, kind: "turn-toolbar",
+              timestamp: value.timestamp_ms,
+              finalAnswerEventId: value.id,
+              promptId: value.prompt_id,
+              durationMs: Math.max(0, Number(value.timestamp_ms) - Number(started)),
+              tokenCount: completedTurnContextGrowth(
+                projection._completedApiUsage,
+                value.prompt_id,
+                projection._turnContextBaseline.get(value.prompt_id) ?? null,
+              ),
+            });
+          }
+        }
+        finishProjectedTurn(projection, value.prompt_id, stateName);
+        changes.turn = true;
+        break;
+      }
+      case "ApiStateUpdate":
+        projection.apiState = value.state;
+        updateProjectedApiState(projection, value);
+        changes.status = true;
+        changes.turn = true;
+        if (value.state === "Completed") {
+          projection.apiUsage = value.usage;
+          projection._completedApiUsage.set(value.api_call_id, {
+            promptId: value.prompt_id,
+            usage: value.usage ?? null,
+          });
+        }
+        if (value.state === "Error") {
+          projection._erroredApis.add(value.api_call_id);
+          addNotice(projection, changes, `API 错误：${value.detail}`, value);
+        }
+        if (value.state === "Retrying") {
+          addNotice(projection, changes, `API 正在重试 ${value.retry_count}/${value.retry_limit}`, value);
+        }
+        if (value.state === "Interrupted") {
+          if (!projection._erroredApis.has(value.api_call_id)) projection.apiUsage = value.usage;
+          else {
+            addNotice(projection, changes, `API 已中断：${value.detail}`, value);
+          }
+        }
+        break;
+      case "ToolCall": {
+        openProjectedTool(projection, value);
+        changes.turn = true;
+        const workerActivity = toolIsWorkerActivity(value.name);
+        if (!toolIsChatVisible(value.name) && !workerActivity) {
+          projection._hiddenTools.add(value.id);
+          break;
+        }
+        if (projection._completedCompactTools.has(value.id)) break;
+        const queued = [...projection._activeTools.values()]
+          .some((tool) => tool.apiCallId === value.api_call_id);
+        const args = safeJson(value.arguments);
+        const tool = {
+          id: value.id, apiCallId: value.api_call_id, name: value.name, arguments: value.arguments,
+          args, started: value.timestamp_ms, queued, sessionId: args?.session_id || null,
+          output: "", result: null, revision: value.id,
+        };
+        const message = appendProjectedMessage(projection, changes, {
+          key: `tool:${value.id}`, revision: value.id,
+          kind: workerActivity ? "worker-activity" : "tool",
+          timestamp: value.timestamp_ms, tool,
+        });
+        tool._messageIndex = message._projectionIndex;
+        projection._activeTools.set(value.id, tool);
+        break;
+      }
+      case "ToolInfoUpdate": {
+        if (projection._hiddenTools.has(value.tool_call_id)) break;
+        if (projection._completedCompactTools.has(value.tool_call_id)) break;
+        const tool = projection._activeTools.get(value.tool_call_id);
+        if (tool) {
+          tool.output += toolInfoText(value.content);
+          tool.revision = value.id;
+          markProjectedToolChanged(projection, changes, tool);
+        }
+        break;
+      }
+      case "ToolCallResult": {
+        closeProjectedTool(projection, value.tool_call_id);
+        changes.turn = true;
+        if (projection._hiddenTools.has(value.tool_call_id)) break;
+        if (projection._completedCompactTools.has(value.tool_call_id)) break;
+        const tool = projection._activeTools.get(value.tool_call_id);
+        if (!tool) break;
+        tool.result = { state: value.state, exitCode: value.exit_code, detail: value.detail, finished: value.timestamp_ms };
+        tool.revision = value.id;
+        if (!tool.sessionId && tool.name === "Terminal.Create") tool.sessionId = safeJson(value.detail)?.session_id || null;
+        projection._activeTools.delete(value.tool_call_id);
+        const next = [...projection._activeTools.values()]
+          .find((candidate) => candidate.apiCallId === tool.apiCallId && candidate.queued);
+        if (next) {
+          next.queued = false;
+          next.started = value.timestamp_ms;
+          next.revision = value.id;
+          markProjectedToolChanged(projection, changes, next);
+        }
+        markProjectedToolChanged(projection, changes, tool);
+        break;
+      }
+      case "TerminalSessionCreated": {
+        const tool = projection._activeTools.get(value.tool_call_id);
+        if (tool) {
+          tool.sessionId = value.session_id;
+          tool.revision = value.id;
+          markProjectedToolChanged(projection, changes, tool);
+        }
+        break;
+      }
+      case "TerminalSessionState":
+        appendProjectedMessage(projection, changes, {
+          key: `session:${value.id}`, revision: value.id,
+          kind: "session", timestamp: value.timestamp_ms,
+          content: `Session ${value.session_id} ${normalize(value.state)} · exit_code=${value.exit_code ?? "None"} · ${value.detail}`,
+        });
+        break;
+      case "UserTurnAborted":
+        abortProjectedTurn(projection, value.prompt_id);
+        changes.turn = true;
+        break;
+      case "ContextCleared":
+        addNotice(projection, changes, "上下文已清空", value);
+        break;
+      case "CompactStateUpdate":
+        if (value.state === "Started") {
+          beginCompactActivity(projection, changes, value);
+        } else if (value.state === "StageCompleted") {
+          advanceCompactActivity(projection, changes, value);
+        } else if (value.state === "Completed") {
+          projection.apiUsage = null;
+          projection._turn = null;
+          projection.turnState = null;
+          projection._turnContextBaseline.set(value.prompt_id, null);
+          for (const [apiCallId, entry] of projection._completedApiUsage) {
+            if (entry.promptId === value.prompt_id) projection._completedApiUsage.delete(apiCallId);
+          }
+          finishCompactActivity(projection, changes, value, "上下文已压缩");
+          changes.status = true;
+        } else if (value.state === "Failed") {
+          finishCompactActivity(projection, changes, value, "压缩失败");
+        } else if (value.state === "Interrupted") {
+          finishCompactActivity(projection, changes, value, "压缩中断");
+        }
+        break;
+      case "CloneCompleted":
+        addNotice(projection, changes, `克隆完成。新会话：${value.title}`, value);
+        break;
+      default:
+        break;
+    }
+  }
+  refreshProjectedTurnState(projection);
+  return changes;
+}
+
+function beginProjectedTurn(projection, promptId) {
+  projection._turn = {
+    promptId,
+    aborted: false,
+    terminal: false,
+    apiStates: new Map(),
+    openTools: new Set(),
+    latestApiCallId: null,
+    latestApiHasTool: false,
+    latestApiHasFinal: false,
+  };
+  refreshProjectedTurnState(projection);
+}
+
+function updateProjectedApiState(projection, update) {
+  const turn = projection._turn;
+  if (!turn || turn.promptId !== update.prompt_id) return;
+  turn.apiStates.set(update.api_call_id, update.state);
+  if (update.state === "Requesting") {
+    turn.latestApiCallId = update.api_call_id;
+    turn.latestApiHasTool = false;
+    turn.latestApiHasFinal = false;
+    turn.terminal = false;
+  } else if (["Streaming", "Retrying"].includes(update.state)) {
+    turn.terminal = false;
+  } else if (["Error", "Interrupted"].includes(update.state)) {
+    turn.terminal = true;
+  }
+  refreshProjectedTurnState(projection);
+}
+
+function openProjectedTool(projection, call) {
+  const turn = projection._turn;
+  if (!turn || turn.promptId !== call.prompt_id) return;
+  turn.openTools.add(call.id);
+  if (turn.latestApiCallId === call.api_call_id) turn.latestApiHasTool = true;
+  turn.terminal = false;
+  refreshProjectedTurnState(projection);
+}
+
+function closeProjectedTool(projection, toolCallId) {
+  const turn = projection._turn;
+  if (!turn) return;
+  turn.openTools.delete(toolCallId);
+  refreshProjectedTurnState(projection);
+}
+
+function finishProjectedAssistant(projection, promptId) {
+  const turn = projection._turn;
+  if (!turn || turn.promptId !== promptId) return;
+  turn.latestApiHasFinal = true;
+  if (!turn.latestApiHasTool) turn.terminal = true;
+  refreshProjectedTurnState(projection);
+}
+
+function finishProjectedTurn(projection, promptId, stateName) {
+  const turn = projection._turn;
+  if (!turn || turn.promptId !== promptId || stateName === "started") return;
+  turn.terminal = true;
+  refreshProjectedTurnState(projection);
+}
+
+function abortProjectedTurn(projection, promptId) {
+  const turn = projection._turn;
+  if (!turn || turn.promptId !== promptId) return;
+  turn.aborted = true;
+  refreshProjectedTurnState(projection);
+}
+
+function refreshProjectedTurnState(projection) {
+  const turn = projection._turn;
+  if (!turn) {
+    projection.turnState = null;
+    return;
+  }
+  if (turn.aborted) {
+    const terminalStates = new Set(["Completed", "Error", "Interrupted"]);
+    const settled = [...turn.apiStates.values()].every((stateName) => terminalStates.has(stateName))
+      && turn.openTools.size === 0;
+    projection.turnState = { state: settled ? "aborted" : "aborting", promptId: turn.promptId };
+    return;
+  }
+  const apiState = turn.latestApiCallId == null ? null : turn.apiStates.get(turn.latestApiCallId);
+  const active = ["Requesting", "Streaming", "Retrying"].includes(apiState)
+    || turn.openTools.size > 0
+    || !turn.terminal;
+  projection.turnState = { state: active ? "active" : "completed", promptId: turn.promptId };
+}
+
+function addNotice(projection, changes, content, event) {
+  return appendProjectedMessage(projection, changes, {
+    key: `notice:${event.id}`, revision: event.id,
+    kind: "notice", content, timestamp: event.timestamp_ms,
+  });
+}
+
+function compactStageCount(kind) {
+  return kind === "Segmented" ? 6 : 1;
+}
+
+function compactProgressText(kind, stage, receivedSseEvents = null) {
+  const total = compactStageCount(kind);
+  const current = Math.min(Math.max(1, Number(stage) || 1), total);
+  const progress = `正在压缩 (${current}/${total}) ...`;
+  return receivedSseEvents == null
+    ? progress : `${progress} ↓ ${Math.max(0, Number(receivedSseEvents) || 0)}`;
+}
+
+function refreshCompactActivity(projection, changes, revision) {
+  const activity = projection._compactActivity;
+  if (!activity) return;
+  activity.message.content = compactProgressText(activity.kind, activity.stage);
+  activity.message.revision = revision;
+  markProjectedMessageChanged(changes, activity.message);
+}
+
+function beginCompactActivity(projection, changes, event) {
+  const message = appendProjectedMessage(projection, changes, {
+    key: `compact:${event.compact_id}`, revision: event.id,
+    kind: "notice", content: compactProgressText(event.kind, 1),
+    timestamp: event.timestamp_ms,
+  });
+  projection._compactActivity = {
+    compactId: event.compact_id,
+    kind: event.kind,
+    stage: 1,
+    message,
+  };
+}
+
+function advanceCompactActivity(projection, changes, event) {
+  const activity = projection._compactActivity;
+  if (!activity || activity.compactId !== event.compact_id) return;
+  activity.stage = Math.min(activity.stage + 1, compactStageCount(activity.kind));
+  refreshCompactActivity(projection, changes, event.id);
+}
+
+function applyCompactApiActivity(projection, apiActivity) {
+  const changes = emptyProjectionChanges();
+  const activity = projection._compactActivity;
+  if (!activity) return changes;
+  const receivedSseEvents = apiActivity.active ? apiActivity.receivedSseEvents : null;
+  const content = compactProgressText(activity.kind, activity.stage, receivedSseEvents);
+  if (activity.message.content === content) return changes;
+  activity.message.content = content;
+  activity.message.presentationRevision = (activity.message.presentationRevision || 0) + 1;
+  markProjectedMessageChanged(changes, activity.message);
+  return changes;
+}
+
+function finishCompactActivity(projection, changes, event, content) {
+  const activity = projection._compactActivity;
+  if (activity && activity.compactId === event.compact_id) {
+    activity.message.content = content;
+    activity.message.timestamp = event.timestamp_ms;
+    activity.message.revision = event.id;
+    delete activity.message.presentationRevision;
+    markProjectedMessageChanged(changes, activity.message);
+    projection._compactActivity = null;
+  } else {
+    addNotice(projection, changes, content, event);
+  }
+}
+
+function toolInfoText(content) {
+  if (!content) return "";
+  if (content.kind === "text") return content.value || "";
+  if (content.kind === "terminal") {
+    return (content.value?.rows || []).map((row) => `${String(row.row).padStart(6, "0")}: ${terminalRowText(row)}`).join("\n");
+  }
+  return "";
+}
+
+function terminalRowText(row) {
+  let output = "", column = 0;
+  for (const run of row.runs || []) {
+    if (run.col > column) output += " ".repeat(run.col - column);
+    output += run.text;
+    column = run.col + run.width;
+  }
+  return output.replace(/\s+$/, "");
+}
+
+function safeJson(value) {
+  try { return JSON.parse(value); } catch { return null; }
+}
+
+function toolIsChatVisible(name) {
+  if (toolIsWorkerActivity(name)) return false;
+  const policy = state.snapshot.tool_visibility || {};
+  return !(policy.hidden_names || []).includes(name)
+    && !(policy.hidden_prefixes || []).some((prefix) => name.startsWith(prefix));
+}
+
+function toolIsWorkerActivity(name) {
+  return (state.snapshot.tool_visibility?.activity_names || []).includes(name);
+}
+
+function emptyWorkMap() {
+  return {
+    memory: { facts: [], agreements: [] }, history: [], current: null, recordCount: 0,
+    _records: new Map(),
+  };
+}
+
+function projectWorkMap(events) {
+  const workmap = emptyWorkMap();
+  consumeWorkMapEvents(workmap, events);
+  return workmap;
+}
+
+function consumeWorkMapEvents(workmap, events) {
+  let changed = false;
+  for (const event of events) {
+    const [kind, value] = eventParts(event);
+    if (kind === "ContextCleared") {
+      workmap._records.clear();
+      changed = true;
+      continue;
+    }
+    if (kind !== "WorkMapMutation") continue;
+    for (const record of value.mutation.records || []) {
+      const recordType = record.kind;
+      const data = record.record;
+      if (data?.id) {
+        workmap._records.set(data.id, { recordType, ...data });
+        changed = true;
+      }
+    }
+  }
+  if (!changed) return false;
+  materializeWorkMap(workmap);
+  return true;
+}
+
+function materializeWorkMap(workmap) {
+  const records = workmap._records;
+  const objectives = [...records.values()].filter((record) => record.recordType === "objective")
+    .sort((a, b) => a.created_at_ms - b.created_at_ms);
+  const plans = [...records.values()].filter((record) => record.recordType === "plan");
+  const notes = [...records.values()].filter((record) => record.recordType === "note");
+  const memories = [...records.values()].filter((record) => record.recordType === "memory" && record.state === "active");
+  const objectiveSnapshot = (objective) => ({
+    objective,
+    plans: plans.filter((plan) => plan.objective_id === objective.id)
+      .sort((a, b) => a.order - b.order)
+      .map((plan) => ({ plan, notes: notes.filter((note) => note.plan_id === plan.id).sort((a, b) => a.sequence - b.sequence) })),
+  });
+  const current = objectives.find((objective) => objective.state === "active");
+  workmap.memory = {
+    facts: memories.filter((memory) => memory.kind === "fact"),
+    agreements: memories.filter((memory) => memory.kind === "agreement"),
+  };
+  workmap.history = objectives.filter((objective) => objective.state !== "active")
+    .map(objectiveSnapshot);
+  workmap.current = current ? objectiveSnapshot(current) : null;
+  workmap.recordCount = objectives.length + plans.length + notes.length + memories.length;
+}
+
+function flushPendingRender() {
+  const request = state.pendingRender;
+  state.pendingRender = emptyRenderRequest();
+  if (request.full) {
+    renderAll();
+    return;
+  }
+  renderIncremental(request);
+}
+
+function renderAll() {
+  state.pendingRender = emptyRenderRequest();
+  advanceCurrentProjection();
+  applyCompactApiActivity(currentProjection(), state.apiActivity);
+  renderConnection();
+  renderAgents();
+  renderTabs();
+  renderAgentControls();
+  renderTranscript(true, 0);
+  renderObjective();
+  renderWorkMap();
+  renderComposer();
+  renderStatus();
+  if (state.transcriptAutoFollow) scrollTranscriptToBottomAfterLayout();
+  else updateScrollToBottomButton();
+  if (state.view.kind === "terminal") void renderTerminal();
+}
+
+function renderIncremental(request) {
+  const changes = request.currentEvents ? advanceCurrentProjection() : emptyProjectionChanges();
+  if (request.apiActivity || request.currentEvents) {
+    const activityChanges = applyCompactApiActivity(currentProjection(), state.apiActivity);
+    if (activityChanges.transcript) {
+      changes.transcript = true;
+      changes.transcriptFrom = changes.transcriptFrom == null
+        ? activityChanges.transcriptFrom
+        : Math.min(changes.transcriptFrom, activityChanges.transcriptFrom);
+    }
+  }
+  let transcriptChanged = false;
+  if (request.connection) renderConnection();
+  if (request.agents) renderAgents();
+  if (request.tabs) renderTabs();
+  if (changes.transcript) {
+    renderTranscript(Boolean(changes.fullReplay), changes.transcriptFrom ?? 0);
+    transcriptChanged = true;
+  } else if (request.workerEvents && state.view.kind === "chat") {
+    refreshWorkerActivityCards();
+    transcriptChanged = true;
+  }
+  if (changes.workmap) {
+    renderObjective();
+    if (state.view.kind === "workmap") renderWorkMap();
+  }
+  if (changes.turn) renderComposer();
+  if (request.status || changes.status) renderStatus();
+  if (transcriptChanged) {
+    if (state.transcriptAutoFollow) scrollTranscriptToBottomAfterLayout();
+    else updateScrollToBottomButton();
+  }
+  if (state.view.kind === "terminal") void renderTerminal();
+}
+
+function advanceCurrentProjection() {
+  const store = currentStore();
+  if (!store) return emptyProjectionChanges();
+  if (store.needsReplay) {
+    store.projection = projectChat(store.events);
+    store.workmap = projectWorkMap(store.events);
+    store.projectedOrder = store.events.length;
+    store.needsReplay = false;
+    return { transcript: true, status: true, turn: true, workmap: true, fullReplay: true };
+  }
+  const appended = store.events.slice(store.projectedOrder);
+  if (!appended.length) return emptyProjectionChanges();
+  const fullReplay = chatAppendNeedsReplay(appended);
+  const changes = fullReplay
+    ? { transcript: true, transcriptFrom: 0, status: true, turn: true }
+    : consumeChatEvents(store.projection, appended);
+  if (fullReplay) store.projection = projectChat(store.events);
+  changes.workmap = consumeWorkMapEvents(store.workmap, appended);
+  changes.fullReplay = fullReplay;
+  store.projectedOrder = store.events.length;
+  return changes;
+}
+
+function transcriptIsNearBottom() {
+  return elements.transcript.scrollHeight
+    - elements.transcript.scrollTop
+    - elements.transcript.clientHeight <= TRANSCRIPT_BOTTOM_THRESHOLD_PX;
+}
+
+function updateScrollToBottomButton() {
+  const overflow = elements.transcript.scrollHeight - elements.transcript.clientHeight
+    > TRANSCRIPT_BOTTOM_THRESHOLD_PX;
+  const visible = state.view.kind === "chat" && overflow && !transcriptIsNearBottom();
+  elements.scrollToBottom.classList.toggle("hidden", !visible);
+}
+
+function scrollTranscriptToBottomAfterLayout() {
+  state.transcriptAutoFollow = true;
+  cancelTranscriptBottomFollow();
+  if (state.view.kind !== "chat") return;
+  state.transcriptScrollFrame = requestAnimationFrame(() => {
+    if (state.view.kind !== "chat") {
+      state.transcriptScrollFrame = null;
+      return;
+    }
+    elements.transcript.scrollTop = elements.transcript.scrollHeight;
+    updateScrollToBottomButton();
+    state.transcriptScrollFrame = null;
+  });
+}
+
+function cancelTranscriptBottomFollow() {
+  if (state.transcriptScrollFrame === null) return;
+  cancelAnimationFrame(state.transcriptScrollFrame);
+  state.transcriptScrollFrame = null;
+}
+
+function suspendTranscriptAutoFollow() {
+  state.transcriptAutoFollow = false;
+  cancelTranscriptBottomFollow();
+  clearTimeout(state.transcriptScrollSettleTimer);
+  state.transcriptScrollSettleTimer = setTimeout(() => {
+    state.transcriptScrollSettleTimer = null;
+    state.transcriptAutoFollow = transcriptIsNearBottom();
+    updateScrollToBottomButton();
+  }, 120);
+}
+
+function renderConnection() {
+  elements.connection.textContent = state.connected ? "已连接" : "连接已断开";
+  elements.connection.style.color = state.connected ? "var(--green)" : "var(--red)";
+  const environment = state.snapshot.environment;
+  elements.environment.textContent = environment
+    ? `${environment.system} · ${window.location.host}`
+    : window.location.host;
+  elements.environment.title = environment?.workspace || "";
+}
+
+function renderAgents() {
+  if (state.agentMenu && !state.snapshot.agents.some((agent) => agent.id === state.agentMenu.agentId)) closeAgentMenu();
+  const agents = state.snapshot.agents;
+  if (!agents.length) {
+    if (!elements.agents.querySelector(":scope > .empty-state")) {
+      elements.agents.innerHTML = `<div class="empty-state">暂无会话</div>`;
+    }
+    return;
+  }
+  if (elements.agents.querySelector(":scope > .empty-state")) elements.agents.replaceChildren();
+  for (let index = 0; index < agents.length; index += 1) {
+    const agent = agents[index];
+    const summary = state.stores.get(agent.id)?.summary;
+    const active = API_ACTIVE.has(summary?.apiState);
+    const label = agent.title || agent.id;
+    const secondary = [agent.orchestrator === "worker-agent" ? "Worker" : agent.kind === "sub-agent" ? "子会话" : null, summary?.model]
+      .filter(Boolean).join(" · ") || "新会话";
+    let row = elements.agents.children[index];
+    if (!row || row.dataset.agentRow !== agent.id) {
+      while (elements.agents.children.length > index) elements.agents.lastElementChild.remove();
+      row = createAgentRow(agent);
+      elements.agents.append(row);
+    }
+    row.classList.toggle("active", agent.id === state.selectedAgent);
+    const item = row.querySelector(".agent-item");
+    const actions = row.querySelector(".agent-actions");
+    item.dataset.agent = agent.id;
+    actions.dataset.agentMenu = agent.id;
+    row.querySelector(".agent-dot").classList.toggle("active", active);
+    const title = row.querySelector(".agent-label strong");
+    const detail = row.querySelector(".agent-label span");
+    if (title.textContent !== label) title.textContent = label;
+    if (detail.textContent !== secondary) detail.textContent = secondary;
+    actions.setAttribute("aria-label", `打开 ${label} 的操作菜单`);
+  }
+  while (elements.agents.children.length > agents.length) elements.agents.lastElementChild.remove();
+  if (state.agentMenu) {
+    const trigger = [...elements.agents.querySelectorAll("[data-agent-menu]")]
+      .find((button) => button.dataset.agentMenu === state.agentMenu.agentId);
+    if (trigger) {
+      state.agentMenu.trigger = trigger;
+      trigger.setAttribute("aria-expanded", "true");
+    } else closeAgentMenu();
+  }
+}
+
+function createAgentRow(agent) {
+  const template = document.createElement("template");
+  template.innerHTML = `<div class="agent-row" data-agent-row="${escapeAttr(agent.id)}">
+    <button class="agent-item" type="button" data-agent="${escapeAttr(agent.id)}">
+      <span class="agent-dot"></span>
+      <span class="agent-label"><strong></strong><span></span></span>
+    </button>
+    <button class="agent-actions" type="button" data-agent-menu="${escapeAttr(agent.id)}" aria-haspopup="menu" aria-expanded="false">···</button>
+  </div>`;
+  const row = template.content.firstElementChild;
+  row.querySelector(".agent-item").addEventListener("click", (event) => selectAgent(event.currentTarget.dataset.agent));
+  row.querySelector(".agent-actions").addEventListener("click", (event) => {
+    event.stopPropagation();
+    openAgentMenu(event.currentTarget, event.currentTarget.dataset.agentMenu);
+  });
+  return row;
+}
+
+function selectAgent(id) {
+  closeContextDrawer();
+  closeMobileSidebar();
+  closeUserMessageMenu();
+  closeAgentMenu();
+  saveDraft();
+  state.selectedAgent = id;
+  state.transcriptAutoFollow = true;
+  state.view = { kind: "chat", sessionId: null };
+  state.terminals = [];
+  state.terminalRevisions.clear();
+  restoreDraft();
+  renderAll();
+}
+
+function renderTabs() {
+  elements.tabs.querySelectorAll("button[data-view]").forEach((button) => button.classList.toggle("active", state.view.kind === button.dataset.view));
+  elements.terminalTabs.innerHTML = state.terminals.map((session) =>
+    `<button data-terminal="${escapeAttr(session.session_id)}" class="${state.view.kind === "terminal" && state.view.sessionId === session.session_id ? "active" : ""}">Terminal · ${escapeHtml(session.session_id)}</button>`
+  ).join("");
+  elements.terminalTabs.querySelectorAll("[data-terminal]").forEach((button) => button.addEventListener("click", () => {
+    showView({ kind: "terminal", sessionId: button.dataset.terminal });
+  }));
+  elements.chatView.classList.toggle("active", state.view.kind === "chat");
+  elements.workmapView.classList.toggle("active", state.view.kind === "workmap");
+  elements.terminalView.classList.toggle("active", state.view.kind === "terminal");
+}
+
+function showView(view) {
+  flushPendingRender();
+  state.view = view;
+  renderTabs();
+  renderObjective();
+  if (state.view.kind === "workmap") renderWorkMap();
+  renderComposer();
+  renderStatus();
+  updateScrollToBottomButton();
+  if (state.view.kind === "terminal") void renderTerminal();
+}
+
+function renderAgentControls() {
+  const meta = agentMeta();
+  elements.mobileDeleteAgent.disabled = !meta;
+}
+
+function openMobileSidebar() {
+  document.body.classList.add("mobile-sidebar-open");
+  elements.mobileSidebarToggle.setAttribute("aria-expanded", "true");
+}
+
+function closeMobileSidebar() {
+  document.body.classList.remove("mobile-sidebar-open");
+  elements.mobileSidebarToggle.setAttribute("aria-expanded", "false");
+  closeAgentMenu();
+}
+
+function renderTranscript(forceFull = false, changedFrom = 0) {
+  const projection = currentProjection();
+  const messages = projection.messages;
+  if (forceFull && state.userMenu && (state.userMenu.agentId !== state.selectedAgent
+    || !messages.some((message) => message.kind === "user" && message.eventId === state.userMenu.eventId))) {
+    closeUserMessageMenu();
+  }
+  if (!messages.length) {
+    const environment = state.snapshot.environment;
+    if (!elements.transcript.querySelector(":scope > .empty-state")) {
+      elements.transcript.innerHTML = `<div class="empty-state"><div><strong>ME-RUST</strong><p>从这里开始一段对话。</p>${environment ? `<small>${escapeHtml(environment.workspace)}<br>${escapeHtml(environment.system)}</small>` : ""}</div></div>`;
+    }
+    return;
+  }
+  if (forceFull) elements.transcript.replaceChildren();
+  reconcileTranscript(messages, forceFull ? 0 : changedFrom);
+}
+
+function reconcileTranscript(messages, changedFrom = 0) {
+  if (elements.transcript.querySelector(":scope > .empty-state")) elements.transcript.replaceChildren();
+  const start = Math.max(0, Math.min(changedFrom, messages.length));
+  let previousKind = previousVisibleRenderedKind(start);
+  for (let index = start; index < messages.length; index += 1) {
+    const message = messages[index];
+    const visible = messageIsVisible(message);
+    const afterTool = visible && isToolLikeKind(previousKind) && message.kind === "assistant";
+    const key = messageDomKey(message, index);
+    const revision = messageRenderRevision(message, afterTool);
+    const current = elements.transcript.children[index];
+    if (!current || current.dataset.messageKey !== key) {
+      while (elements.transcript.children.length > index) elements.transcript.lastElementChild.remove();
+      elements.transcript.append(createMessageFragment(messages, index, previousKind));
+      return;
+    }
+    if (current.meRenderRevision !== revision) updateMessageNode(current, message, afterTool, index);
+    if (visible) previousKind = message.kind;
+  }
+  while (elements.transcript.children.length > messages.length) elements.transcript.lastElementChild.remove();
+}
+
+function previousVisibleRenderedKind(index) {
+  for (let previous = index - 1; previous >= 0; previous -= 1) {
+    const node = elements.transcript.children[previous];
+    if (node?.dataset.messageVisible === "true") return node.dataset.messageKind || null;
+  }
+  return null;
+}
+
+function messageIsVisible(message) {
+  if (message.kind === "assistant") return Boolean(message.content.trim());
+  if (message.kind === "worker-activity") return workerWaitIsVisible(message.tool);
+  return true;
+}
+
+function createMessageFragment(messages, start, previousKind) {
+  const descriptors = [];
+  let previous = previousKind;
+  for (let index = start; index < messages.length; index += 1) {
+    const message = messages[index];
+    const visible = messageIsVisible(message);
+    const afterTool = visible && isToolLikeKind(previous) && message.kind === "assistant";
+    descriptors.push({ message, afterTool, index });
+    if (visible) previous = message.kind;
+  }
+  const template = document.createElement("template");
+  template.innerHTML = descriptors.map(({ message, afterTool }) => renderMessageHtml(message, afterTool)).join("");
+  [...template.content.children].forEach((node, offset) => {
+    const { message, afterTool, index } = descriptors[offset];
+    initializeMessageNode(node, message, afterTool, index);
+  });
+  return template.content;
+}
+
+function createMessageNode(message, afterTool, index) {
+  const template = document.createElement("template");
+  template.innerHTML = renderMessageHtml(message, afterTool).trim();
+  const node = template.content.firstElementChild;
+  initializeMessageNode(node, message, afterTool, index);
+  return node;
+}
+
+function updateMessageNode(node, message, afterTool, index) {
+  const visible = messageIsVisible(message);
+  if (node.dataset.messageVisible !== String(visible)) {
+    node.replaceWith(createMessageNode(message, afterTool, index));
+    return;
+  }
+  if (!visible) {
+    node.meRenderRevision = messageRenderRevision(message, afterTool);
+    return;
+  }
+  if (message.kind === "assistant") {
+    node.classList.toggle("after-tool", afterTool);
+    const markdown = node.querySelector(":scope > .markdown");
+    const rendered = renderMarkdown(message.content.trim());
+    if (markdown.innerHTML !== rendered) markdown.innerHTML = rendered;
+    node.meRenderRevision = messageRenderRevision(message, afterTool);
+    return;
+  }
+  if (message.kind === "worker-activity") {
+    updateWorkerActivityNode(node, message.tool);
+    node.meRenderRevision = messageRenderRevision(message, afterTool);
+    return;
+  }
+  node.replaceWith(createMessageNode(message, afterTool, index));
+}
+
+function initializeMessageNode(node, message, afterTool, index) {
+  node.dataset.messageKey = messageDomKey(message, index);
+  node.dataset.messageVisible = String(messageIsVisible(message));
+  node.dataset.messageKind = messageIsVisible(message) ? message.kind : "";
+  node.meRenderRevision = messageRenderRevision(message, afterTool);
+  if (message.kind === "tool") bindToolCard(node);
+  if (message.kind === "user") bindUserMessage(node, message);
+  if (message.kind === "turn-toolbar") bindTurnToolbar(node, message);
+}
+
+function messageDomKey(message, index) {
+  return `${state.selectedAgent}:${message.key || `${message.kind}:${message.timestamp}:${index}`}`;
+}
+
+function renderMessageHtml(message, afterTool) {
+  if (!messageIsVisible(message)) return `<div class="message-block projection-hidden hidden" aria-hidden="true"></div>`;
+  if (message.kind === "user") return `<div class="message-block user"><div class="user-message-content"> ${escapeHtml(message.content)}</div><button class="user-message-actions" type="button" aria-label="消息操作" aria-haspopup="menu" aria-expanded="false">···</button></div>`;
+  if (message.kind === "assistant") return `<div class="message-block assistant ${afterTool ? "after-tool" : ""}"><span class="block-marker">●</span><div class="markdown">${renderMarkdown(message.content.trim())}</div></div>`;
+  if (message.kind === "turn-toolbar") return `<div class="message-block turn-toolbar" aria-label="本轮用时"><span>▶ 用时 ${formatTurnElapsed(message.durationMs)} · ${formatTurnTokens(message.tokenCount)}</span><div class="turn-actions"><button class="clone-turn" type="button">克隆</button><button class="regenerate-turn" type="button">重新生成</button></div></div>`;
+  if (message.kind === "tool") return renderToolCard(message.tool);
+  if (message.kind === "worker-activity") return renderWorkerActivity(message.tool);
+  const className = message.kind === "session" ? "session" : "notice";
+  return `<div class="message-block ${className}"><span class="block-marker">●</span><div class="${className}-content">${escapeHtml(message.content)}</div></div>`;
+}
+
+function bindUserMessage(node, message) {
+  const trigger = node.querySelector(".user-message-actions");
+  trigger.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openUserMessageMenu(trigger, message);
+  });
+}
+
+function bindTurnToolbar(node, message) {
+  const agentId = state.selectedAgent;
+  const readOnly = agentMeta()?.kind === "sub-agent";
+  const cloneButton = node.querySelector(".clone-turn");
+  const regenerateButton = node.querySelector(".regenerate-turn");
+  cloneButton.disabled = readOnly;
+  regenerateButton.disabled = readOnly;
+  if (readOnly) {
+    cloneButton.title = "只读会话";
+    regenerateButton.title = "只读会话";
+    return;
+  }
+  cloneButton.addEventListener("click", async () => {
+    const button = cloneButton;
+    button.disabled = true;
+    try {
+      const payload = await sendCommand({
+        command: "clone_agent",
+        agent_id: agentId,
+        final_answer_event_id: message.finalAnswerEventId,
+      });
+      const id = payload?.receipt?.agent_id;
+      if (id) state.pendingAgentSelection = id;
+    } catch (error) { toast(error.message, true); }
+    finally { button.disabled = false; }
+  });
+  regenerateButton.addEventListener("click", () => {
+    openConfirm(
+      "重新生成这条回复？",
+      "这条回复及其后的内容将被永久移除，并从对应的用户消息重新生成。",
+      "重新生成",
+      () => sendCommand({
+        command: "regenerate",
+        agent_id: agentId,
+        final_answer_event_id: message.finalAnswerEventId,
+      }),
+      true,
+    );
+  });
+}
+
+function openUserMessageMenu(trigger, message) {
+  closeAgentMenu();
+  closeUserMessageMenu();
+  const rewindable = message.rewindable && agentMeta()?.kind !== "sub-agent";
+  state.userMenu = {
+    agentId: state.selectedAgent,
+    eventId: message.eventId,
+    content: message.content,
+    trigger,
+    rewindable,
+    deletable: rewindable,
+  };
+  trigger.setAttribute("aria-expanded", "true");
+  elements.rewindUserMessage.disabled = !rewindable;
+  elements.rewindUserMessage.title = rewindable ? "" : "无法撤回到此消息";
+  elements.deleteUserTurn.disabled = !rewindable;
+  elements.deleteUserTurn.title = rewindable ? "" : "无法删除这一轮";
+  elements.userMessageMenu.classList.remove("hidden");
+  const triggerRect = trigger.getBoundingClientRect();
+  const menuRect = elements.userMessageMenu.getBoundingClientRect();
+  const margin = 8;
+  const left = Math.max(margin, Math.min(triggerRect.right - menuRect.width, window.innerWidth - menuRect.width - margin));
+  const below = triggerRect.bottom + 5;
+  const top = below + menuRect.height <= window.innerHeight - margin
+    ? below
+    : Math.max(margin, triggerRect.top - menuRect.height - 5);
+  elements.userMessageMenu.style.left = `${left}px`;
+  elements.userMessageMenu.style.top = `${top}px`;
+}
+
+function closeUserMessageMenu() {
+  state.userMenu?.trigger?.setAttribute("aria-expanded", "false");
+  state.userMenu = null;
+  elements.userMessageMenu.classList.add("hidden");
+}
+
+function openAgentMenu(trigger, agentId) {
+  closeUserMessageMenu();
+  closeAgentMenu();
+  state.agentMenu = { agentId, trigger };
+  trigger.setAttribute("aria-expanded", "true");
+  elements.agentMenu.classList.remove("hidden");
+  const triggerRect = trigger.getBoundingClientRect();
+  const menuRect = elements.agentMenu.getBoundingClientRect();
+  const margin = 8;
+  const left = Math.max(margin, Math.min(triggerRect.right - menuRect.width, window.innerWidth - menuRect.width - margin));
+  const below = triggerRect.bottom + 5;
+  const top = below + menuRect.height <= window.innerHeight - margin
+    ? below
+    : Math.max(margin, triggerRect.top - menuRect.height - 5);
+  elements.agentMenu.style.left = `${left}px`;
+  elements.agentMenu.style.top = `${top}px`;
+}
+
+function closeAgentMenu() {
+  state.agentMenu?.trigger?.setAttribute("aria-expanded", "false");
+  state.agentMenu = null;
+  elements.agentMenu.classList.add("hidden");
+}
+
+async function copyTextToClipboard(content) {
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    await navigator.clipboard.writeText(content);
+    return;
+  }
+  const scratch = document.createElement("textarea");
+  scratch.value = content;
+  scratch.setAttribute("readonly", "");
+  scratch.style.position = "fixed";
+  scratch.style.opacity = "0";
+  document.body.append(scratch);
+  scratch.select();
+  const copied = document.execCommand("copy");
+  scratch.remove();
+  if (!copied) throw new Error("浏览器未允许复制到剪贴板");
+}
+
+function messageRenderRevision(message, afterTool) {
+  const expanded = message.kind === "tool"
+    && state.expandedTools.has(`${state.selectedAgent}:${message.tool.id}`);
+  const revision = message.kind === "tool" || message.kind === "worker-activity"
+    ? message.tool.revision : message.revision;
+  const workerRevision = message.kind === "worker-activity"
+    ? workerActivityForWait(message.tool)?.revision || 0 : 0;
+  return `${revision ?? message.timestamp}:${message.presentationRevision || 0}:${workerRevision}:${afterTool ? 1 : 0}:${expanded ? 1 : 0}`;
+}
+
+function isToolLikeKind(kind) {
+  return kind === "tool" || kind === "worker-activity";
+}
+
+function bindToolCard(card) {
+  const toggle = () => {
+    if (window.getSelection()?.toString()) return;
+    const key = `${state.selectedAgent}:${card.dataset.toolCard}`;
+    if (state.expandedTools.has(key)) state.expandedTools.delete(key); else state.expandedTools.add(key);
+    const messages = currentProjection().messages;
+    const index = messages.findIndex((message) =>
+      message.kind === "tool" && String(message.tool.id) === card.dataset.toolCard);
+    if (index >= 0) card.replaceWith(createMessageNode(messages[index], false, index));
+  };
+  card.addEventListener("click", toggle);
+  card.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggle(); }
+  });
+}
+
+function renderToolCard(tool) {
+  const key = `${state.selectedAgent}:${tool.id}`;
+  const expanded = state.expandedTools.has(key);
+  const resultState = normalize(tool.result?.state || "");
+  const status = !tool.result ? "running" : resultState === "succeeded" ? "succeeded" : "failed";
+  const marker = "●";
+  const rows = toolRows(tool, expanded);
+  return `<div class="tool-card ${status} ${expanded ? "expanded" : ""}" data-tool-card="${escapeAttr(tool.id)}" role="button" tabindex="0" aria-expanded="${expanded}">
+    <div class="tool-header"><span class="tool-marker">${marker}</span><span>${escapeHtml(tool.name)}</span></div>
+    <div class="tool-details">${rows.map((row, index) => `<div class="tool-row"><span class="tool-tree">${index + 1 === rows.length ? "└" : "├"}─</span><span class="tool-key">${escapeHtml(row.key)}</span><${expanded && row.pre ? "pre" : "span"} class="tool-value ${row.pre ? "tool-output" : ""}"${row.runningStarted == null ? "" : ` data-running-started="${row.runningStarted}"`}>${escapeHtml(row.value)}</${expanded && row.pre ? "pre" : "span"}></div>`).join("")}</div>
+  </div>`;
+}
+
+function renderWorkerActivity(wait) {
+  const view = workerActivityView(wait);
+  return `<div class="worker-activity ${view.status}" data-worker-wait="${escapeAttr(wait.id)}">
+    <div class="worker-activity-header"><span class="worker-activity-marker">●</span><span class="worker-activity-title">${view.title}</span></div>
+    <div class="worker-activity-tools">${view.tools.map(renderWorkerTool).join("")}</div>
+  </div>`;
+}
+
+function refreshWorkerActivityCards() {
+  const projection = currentProjection();
+  elements.transcript.querySelectorAll(":scope > [data-worker-wait]").forEach((node) => {
+    const message = projection._messageByKey.get(`tool:${node.dataset.workerWait}`);
+    if (!message) return;
+    updateWorkerActivityNode(node, message.tool);
+    node.meRenderRevision = messageRenderRevision(message, false);
+  });
+}
+
+function workerActivityView(wait) {
+  const activity = workerActivityForWait(wait);
+  const stateName = activity?.state || workerWaitState(wait);
+  return {
+    status: stateName === "completed" ? "succeeded"
+      : stateName === "running" ? "running" : "failed",
+    title: stateName === "completed" ? "已完成"
+      : stateName === "interrupted" ? "已中断"
+        : stateName === "failed" ? "未完成" : "正在执行",
+    tools: activity?.tools || [],
+  };
+}
+
+function workerToolView(tool) {
+  return {
+    status: !tool.result ? "running"
+      : normalize(tool.result.state) === "succeeded" ? "succeeded" : "failed",
+    brief: workerToolBrief(tool),
+  };
+}
+
+function renderWorkerTool(tool) {
+  const view = workerToolView(tool);
+  return `<div class="worker-activity-tool ${view.status}" data-worker-tool="${escapeAttr(tool.id)}"><span class="worker-tool-marker">●</span><span class="worker-tool-name">${escapeHtml(tool.name)}</span><span class="worker-tool-brief">${escapeHtml(view.brief)}</span></div>`;
+}
+
+function updateWorkerActivityNode(node, wait) {
+  const view = workerActivityView(wait);
+  node.className = `worker-activity ${view.status}`;
+  const title = node.querySelector(":scope > .worker-activity-header .worker-activity-title");
+  if (title.textContent !== view.title) title.textContent = view.title;
+  const tools = node.querySelector(":scope > .worker-activity-tools");
+  for (let index = 0; index < view.tools.length; index += 1) {
+    const tool = view.tools[index];
+    let current = tools.children[index];
+    if (!current || current.dataset.workerTool !== String(tool.id)) {
+      while (tools.children.length > index) tools.lastElementChild.remove();
+      const template = document.createElement("template");
+      template.innerHTML = renderWorkerTool(tool);
+      tools.append(template.content.firstElementChild);
+      current = tools.children[index];
+    }
+    const toolView = workerToolView(tool);
+    current.className = `worker-activity-tool ${toolView.status}`;
+    const name = current.querySelector(".worker-tool-name");
+    const brief = current.querySelector(".worker-tool-brief");
+    if (name.textContent !== tool.name) name.textContent = tool.name;
+    if (brief.textContent !== toolView.brief) brief.textContent = toolView.brief;
+  }
+  while (tools.children.length > view.tools.length) tools.lastElementChild.remove();
+}
+
+function workerActivityForWait(wait) {
+  const worker = state.snapshot.agents.find((agent) => agent.kind === "sub-agent"
+    && agent.orchestrator === "worker-agent" && agent.parent_agent_id === state.selectedAgent);
+  if (!worker) return null;
+  const index = workerActivityIndex(worker);
+  const targetTurnId = Number(safeJson(wait.result?.detail)?.turn_id);
+  let turn = Number.isFinite(targetTurnId) ? index.byPromptId.get(targetTurnId) : null;
+  if (!turn) {
+    const cutoff = wait.result ? Number(wait.result.finished) : Number.POSITIVE_INFINITY;
+    turn = [...index.turns].reverse().find((candidate) => candidate.timestamp <= cutoff) || null;
+  }
+  return turn ? {
+    state: workerWaitState(wait),
+    tools: turn.tools,
+    revision: turn.revision,
+  } : null;
+}
+
+function workerActivityIndex(worker) {
+  const store = state.stores.get(worker.id);
+  const events = store?.events || [];
+  let cache = state.workerActivityIndexes.get(worker.id);
+  const prefixChanged = !cache
+    || cache.mutationRevision !== store?.mutationRevision
+    || cache.nextOrder > events.length
+    || (cache.nextOrder > 0
+      && eventParts(events[cache.nextOrder - 1] || {})[1]?.id !== cache.lastEventId);
+  if (prefixChanged) {
+    cache = {
+      mutationRevision: store?.mutationRevision || 0,
+      nextOrder: 0,
+      lastEventId: null,
+      index: { turns: [], byPromptId: new Map() },
+      activeTools: new Map(),
+      turn: null,
+    };
+    state.workerActivityIndexes.set(worker.id, cache);
+  }
+  while (cache.nextOrder < events.length) {
+    const event = events[cache.nextOrder];
+    const [kind, value] = eventParts(event);
+    if (kind === "ManagerPrompt") {
+      cache.turn = {
+        promptId: Number(value.id), timestamp: Number(value.timestamp_ms),
+        tools: [], revision: value.id,
+      };
+      cache.index.turns.push(cache.turn);
+      cache.index.byPromptId.set(cache.turn.promptId, cache.turn);
+      cache.activeTools.clear();
+    } else if (cache.turn && kind === "ToolCall") {
+      if (toolIsChatVisible(value.name) && !toolIsWorkerActivity(value.name)) {
+        const queued = [...cache.activeTools.values()]
+          .some((tool) => tool.apiCallId === value.api_call_id);
+        const args = safeJson(value.arguments);
+        const tool = {
+          id: value.id, apiCallId: value.api_call_id, name: value.name, arguments: value.arguments,
+          args, started: value.timestamp_ms, queued, sessionId: args?.session_id || null,
+          output: "", result: null, revision: value.id,
+        };
+        cache.turn.tools.push(tool);
+        cache.turn.revision = value.id;
+        cache.activeTools.set(value.id, tool);
+      }
+    } else if (cache.turn && kind === "ToolInfoUpdate") {
+      const tool = cache.activeTools.get(value.tool_call_id);
+      if (tool) {
+        tool.output += toolInfoText(value.content);
+        tool.revision = value.id;
+        cache.turn.revision = value.id;
+      }
+    } else if (cache.turn && kind === "ToolCallResult") {
+      const tool = cache.activeTools.get(value.tool_call_id);
+      if (tool) {
+        tool.result = { state: value.state, exitCode: value.exit_code, detail: value.detail, finished: value.timestamp_ms };
+        tool.revision = value.id;
+        cache.turn.revision = value.id;
+        if (!tool.sessionId && tool.name === "Terminal.Create") {
+          tool.sessionId = safeJson(value.detail)?.session_id || null;
+        }
+        cache.activeTools.delete(value.tool_call_id);
+        const next = [...cache.activeTools.values()]
+          .find((candidate) => candidate.apiCallId === tool.apiCallId && candidate.queued);
+        if (next) {
+          next.queued = false;
+          next.started = value.timestamp_ms;
+          next.revision = value.id;
+        }
+      }
+    } else if (cache.turn && kind === "TerminalSessionCreated") {
+      const tool = cache.activeTools.get(value.tool_call_id);
+      if (tool) {
+        tool.sessionId = value.session_id;
+        tool.revision = value.id;
+        cache.turn.revision = value.id;
+      }
+    }
+    cache.nextOrder += 1;
+    cache.lastEventId = value?.id ?? cache.lastEventId;
+  }
+  return cache.index;
+}
+
+function workerWaitState(wait) {
+  if (!wait.result) return "running";
+  if (normalize(wait.result.state) !== "succeeded") return "failed";
+  const stateName = normalize(safeJson(wait.result.detail)?.state || "");
+  if (stateName === "completed") return "completed";
+  if (stateName === "interrupted" || stateName === "stopped") return "interrupted";
+  if (stateName === "wait_interrupted") return "running";
+  if (stateName === "failed" || stateName === "api_error") return "failed";
+  return "running";
+}
+
+function workerWaitIsVisible(wait) {
+  return !wait.result || workerWaitState(wait) !== "running";
+}
+
+function workerToolBrief(tool) {
+  if (tool.result && normalize(tool.result.state) !== "succeeded") {
+    const detail = String(tool.result.detail || "").trim().split(/\r?\n/, 1)[0];
+    return detail ? `失败: ${detail}` : "失败";
+  }
+  const parts = [];
+  if (tool.sessionId) parts.push(String(tool.sessionId));
+  const terminalInput = tool.name.startsWith("Terminal.") ? toolInput(tool) : "";
+  if (terminalInput) parts.push(toolPreview(terminalInput));
+  if (tool.args) {
+    for (const key of ["path", "url", "page_id", "element_id", "query", "command", "name"]) {
+      const value = tool.args[key];
+      if (["string", "number", "boolean"].includes(typeof value) && String(value)
+          && !parts.includes(String(value))) parts.push(String(value));
+      if (parts.length >= 2) break;
+    }
+  }
+  if (!parts.length) {
+    const input = toolInput(tool);
+    if (input) parts.push(toolPreview(input));
+  }
+  return parts.join(" ");
+}
+
+function toolRows(tool, expanded) {
+  const rows = [];
+  if (tool.sessionId) rows.push({ key: "Session", value: tool.sessionId });
+  const input = toolInput(tool);
+  if (input) rows.push({ key: "Input", value: expanded ? input : toolPreview(input), pre: expanded });
+  const output = tool.output || (!tool.result ? "" : tool.result.detail) || (tool.result?.state === "Succeeded" ? "(no output)" : "");
+  if (output) rows.push({ key: "Output", value: expanded ? output : toolPreview(output), pre: expanded });
+  if (tool.queued) rows.push({ key: "State", value: "Queued" });
+  else if (!tool.result) rows.push({ key: "State", value: `Running ... ${formatDuration(Date.now() - tool.started)}`, runningStarted: tool.started });
+  else rows.push({ key: "Time use", value: formatDuration(Math.max(0, tool.result.finished - tool.started)) });
+  return rows;
+}
+
+function toolPreview(value) {
+  const preview = String(value).trim().replace(/\s+/g, " ");
+  return preview.length > 240 ? `${preview.slice(0, 239)}…` : preview;
+}
+
+function toolInput(tool) {
+  const args = tool.args;
+  if (!args || Object.keys(args).length === 0) return "";
+  if (typeof args.content === "string") return args.content;
+  if (typeof args.input === "string") return args.input;
+  if (Array.isArray(args.events)) return args.events.map((event) => event.text || event.key || JSON.stringify(event)).join("");
+  const copy = { ...args };
+  delete copy.session_id;
+  return Object.keys(copy).length ? JSON.stringify(copy, null, 2) : "";
+}
+
+function renderObjective() {
+  const current = currentStore()?.workmap.current;
+  if (!current || state.view.kind !== "chat") {
+    elements.objective.classList.add("hidden");
+    elements.objective.innerHTML = "";
+    return;
+  }
+  const active = current.plans.some(({ plan }) => plan.state === "active");
+  elements.objective.classList.remove("hidden");
+  elements.objective.innerHTML = `<div class="objective-title">${active ? "■" : "□"} ${escapeHtml(current.objective.title)}</div>
+    ${current.objective.description ? `<div class="objective-description">${escapeHtml(current.objective.description)}</div>` : ""}
+    ${current.plans.map(({ plan, notes }) => `<div class="objective-plan ${plan.state === "active" ? "active" : ""}"><span>${planSymbol(plan.state)}</span><span>${escapeHtml(plan.title)}${notes.length ? ` (${notes.length} ${notes.length === 1 ? "note" : "notes"})` : ""}</span></div>`).join("")}`;
+}
+
+function renderWorkMap() {
+  const workmap = currentStore()?.workmap || emptyWorkMap();
+  const objectives = workmap.history.length + (workmap.current ? 1 : 0);
+  const plans = [...workmap.history, ...(workmap.current ? [workmap.current] : [])].reduce((sum, objective) => sum + objective.plans.length, 0);
+  const notes = [...workmap.history, ...(workmap.current ? [workmap.current] : [])].reduce((sum, objective) => sum + objective.plans.reduce((value, plan) => value + plan.notes.length, 0), 0);
+  elements.workmapCount.textContent = `${workmap.recordCount} records · ${objectives} objectives · ${plans} plans · ${notes} notes`;
+  const historyIds = new Set(workmap.history.map(({ objective }) => objective.id));
+  for (const id of state.expandedHistoryObjectives) if (!historyIds.has(id)) state.expandedHistoryObjectives.delete(id);
+  elements.workmap.innerHTML = `${renderMemory(workmap.memory)}
+    <section class="workmap-section"><h2>History (${workmap.history.length})</h2>${workmap.history.length ? workmap.history.map((objective) => renderObjectiveCard(objective, state.expandedHistoryObjectives.has(objective.objective.id), true)).join("") : `<div class="workmap-empty">—</div>`}</section>
+    <section class="workmap-section"><h2>Current (${workmap.current ? 1 : 0})</h2>${workmap.current ? renderObjectiveCard(workmap.current, true) : `<div class="workmap-empty">—</div>`}</section>`;
+  const toggleHistory = (card) => {
+    if (window.getSelection()?.toString()) return;
+    const id = card.dataset.historyObjective;
+    if (state.expandedHistoryObjectives.has(id)) state.expandedHistoryObjectives.delete(id); else state.expandedHistoryObjectives.add(id);
+    renderWorkMap();
+  };
+  elements.workmap.querySelectorAll("[data-history-objective]").forEach((card) => {
+    card.addEventListener("click", () => toggleHistory(card));
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); toggleHistory(card); }
+    });
+  });
+}
+
+function renderMemory(memory) {
+  const count = memory.facts.length + memory.agreements.length;
+  if (!count) return `<section class="workmap-section"><h2>Memory (0)</h2><div class="workmap-empty">—</div></section>`;
+  const group = (title, items) => `<div class="memory-group"><h3>${title} (${items.length})</h3>${items.length ? items.map((item) => `<div class="memory-item"><span class="memory-label">${escapeHtml(memoryLabel(item))}</span>${escapeHtml(item.content)}</div>`).join("") : `<div class="workmap-empty">—</div>`}</div>`;
+  return `<section class="workmap-section"><h2>Memory (${count})</h2>${group("Facts", memory.facts)}${group("Agreements", memory.agreements)}</section>`;
+}
+
+function renderObjectiveCard(snapshot, detailed, expandable = false) {
+  const objective = snapshot.objective;
+  const behavior = expandable ? ` data-history-objective="${escapeAttr(objective.id)}" role="button" tabindex="0" aria-expanded="${detailed}"` : "";
+  const disclosure = expandable ? `<span class="disclosure">${detailed ? "▾" : "▸"}</span>` : "";
+  return `<article class="objective-card${expandable ? " history-card" : ""}"${behavior}><h3>${disclosure}${objectiveSymbol(objective.state)} ${escapeHtml(objective.title)}</h3>
+    ${detailed && objective.description ? `<div class="objective-meta">${escapeHtml(objective.description)}</div>` : ""}
+    ${objective.status_reason ? `<div class="objective-meta">${escapeHtml(objective.status_reason)}</div>` : ""}
+    ${detailed ? snapshot.plans.map(renderPlanCard).join("") : ""}</article>`;
+}
+
+function renderPlanCard({ plan, notes }) {
+  return `<div class="plan-card"><div class="plan-title">${planSymbol(plan.state)} ${escapeHtml(plan.title)}</div>
+    ${plan.description ? `<div class="plan-detail">${escapeHtml(plan.description)}</div>` : ""}
+    ${plan.outcome ? `<div class="plan-detail"><strong>Outcome:</strong> ${escapeHtml(plan.outcome)}</div>` : ""}
+    ${plan.verification ? `<div class="plan-detail"><strong>Verification:</strong> ${escapeHtml(plan.verification)}</div>` : ""}
+    ${plan.status_reason ? `<div class="plan-detail"><strong>Reason:</strong> ${escapeHtml(plan.status_reason)}</div>` : ""}
+    ${notes.map((note) => `<div class="plan-note"><span class="note-kind">${escapeHtml(String(note.kind).toUpperCase())}</span>${escapeHtml(note.content)}</div>`).join("")}</div>`;
+}
+
+function renderComposer() {
+  const meta = agentMeta();
+  const readOnly = meta?.kind === "sub-agent";
+  const worker = isWorkerAgent(meta);
+  const canStop = canControlRuntime(meta) && currentProjection().turnState?.state === "active";
+  elements.composer.classList.toggle("hidden", !meta);
+  elements.input.disabled = readOnly;
+  elements.send.disabled = readOnly;
+  elements.stop.disabled = !canStop;
+  elements.input.placeholder = readOnly ? `${worker ? "Worker" : "子 Agent"} 对话只读 · ${childStateLabel(currentStore()?.events || [])}` : "发送消息，输入 / 查看命令";
+  elements.inputHint.textContent = worker ? "可调整模型、推理强度或停止当前任务" : readOnly ? "子 Agent 仅允许查看" : "Enter 发送 · Shift+Enter 换行 · Esc 中止/撤回/清空";
+  renderSlashMenu();
+}
+
+function renderStatus() {
+  const projection = currentProjection();
+  const model = state.snapshot.models.find((model) => model.name === projection.model);
+  const canChange = canControlRuntime();
+  elements.statusModel.textContent = projection.model || "—";
+  elements.statusEffort.textContent = projection.effort || "—";
+  elements.statusLiveTokens.textContent = state.apiActivity.active
+    ? `↓ ${state.apiActivity.receivedSseEvents}` : "";
+  elements.statusModelTrigger.disabled = !canChange;
+  elements.statusEffortTrigger.disabled = !canChange || !model?.reasoning_efforts?.length;
+  elements.statusContextTrigger.disabled = !agentMeta();
+  elements.statusContext.textContent = `${formatTokens(projection.apiUsage?.total_tokens)}/${formatLimit(model?.context_window)}`;
+  const active = state.apiActivity.active || API_ACTIVE.has(projection.apiState);
+  elements.apiSpinner.textContent = active ? API_SPINNER_FRAMES[state.apiAnimationTick % API_SPINNER_FRAMES.length] : "";
+  if (state.contextDrawerOpen) renderContextDrawer();
+}
+
+const CONTEXT_CATEGORIES = [
+  { key: "system", label: "系统提示词", color: "var(--context-system)" },
+  { key: "compact", label: "上下文压缩", color: "var(--context-compact)" },
+  { key: "memory", label: "记忆", color: "var(--context-memory)" },
+  { key: "user", label: "用户消息", color: "var(--context-user)" },
+  { key: "model", label: "模型输出", color: "var(--context-assistant)" },
+  { key: "tool", label: "工具调用", color: "var(--context-tool)" },
+  { key: "reserve", label: "输出预留", color: "var(--context-reserve)" },
+];
+
+function estimateTokenWeight(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  let ascii = 0, nonAscii = 0;
+  for (const character of text) {
+    if (character.codePointAt(0) <= 0x7f) ascii += 1; else nonAscii += 1;
+  }
+  return text.length ? Math.max(1, Math.ceil(ascii / 4 + nonAscii)) : 0;
+}
+
+function latestCommittedUsageBoundary(events, expectedUsage) {
+  if (!expectedUsage) return null;
+  const effective = effectiveConversationEvents(events);
+  const errored = new Set();
+  let boundary = null;
+  for (const event of effective) {
+    const [kind, value] = eventParts(event);
+    if (kind !== "ApiStateUpdate") continue;
+    if (value.state === "Error") errored.add(value.api_call_id);
+    const committed = value.state === "Completed"
+      || (value.state === "Interrupted" && !errored.has(value.api_call_id));
+    if (committed && value.usage) boundary = value;
+  }
+  if (!boundary || boundary.usage.total_tokens !== expectedUsage.total_tokens) return null;
+  return events.findIndex((event) => eventParts(event)[1].id === boundary.id);
+}
+
+function estimateContextBreakdown(events, usage, memoryContent) {
+  const empty = { system: 0, compact: 0, memory: 0, user: 0, model: 0, tool: 0 };
+  const currentCompact = effectiveConversationEvents(events)
+    .map(eventParts)
+    .find(([kind, value]) => kind === "CompactStateUpdate" && value.state === "Completed");
+  const currentCompactContent = currentCompact?.[1].content ?? null;
+  const total = Number(usage?.total_tokens);
+  if (!Number.isFinite(total) || total < 0) return { total: null, values: empty, compactContent: currentCompactContent, memoryContent };
+  const boundary = latestCommittedUsageBoundary(events, usage);
+  if (boundary == null || boundary < 0) return { total, values: { ...empty, system: total }, compactContent: currentCompactContent, memoryContent };
+  const values = { ...empty };
+  let compactContent = null;
+  let activeMemoryContent = null;
+  for (const event of effectiveConversationEvents(events.slice(0, boundary + 1))) {
+    const [kind, value] = eventParts(event);
+    if (kind === "UserPrompt" || kind === "ManagerPrompt"
+        || kind === "ParentAgentPrompt" || kind === "FollowUpPrompt") {
+      values.user += estimateTokenWeight(value.content) + 8;
+    } else if (kind === "AssistResponse") {
+      values.model += estimateTokenWeight(value.content);
+    } else if (kind === "ToolCall") {
+      values.model += estimateTokenWeight(value.name) + estimateTokenWeight(value.arguments) + 12;
+    } else if (kind === "ToolInfoUpdate") {
+      values.tool += estimateTokenWeight(value.content) + 6;
+    } else if (kind === "ToolCallResult") {
+      values.tool += estimateTokenWeight(value.detail) + 8;
+    } else if (kind === "ModelContextItem") {
+      values.model += estimateTokenWeight(value.content);
+    } else if (kind === "CompactStateUpdate" && value.state === "Completed") {
+      compactContent = value.content;
+      values.compact += estimateTokenWeight(value.content) + 12;
+      if (memoryContent !== null) {
+        activeMemoryContent = memoryContent;
+        values.memory += estimateTokenWeight(memoryContent) + 12;
+      }
+    }
+  }
+  const known = Object.values(values).reduce((sum, value) => sum + value, 0);
+  if (known <= total) values.system += total - known;
+  else if (known > 0) {
+    const scale = total / known;
+    for (const category of Object.keys(values)) values[category] *= scale;
+  }
+  return { total, values, compactContent, memoryContent: activeMemoryContent };
+}
+
+function renderContextDrawer() {
+  const projection = currentProjection();
+  const model = state.snapshot.models.find((candidate) => candidate.name === projection.model);
+  const limit = Number(model?.context_window);
+  const { total, values: usageValues, compactContent, memoryContent } = estimateContextBreakdown(currentStore()?.events || [], projection.apiUsage, currentStore()?.turnHistory ?? null);
+  const configuredReserve = Number(model?.output_token_reservations?.[projection.effort] ?? 0);
+  const outputReserve = Number.isFinite(configuredReserve) && configuredReserve > 0 ? configuredReserve : 0;
+  const values = { ...usageValues, reserve: outputReserve };
+  const hasCompact = compactContent !== null;
+  const hasMemory = memoryContent !== null;
+  state.contextCompactContent = compactContent;
+  state.contextMemoryContent = memoryContent;
+  const validLimit = Number.isFinite(limit) && limit > 0 ? limit : null;
+  const percent = total == null || !validLimit ? null : total / validLimit * 100;
+  const chartTotal = total == null ? (validLimit || 1) : Math.max(validLimit || total || 1, total || 0);
+  const signature = JSON.stringify([state.selectedAgent, projection.model, total, validLimit, values, hasCompact, hasMemory, agentMeta()?.kind]);
+  if (state.contextDrawerSignature === signature) return;
+  state.contextDrawerSignature = signature;
+  const categories = CONTEXT_CATEGORIES.filter((category) => (category.key !== "compact" || hasCompact) && (category.key !== "memory" || hasMemory));
+  let offset = 0;
+  const segments = categories.map((category) => {
+    const rawLength = category.key === "reserve" || total != null ? values[category.key] / chartTotal * 100 : 0;
+    const length = Math.max(0, Math.min(rawLength, 100 - offset));
+    const formattedValue = formatContextCategoryTokens(category.key, values[category.key]);
+    const markup = length <= 0 ? "" : `<circle class="context-ring-segment" cx="90" cy="90" r="68" pathLength="100" transform="rotate(-90 90 90)" stroke="${category.color}" stroke-dasharray="${length} ${100 - length}" stroke-dashoffset="${-offset}"><title>${escapeHtml(category.label)} ${escapeHtml(formattedValue)}</title></circle>`;
+    offset += length;
+    return markup;
+  }).join("");
+  elements.contextRing.innerHTML = `<circle class="context-ring-track" cx="90" cy="90" r="68" pathLength="100"></circle>${segments}`;
+  elements.contextPercent.textContent = percent == null ? "—" : `${Math.round(percent)}%`;
+  elements.contextUsageText.textContent = `${formatTokens(total)} / ${formatLimit(validLimit)}`;
+  elements.contextBreakdown.innerHTML = categories.map((category) => {
+    const value = category.key === "reserve" ? values.reserve : (total == null ? null : values[category.key]);
+    const share = category.key === "reserve"
+      ? (validLimit ? value / validLimit * 100 : null)
+      : (total > 0 ? value / total * 100 : null);
+    const help = category.key === "compact"
+      ? `<button class="context-detail-help" type="button" data-detail="compact" aria-label="查看原始压缩内容" title="查看原始压缩内容">?</button>`
+      : category.key === "memory"
+        ? `<button class="context-detail-help" type="button" data-detail="memory" aria-label="查看记忆内容" title="查看记忆内容">?</button>`
+        : "";
+    return `<div class="context-breakdown-row"><span class="context-swatch" style="background:${category.color}"></span><span class="context-breakdown-label">${escapeHtml(category.label)}${help}</span><strong class="context-breakdown-value">${escapeHtml(formatContextCategoryTokens(category.key, value))}</strong><span class="context-breakdown-percent">${share == null ? "—" : `${share.toFixed(1)}%`}</span></div>`;
+  }).join("");
+  elements.contextClear.disabled = !agentMeta() || agentMeta().kind === "sub-agent";
+}
+
+function openContextDrawer() {
+  if (!agentMeta()) return;
+  closeChoiceDrawer();
+  closeModal();
+  state.contextDrawerOpen = true;
+  state.contextDrawerSignature = null;
+  elements.statusContextTrigger.setAttribute("aria-expanded", "true");
+  renderContextDrawer();
+  elements.contextDrawerBackdrop.classList.remove("hidden");
+}
+
+function closeContextDrawer() {
+  state.contextDrawerOpen = false;
+  state.contextDrawerSignature = null;
+  state.contextCompactContent = null;
+  state.contextMemoryContent = null;
+  elements.statusContextTrigger.setAttribute("aria-expanded", "false");
+  elements.contextDrawerBackdrop.classList.add("hidden");
+}
+
+function openContextDetail(title, content, markdown = false) {
+  closeContextDrawer();
+  elements.compactSummaryTitle.textContent = title;
+  if (markdown) {
+    elements.compactSummaryContent.innerHTML = renderMarkdown(content);
+  } else {
+    const pre = document.createElement("pre");
+    pre.className = "context-detail-raw";
+    pre.textContent = content;
+    elements.compactSummaryContent.replaceChildren(pre);
+  }
+  elements.compactSummaryBackdrop.classList.remove("hidden");
+  elements.compactSummaryClose.focus();
+}
+
+function closeCompactSummary() {
+  elements.compactSummaryBackdrop.classList.add("hidden");
+  elements.compactSummaryContent.replaceChildren();
+}
+
+function confirmContextClear() {
+  if (!state.selectedAgent || agentMeta()?.kind === "sub-agent") return;
+  const agentId = state.selectedAgent;
+  closeContextDrawer();
+  openConfirm("清空上下文？", "", "清空上下文", () => sendCommand({ command: "clear_context", agent_id: agentId }), true);
+}
+
+async function renderTerminal() {
+  const sessionId = state.view.sessionId;
+  if (!sessionId || !state.selectedAgent) return;
+  try {
+    const payload = await api(`/api/terminal/${state.selectedAgent}/${sessionId}`);
+    if (state.view.kind !== "terminal" || state.view.sessionId !== sessionId) return;
+    const frame = payload.frame;
+    if (!frame) {
+      showTerminalMessage(`Terminal ${sessionId} 已不可用`);
+      return;
+    }
+    const revisionKey = `${state.selectedAgent}:${sessionId}`;
+    const previousRevision = state.terminalRevisions.get(revisionKey) || 0;
+    if (frame.revision < previousRevision) return;
+    state.terminalRevisions.set(revisionKey, frame.revision);
+    const metrics = terminalCapacity();
+    if (metrics.columns < frame.width || metrics.rows < frame.height) {
+      showTerminalMessage(`Terminal ${sessionId} 需要至少 ${frame.width}×${frame.height}，当前约为 ${metrics.columns}×${metrics.rows}；请扩大窗口`);
+      return;
+    }
+    elements.terminalMessage.classList.add("hidden");
+    elements.terminalScreen.classList.remove("hidden");
+    elements.terminalScreen.style.minWidth = `${frame.width}ch`;
+    const styles = new Map((frame.style_defs || []).map((definition) => [definition.id, definition.style]));
+    elements.terminalScreen.innerHTML = (frame.rows || []).map((row) => {
+      const runs = (row.runs || []).map((run) => `<span style="left:${run.col}ch;${terminalStyle(styles.get(run.style))}">${escapeHtml(run.text)}</span>`).join("");
+      const cursor = frame.cursor.visible && frame.cursor.row === row.row
+        ? `<span class="terminal-cursor" style="left:${frame.cursor.col}ch;width:${frame.cursor.wide ? 2 : 1}ch"></span>` : "";
+      return `<div class="terminal-row" style="width:${frame.width}ch;position:relative"><span style="position:absolute">${" ".repeat(frame.width)}</span>${runs}${cursor}</div>`;
+    }).join("");
+  } catch (error) {
+    showTerminalMessage(error.message);
+  }
+}
+
+function showTerminalMessage(message) {
+  elements.terminalMessage.textContent = message;
+  elements.terminalMessage.classList.remove("hidden");
+  elements.terminalScreen.classList.add("hidden");
+}
+
+function terminalCapacity() {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  context.font = getComputedStyle(elements.terminalScreen).font;
+  const width = context.measureText("M").width || 8;
+  const lineHeight = parseFloat(getComputedStyle(elements.terminalScreen).lineHeight) || 18;
+  return {
+    columns: Math.floor((elements.terminalView.clientWidth - 40) / width),
+    rows: Math.floor((elements.terminalView.clientHeight - 40) / lineHeight),
+  };
+}
+
+function terminalStyle(style = {}) {
+  let foreground = colorCss(style.foreground), background = colorCss(style.background);
+  if (style.inverse) [foreground, background] = [background || "#0b0c10", foreground || "#f2f3f5"];
+  return `position:absolute;${foreground ? `color:${foreground};` : ""}${background ? `background:${background};` : ""}${style.bold ? "font-weight:700;" : ""}${style.dim ? "opacity:.55;" : ""}${style.italic ? "font-style:italic;" : ""}${style.underline ? "text-decoration:underline;" : ""}`;
+}
+
+function colorCss(color) {
+  if (!color) return null;
+  if (color.kind === "rgb") return `rgb(${color.value.join(",")})`;
+  if (color.kind !== "indexed") return null;
+  const index = color.value;
+  const base = ["#000000", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5", "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff"];
+  if (index < 16) return base[index];
+  if (index >= 232) { const value = 8 + (index - 232) * 10; return `rgb(${value},${value},${value})`; }
+  const n = index - 16, levels = [0, 95, 135, 175, 215, 255];
+  return `rgb(${levels[Math.floor(n / 36)]},${levels[Math.floor(n / 6) % 6]},${levels[n % 6]})`;
+}
+
+function renderSlashMenu() {
+  const value = elements.input.value;
+  const matches = value.startsWith("/") && !value.includes(" ")
+    ? COMMANDS.filter(([name]) => name.startsWith(value)) : [];
+  if (!matches.length) { elements.slashMenu.classList.add("hidden"); return; }
+  state.slashIndex = Math.min(state.slashIndex, matches.length - 1);
+  elements.slashMenu.classList.remove("hidden");
+  elements.slashMenu.innerHTML = matches.map(([name, description], index) =>
+    `<button class="slash-item ${index === state.slashIndex ? "selected" : ""}" data-command="${name}"><strong>${name}</strong><span>${description}</span></button>`).join("");
+  elements.slashMenu.querySelectorAll("[data-command]").forEach((button) => button.addEventListener("click", () => openSlashCommand(button.dataset.command)));
+}
+
+async function openSlashCommand(name) {
+  elements.input.value = "";
+  saveDraft();
+  state.slashIndex = 0;
+  autoSizeInput();
+  renderSlashMenu();
+  if (!agentMeta() && name !== "/agent-add") return;
+  if (name === "/agent-add") return openAddAgent();
+  if (name === "/agent-delete") return openDeleteAgent();
+  if (name === "/model") return openModel();
+  if (name === "/effort") return openEffort();
+  if (name === "/clear") return openConfirm("清空上下文？", "", "清空上下文", () => sendCommand({ command: "clear_context", agent_id: state.selectedAgent }));
+  if (name === "/rewind") return openRewind();
+  if (name === "/exit") { window.close(); toast("浏览器不允许页面自行关闭时，请直接关闭标签页。"); }
+}
+
+function openModel() {
+  const projection = currentProjection();
+  openChoice("切换模型", "选择后将从下一次回复开始生效。", state.snapshot.models.map((model) => ({ value: model.name, label: model.name })), projection.model,
+    (model) => sendCommand({ command: "change_model", agent_id: state.selectedAgent, model }));
+}
+
+function openEffort() {
+  const projection = currentProjection();
+  const model = state.snapshot.models.find((candidate) => candidate.name === projection.model);
+  openChoice("切换推理强度", "选择后将从下一次回复开始生效。", (model?.reasoning_efforts || []).map((effort) => ({ value: effort, label: effort })), projection.effort,
+    (effort) => sendCommand({ command: "change_effort", agent_id: state.selectedAgent, effort }));
+}
+
+function openModelDrawer() {
+  const agentId = state.selectedAgent;
+  if (!agentId || !canControlRuntime()) return;
+  const projection = currentProjection();
+  openChoiceDrawer("切换模型", "选择后将从下一次回复开始生效。", state.snapshot.models.map((model) => ({
+    value: model.name,
+    label: model.name,
+    detail: `上下文 ${formatLimit(model.context_window)}`,
+  })), projection.model, (model) => sendCommand({ command: "change_model", agent_id: agentId, model }));
+}
+
+function openEffortDrawer() {
+  const agentId = state.selectedAgent;
+  if (!agentId || !canControlRuntime()) return;
+  const projection = currentProjection();
+  const model = state.snapshot.models.find((candidate) => candidate.name === projection.model);
+  openChoiceDrawer("切换推理强度", `当前模型：${projection.model || "—"}`, (model?.reasoning_efforts || []).map((effort) => ({
+    value: effort,
+    label: effort,
+  })), projection.effort, (effort) => sendCommand({ command: "change_effort", agent_id: agentId, effort }));
+}
+
+function rewindChoices(events) {
+  return [...events].reverse().flatMap((event) => {
+    const [kind, value] = eventParts(event);
+    if (kind === "UserPrompt") return [{ value: value.id, label: collapse(value.content), detail: "用户消息" }];
+    if (kind === "ContextCleared") return [{ value: value.id, label: "上下文已清空", detail: "清理位置" }];
+    if (kind === "CompactStateUpdate" && value.state === "Completed") return [{ value: value.id, label: "上下文已压缩", detail: "压缩位置" }];
+    return [];
+  });
+}
+
+function openRewind() {
+  const choices = rewindChoices(currentStore()?.events || []);
+  openChoice("撤回", "所选位置及其后的内容将从当前会话中永久移除。", choices, choices[0]?.value,
+    (eventId) => sendCommand({ command: "rewind_context", agent_id: state.selectedAgent, event_id: Number(eventId) }));
+}
+
+function openAddAgent() {
+  const choices = (state.snapshot.orchestrators || []).map((orchestrator) => ({ value: orchestrator, label: orchestrator }));
+  openChoice("创建新的会话？", "选择该会话使用的编排器。创建后不可更改。", choices, state.snapshot.default_orchestrator,
+    async (orchestrator) => {
+    const payload = await sendCommand({ command: "add_agent", orchestrator });
+    const id = payload?.receipt?.agent_id;
+    if (id) state.pendingAgentSelection = id;
+  });
+}
+
+async function openDeleteAgent(agentId = state.selectedAgent) {
+  if (!agentId) return;
+  try {
+    const agent = state.snapshot.agents.find((candidate) => candidate.id === agentId);
+    if (!agent) return toast("该会话已不存在", true);
+    const label = agent.title || agent.id;
+    const payload = await api(`/api/deletion-blocker/${agentId}`);
+    if (payload.blocker) return openConfirm("无法删除会话", `“${label}”当前不可删除：${payload.blocker}`, "返回", async () => {});
+    openConfirm("删除会话？", `将永久删除“${label}”及其全部记录。此操作不可恢复。`, "永久删除", async () => {
+      await sendCommand({ command: "delete_agent", agent_id: agentId });
+    }, true);
+  } catch (error) { toast(error.message, true); }
+}
+
+function openChoice(title, description, choices, selectedValue, onConfirm) {
+  if (!choices.length) return toast("没有可用选项", true);
+  const selected = choices.some((choice) => String(choice.value) === String(selectedValue)) ? selectedValue : choices[0].value;
+  openModal({ title, description, choices, selected, confirmLabel: "确认", onConfirm });
+}
+
+function openChoiceDrawer(title, description, choices, selectedValue, onSelect) {
+  if (!choices.length) return toast("没有可用选项", true);
+  closeModal();
+  closeContextDrawer();
+  const selected = choices.some((choice) => String(choice.value) === String(selectedValue)) ? selectedValue : null;
+  state.drawer = { title, description, choices, selected, onSelect, busy: false };
+  elements.drawerTitle.textContent = title;
+  elements.drawerDescription.textContent = description;
+  elements.drawerDescription.classList.toggle("hidden", !description);
+  elements.drawerContent.innerHTML = choices.map((choice) => {
+    const current = String(choice.value) === String(selected);
+    return `<button class="drawer-choice ${current ? "current" : ""}" type="button" data-value="${escapeAttr(choice.value)}">
+      <span class="drawer-choice-copy"><span class="drawer-choice-label">${escapeHtml(choice.label)}</span>${choice.detail ? `<small>${escapeHtml(choice.detail)}</small>` : ""}</span>
+      <span class="drawer-choice-mark">${current ? "✓" : ""}</span>
+    </button>`;
+  }).join("");
+  elements.drawerContent.querySelectorAll(".drawer-choice").forEach((button) => button.addEventListener("click", () => selectDrawerChoice(button.dataset.value)));
+  elements.drawerBackdrop.classList.remove("hidden");
+  elements.drawerContent.querySelector(".drawer-choice.current")?.focus();
+}
+
+function closeChoiceDrawer() {
+  if (state.drawer?.busy) return;
+  state.drawer = null;
+  elements.drawerBackdrop.classList.add("hidden");
+}
+
+async function selectDrawerChoice(value) {
+  const drawer = state.drawer;
+  if (!drawer || drawer.busy) return;
+  if (String(value) === String(drawer.selected)) {
+    closeChoiceDrawer();
+    return;
+  }
+  drawer.busy = true;
+  elements.drawerContent.querySelectorAll(".drawer-choice").forEach((button) => { button.disabled = true; });
+  try {
+    await drawer.onSelect(value);
+    drawer.busy = false;
+    closeChoiceDrawer();
+  } catch (error) {
+    drawer.busy = false;
+    elements.drawerContent.querySelectorAll(".drawer-choice").forEach((button) => { button.disabled = false; });
+    toast(error.message, true);
+  }
+}
+
+function openConfirm(title, description, confirmLabel, onConfirm, danger = false) {
+  openModal({ title, description, choices: [], selected: null, confirmLabel, onConfirm, danger });
+}
+
+function openModal(modal) {
+  state.modal = modal;
+  elements.modalTitle.textContent = modal.title;
+  elements.modalDescription.textContent = modal.description;
+  elements.modalDescription.classList.toggle("hidden", !modal.description);
+  elements.modalConfirm.textContent = modal.confirmLabel;
+  elements.modalConfirm.classList.toggle("danger", !!modal.danger);
+  elements.modalContent.innerHTML = modal.choices.length ? `<div class="choice-list">${modal.choices.map((choice) => `<label class="choice ${String(choice.value) === String(modal.selected) ? "selected" : ""}"><input type="radio" name="modal-choice" value="${escapeAttr(choice.value)}" ${String(choice.value) === String(modal.selected) ? "checked" : ""}><span>${escapeHtml(choice.label)}${choice.detail ? `<small>${escapeHtml(choice.detail)}</small>` : ""}</span></label>`).join("")}</div>` : "";
+  elements.modalContent.classList.toggle("hidden", !modal.choices.length);
+  elements.modalContent.querySelectorAll("input").forEach((input) => input.addEventListener("change", () => {
+    state.modal.selected = input.value;
+    elements.modalContent.querySelectorAll(".choice").forEach((choice) => choice.classList.toggle("selected", choice.contains(input)));
+  }));
+  elements.modalBackdrop.classList.remove("hidden");
+}
+
+function closeModal() {
+  state.modal = null;
+  elements.modalBackdrop.classList.add("hidden");
+}
+
+async function confirmModal() {
+  const modal = state.modal;
+  if (!modal) return;
+  elements.modalConfirm.disabled = true;
+  try {
+    await modal.onConfirm(modal.selected);
+    closeModal();
+  } catch (error) { toast(error.message, true); }
+  finally { elements.modalConfirm.disabled = false; }
+}
+
+async function sendCommand(payload) {
+  return command(payload);
+}
+
+async function submitPrompt() {
+  const content = elements.input.value.trim();
+  if (!content || !state.selectedAgent || agentMeta()?.kind === "sub-agent") return;
+  if (content.startsWith("/") && COMMANDS.some(([name]) => name === content)) return openSlashCommand(content);
+  const agentId = state.selectedAgent;
+  const store = currentStore();
+  store.pendingPromptSubmissions += 1;
+  elements.input.value = "";
+  state.drafts.set(agentId, "");
+  autoSizeInput();
+  renderSlashMenu();
+  await pauseDraftSyncForSubmission(agentId);
+  try {
+    const response = await sendCommand({ command: "submit_user_prompt", agent_id: agentId, content });
+    const revision = Number(response?.receipt?.prompt_submission_revision);
+    if (!Number.isSafeInteger(revision)) throw new Error("消息发送失败：服务返回了无效结果");
+    store.promptSubmissionRevision = Math.max(store.promptSubmissionRevision, revision);
+  } catch (error) {
+    if (state.selectedAgent === agentId && !elements.input.value) {
+      elements.input.value = content;
+      autoSizeInput();
+      renderSlashMenu();
+    }
+    state.drafts.set(agentId, state.selectedAgent === agentId ? elements.input.value : content);
+    toast(error.message, true);
+  } finally {
+    resumeDraftSync(agentId);
+    store.pendingPromptSubmissions = Math.max(0, store.pendingPromptSubmissions - 1);
+  }
+}
+
+async function stopGeneration() {
+  if (!state.selectedAgent || !canControlRuntime()) return;
+  if (currentProjection().turnState?.state !== "active") return;
+  elements.stop.disabled = true;
+  try { await sendCommand({ command: "abort_turn", agent_id: state.selectedAgent }); }
+  catch (error) { renderComposer(); toast(error.message, true); }
+}
+
+async function escapeAction() {
+  if (!state.selectedAgent || agentMeta()?.kind === "sub-agent") return;
+  flushPendingRender();
+  const turn = currentProjection().turnState;
+  try {
+    if (turn?.state === "active") await sendCommand({ command: "abort_turn", agent_id: state.selectedAgent });
+    else if (turn?.state === "aborting") toast("正在等待当前生成中止");
+    else if (turn?.state === "aborted") await sendCommand({ command: "rewind_context", agent_id: state.selectedAgent, event_id: turn.promptId });
+    else { elements.input.value = ""; saveDraft(); autoSizeInput(); renderSlashMenu(); }
+  } catch (error) { toast(error.message, true); }
+}
+
+function saveDraft() {
+  if (!state.selectedAgent) return;
+  const content = elements.input.value;
+  state.drafts.set(state.selectedAgent, content);
+  queueDraftUpdate(state.selectedAgent, content);
+}
+
+function queueDraftUpdate(agentId, content) {
+  let sync = state.draftSync.get(agentId);
+  if (!sync) {
+    sync = { desired: content, sent: null, sending: false, paused: false, waiters: [] };
+    state.draftSync.set(agentId, sync);
+  } else sync.desired = content;
+  void runDraftSync(agentId, sync);
+}
+
+async function runDraftSync(agentId, sync) {
+  if (sync.sending || sync.paused) return;
+  sync.sending = true;
+  try {
+    while (!sync.paused && sync.sent !== sync.desired) {
+      const content = sync.desired;
+      sync.sent = content;
+      const response = await sendCommand({ command: "update_input_draft", agent_id: agentId, content });
+      const revision = Number(response?.receipt?.input_draft_revision);
+      const store = state.stores.get(agentId);
+      if (store && Number.isSafeInteger(revision)) {
+        store.inputDraftRevision = Math.max(store.inputDraftRevision, revision);
+      }
+      state.drafts.set(agentId, content);
+    }
+  } catch (error) {
+    sync.sent = null;
+    toast(`输入同步失败：${error.message}`, true);
+  } finally {
+    const shouldRetry = sync.sent !== sync.desired;
+    sync.sending = false;
+    const waiters = sync.waiters.splice(0);
+    waiters.forEach((resolve) => resolve());
+    if (!sync.paused && shouldRetry) void runDraftSync(agentId, sync);
+  }
+}
+
+async function pauseDraftSyncForSubmission(agentId) {
+  let sync = state.draftSync.get(agentId);
+  if (!sync) {
+    sync = { desired: "", sent: null, sending: false, paused: true, waiters: [] };
+    state.draftSync.set(agentId, sync);
+  } else {
+    sync.desired = "";
+    sync.paused = true;
+  }
+  while (sync.sending) await new Promise((resolve) => sync.waiters.push(resolve));
+}
+
+function resumeDraftSync(agentId) {
+  const sync = state.draftSync.get(agentId);
+  if (!sync) return;
+  // The accepted prompt cleared the runtime draft. Treat that clear as the new
+  // synchronization baseline, then preserve text typed while submission was in flight.
+  sync.sent = "";
+  sync.desired = state.selectedAgent === agentId
+    ? elements.input.value
+    : (state.drafts.get(agentId) || "");
+  sync.paused = false;
+  void runDraftSync(agentId, sync);
+}
+
+function restoreDraft() {
+  elements.input.value = state.drafts.get(state.selectedAgent) || "";
+  autoSizeInput();
+}
+
+function flushDraftBeforePageCloses() {
+  const drafts = new Map();
+  for (const [agentId, sync] of state.draftSync) {
+    if (sync.sent !== sync.desired) drafts.set(agentId, sync.desired);
+  }
+  if (state.selectedAgent && agentMeta()?.kind !== "sub-agent") {
+    drafts.set(state.selectedAgent, elements.input.value);
+  }
+  for (const [agentId, content] of drafts) {
+    const body = JSON.stringify({ command: "update_input_draft", agent_id: agentId, content });
+    if (navigator.sendBeacon
+      && navigator.sendBeacon("/api/command", new Blob([body], { type: "application/json" }))) continue;
+    void fetch("/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      cache: "no-store",
+      keepalive: true,
+    });
+  }
+}
+
+function autoSizeInput() {
+  if (state.inputResizeFrame !== null) return;
+  state.inputResizeFrame = requestAnimationFrame(() => {
+    state.inputResizeFrame = null;
+    elements.input.style.height = "auto";
+    elements.input.style.height = `${Math.min(elements.input.scrollHeight, 180)}px`;
+  });
+}
+
+function positionToastRegion() {
+  const tabs = elements.tabs.getBoundingClientRect();
+  elements.toasts.style.top = `${Math.ceil(tabs.bottom + 10)}px`;
+}
+
+function toast(message, error = false) {
+  positionToastRegion();
+  const node = document.createElement("div");
+  node.className = `toast ${error ? "error" : ""}`;
+  node.textContent = message;
+  elements.toasts.append(node);
+  setTimeout(() => node.remove(), 3500);
+}
+
+function childStateLabel(events) {
+  const latest = [...events].reverse().map(eventParts).find(([kind]) => kind === "AgentTurn")?.[1];
+  if (!latest) return "working";
+  return normalize(latest.state);
+}
+
+function planSymbol(value) { return ({ planned: "□", active: "■", completed: "✓", cancelled: "×", superseded: "×" })[normalize(value)] || "·"; }
+function objectiveSymbol(value) { return ({ active: "■", completed: "✓", cancelled: "×", superseded: "×" })[normalize(value)] || "·"; }
+function memoryLabel(memory) {
+  if (memory.kind === "agreement") return "AGREEMENT";
+  return `FACT${memory.basis ? ` · ${memory.basis.replaceAll("_", " ").toUpperCase()}` : ""}`;
+}
+function normalize(value) { return String(value || "").replace(/([a-z])([A-Z])/g, "$1-$2").replaceAll("_", "-").toLowerCase(); }
+function collapse(value) { return String(value || "").trim().replace(/\s+/g, " ").slice(0, 120); }
+function formatBytes(value) { if (value < 1024) return `${value} B`; if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KiB`; return `${(value / 1024 ** 2).toFixed(1)} MiB`; }
+function formatDuration(ms) { if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`; return `${(ms / 1000).toFixed(ms % 1000 ? 1 : 0)}s`; }
+function formatTurnElapsed(ms) {
+  const totalSeconds = Math.max(0, Math.floor(Number(ms) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor(totalSeconds % 3600 / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
+  if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  return `${seconds}s`;
+}
+
+function completedTurnContextGrowth(completedApiUsage, promptId, contextBaseline) {
+  const calls = [...completedApiUsage.values()].filter((entry) => entry.promptId === promptId);
+  if (!calls.length || !calls[0].usage || !calls.at(-1).usage) return null;
+  const baseline = contextBaseline ?? calls[0].usage.input_tokens;
+  return Math.max(0, Number(calls.at(-1).usage.total_tokens) - Number(baseline));
+}
+
+function formatTurnTokens(tokens) {
+  return tokens == null ? "—" : `${(Math.max(0, Number(tokens)) / 1000).toFixed(1)}k`;
+}
+function formatTokens(value) { return value == null ? "—" : `${(value / 1000).toFixed(1)}k`; }
+function formatLimit(value) { if (value == null) return "—"; return value % 1000 === 0 ? `${value / 1000}k` : `${(value / 1000).toFixed(1)}k`; }
+function formatEstimatedTokens(value) { if (value == null) return "—"; return value < 1000 ? `≈${Math.round(value)} tok` : `≈${(value / 1000).toFixed(1)}k`; }
+function formatContextCategoryTokens(category, value) { return category === "reserve" ? formatTokens(value) : formatEstimatedTokens(value); }
+function escapeHtml(value) { return String(value ?? "").replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]); }
+function escapeAttr(value) { return escapeHtml(value); }
+
+function renderMarkdown(source) {
+  return globalThis.MeMarkdown.render(source);
+}
+
+elements.tabs.querySelectorAll("button[data-view]").forEach((button) => button.addEventListener("click", () => {
+  showView({ kind: button.dataset.view, sessionId: null });
+}));
+elements.loginForm.addEventListener("submit", submitLogin);
+elements.addAgent.addEventListener("click", () => { closeMobileSidebar(); openAddAgent(); });
+elements.mobileDeleteAgent.addEventListener("click", () => { closeMobileSidebar(); openDeleteAgent(); });
+elements.mobileSidebarToggle.addEventListener("click", openMobileSidebar);
+elements.mobileSidebarBackdrop.addEventListener("click", closeMobileSidebar);
+PORTRAIT_LAYOUT.addEventListener("change", closeMobileSidebar);
+elements.deleteAgentMenu.addEventListener("click", () => {
+  const menu = state.agentMenu;
+  closeAgentMenu();
+  closeMobileSidebar();
+  if (menu) void openDeleteAgent(menu.agentId);
+});
+elements.copyUserMessage.addEventListener("click", async () => {
+  const menu = state.userMenu;
+  closeUserMessageMenu();
+  if (!menu) return;
+  try { await copyTextToClipboard(menu.content); toast("已复制"); }
+  catch (error) { toast(error.message, true); }
+});
+elements.rewindUserMessage.addEventListener("click", () => {
+  const menu = state.userMenu;
+  closeUserMessageMenu();
+  if (!menu?.rewindable) return;
+  openConfirm("撤回这条消息？", "该消息及其后的内容将从当前会话中永久移除。", "撤回", () => sendCommand({
+    command: "rewind_context",
+    agent_id: menu.agentId,
+    event_id: menu.eventId,
+  }), true);
+});
+elements.deleteUserTurn.addEventListener("click", () => {
+  const menu = state.userMenu;
+  closeUserMessageMenu();
+  if (!menu?.deletable) return;
+  openConfirm("删除这一轮？", "这条用户消息及其对应回复将被永久移除。", "删除", () => sendCommand({
+    command: "delete_turn",
+    agent_id: menu.agentId,
+    prompt_id: menu.eventId,
+  }), true);
+});
+elements.stop.addEventListener("click", stopGeneration);
+elements.send.addEventListener("click", submitPrompt);
+elements.scrollToBottom.addEventListener("click", scrollTranscriptToBottomAfterLayout);
+elements.statusModelTrigger.addEventListener("click", openModelDrawer);
+elements.statusEffortTrigger.addEventListener("click", openEffortDrawer);
+elements.statusContextTrigger.addEventListener("click", openContextDrawer);
+elements.input.addEventListener("input", () => {
+  state.lastInputAt = performance.now();
+  saveDraft(); state.slashIndex = 0; autoSizeInput(); renderSlashMenu();
+});
+elements.input.addEventListener("compositionstart", () => { state.composing = true; });
+elements.input.addEventListener("compositionend", () => {
+  state.composing = false;
+  state.lastInputAt = performance.now();
+});
+function enterSubmitsInCurrentLayout(event) {
+  return event.key === "Enter" && !event.shiftKey && !PORTRAIT_LAYOUT.matches;
+}
+elements.input.addEventListener("keydown", (event) => {
+  if (state.composing || event.isComposing || event.keyCode === 229) return;
+  const visible = !elements.slashMenu.classList.contains("hidden");
+  const matches = COMMANDS.filter(([name]) => name.startsWith(elements.input.value));
+  if (visible && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+    event.preventDefault();
+    state.slashIndex = (state.slashIndex + (event.key === "ArrowDown" ? 1 : -1) + matches.length) % matches.length;
+    renderSlashMenu();
+  } else if (visible && enterSubmitsInCurrentLayout(event)) {
+    event.preventDefault(); openSlashCommand(matches[state.slashIndex]?.[0]);
+  } else if (enterSubmitsInCurrentLayout(event)) {
+    event.preventDefault(); submitPrompt();
+  } else if (event.key === "Escape") {
+    event.preventDefault(); escapeAction();
+  }
+});
+elements.modalClose.addEventListener("click", closeModal);
+elements.modalCancel.addEventListener("click", closeModal);
+elements.modalConfirm.addEventListener("click", confirmModal);
+elements.modalBackdrop.addEventListener("click", (event) => { if (event.target === elements.modalBackdrop) closeModal(); });
+elements.drawerClose.addEventListener("click", closeChoiceDrawer);
+elements.drawerBackdrop.addEventListener("click", (event) => { if (event.target === elements.drawerBackdrop) closeChoiceDrawer(); });
+elements.contextDrawerClose.addEventListener("click", closeContextDrawer);
+elements.contextDrawerBackdrop.addEventListener("click", (event) => { if (event.target === elements.contextDrawerBackdrop) closeContextDrawer(); });
+elements.contextBreakdown.addEventListener("click", (event) => {
+  const button = event.target.closest(".context-detail-help");
+  if (button?.dataset.detail === "compact" && state.contextCompactContent !== null) {
+    openContextDetail("上下文压缩", state.contextCompactContent, true);
+  } else if (button?.dataset.detail === "memory" && state.contextMemoryContent !== null) {
+    openContextDetail("记忆", state.contextMemoryContent);
+  }
+});
+elements.contextClear.addEventListener("click", confirmContextClear);
+elements.compactSummaryClose.addEventListener("click", closeCompactSummary);
+elements.compactSummaryBackdrop.addEventListener("click", (event) => { if (event.target === elements.compactSummaryBackdrop) closeCompactSummary(); });
+document.addEventListener("click", (event) => {
+  if (state.userMenu && !elements.userMessageMenu.contains(event.target)) closeUserMessageMenu();
+  if (state.agentMenu && !elements.agentMenu.contains(event.target)) closeAgentMenu();
+});
+window.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!elements.compactSummaryBackdrop.classList.contains("hidden")) closeCompactSummary(); else if (state.contextDrawerOpen) closeContextDrawer(); else if (state.drawer) closeChoiceDrawer(); else if (state.modal) closeModal(); else if (state.userMenu) closeUserMessageMenu(); else if (state.agentMenu) closeAgentMenu();
+});
+window.addEventListener("resize", () => {
+  closeUserMessageMenu();
+  closeAgentMenu();
+  positionToastRegion();
+  updateScrollToBottomButton();
+  if (state.view.kind === "terminal") void renderTerminal();
+});
+window.addEventListener("pagehide", flushDraftBeforePageCloses);
+elements.transcript.addEventListener("scroll", () => {
+  closeUserMessageMenu();
+  updateScrollToBottomButton();
+}, { passive: true });
+elements.agents.addEventListener("scroll", closeAgentMenu, { passive: true });
+elements.transcript.addEventListener("wheel", suspendTranscriptAutoFollow, { passive: true });
+elements.transcript.addEventListener("touchstart", suspendTranscriptAutoFollow, { passive: true });
+elements.transcript.addEventListener("touchend", suspendTranscriptAutoFollow, { passive: true });
+elements.transcript.addEventListener("pointerdown", suspendTranscriptAutoFollow);
+elements.transcript.addEventListener("pointerup", suspendTranscriptAutoFollow);
+function refreshRunningToolElapsed() {
+  if (inputHasPriority()) return;
+  elements.transcript.querySelectorAll("[data-running-started]").forEach((node) => {
+    const text = `Running ... ${formatDuration(Date.now() - Number(node.dataset.runningStarted))}`;
+    if (node.textContent !== text) node.textContent = text;
+  });
+}
+setInterval(refreshRunningToolElapsed, 100);
+setInterval(() => {
+  if (performance.now() - state.lastInputAt < INPUT_ANIMATION_QUIET_MS) return;
+  state.apiAnimationTick += 1;
+  elements.apiSpinner.textContent = (state.apiActivity.active
+    || API_ACTIVE.has(currentProjection().apiState))
+    ? API_SPINNER_FRAMES[state.apiAnimationTick % API_SPINNER_FRAMES.length]
+    : "";
+}, 100);
+
+initializeAuthentication();
