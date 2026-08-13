@@ -777,13 +777,14 @@ enum SlashCommand {
     AgentDelete,
     Model,
     Effort,
+    Stop,
     Clear,
     Rewind,
     Exit,
 }
 
 impl SlashCommand {
-    const ALL: [Self; 7] = [
+    const INTERACTIVE: [Self; 7] = [
         Self::AgentAdd,
         Self::AgentDelete,
         Self::Model,
@@ -792,6 +793,7 @@ impl SlashCommand {
         Self::Rewind,
         Self::Exit,
     ];
+    const WORKER: [Self; 4] = [Self::Model, Self::Effort, Self::Stop, Self::Clear];
 
     fn name(self) -> &'static str {
         match self {
@@ -799,6 +801,7 @@ impl SlashCommand {
             Self::AgentDelete => "/agent-delete",
             Self::Model => "/model",
             Self::Effort => "/effort",
+            Self::Stop => "/stop",
             Self::Clear => "/clear",
             Self::Rewind => "/rewind",
             Self::Exit => "/exit",
@@ -811,9 +814,25 @@ impl SlashCommand {
             Self::AgentDelete => "永久删除当前空闲 Agent",
             Self::Model => "切换当前模型",
             Self::Effort => "选择推理强度",
+            Self::Stop => "停止 Worker 当前任务",
             Self::Clear => "清空当前上下文",
             Self::Rewind => "回溯到指定消息、上下文清理或上下文压缩之前",
             Self::Exit => "退出 me",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandScope {
+    Interactive,
+    Worker,
+}
+
+impl CommandScope {
+    fn commands(self) -> &'static [SlashCommand] {
+        match self {
+            Self::Interactive => &SlashCommand::INTERACTIVE,
+            Self::Worker => &SlashCommand::WORKER,
         }
     }
 }
@@ -834,6 +853,7 @@ enum RewindChoiceKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OverlayState {
     Commands {
+        scope: CommandScope,
         selected: usize,
     },
     Effort {
@@ -950,6 +970,24 @@ impl TuiSession {
 
     fn current_model(&self) -> Option<&str> {
         self.projection.model_name.as_deref()
+    }
+
+    fn command_scope(&self) -> Option<CommandScope> {
+        match (self.read_only_state, self.orchestrator_name.as_str()) {
+            (None, _) => Some(CommandScope::Interactive),
+            (Some(_), "worker-agent") => Some(CommandScope::Worker),
+            (Some(_), _) => None,
+        }
+    }
+
+    fn open_command_palette(&mut self) -> bool {
+        let Some(scope) = self.command_scope() else {
+            return false;
+        };
+        self.input.clear();
+        self.input.push('/');
+        self.overlay = Some(OverlayState::Commands { scope, selected: 0 });
+        true
     }
 
     fn redraw(
@@ -1700,7 +1738,7 @@ pub fn run(
                     }
                     continue;
                 }
-                if ui.read_only_state.is_some() && !view.is_tool_details() {
+                if ui.read_only_state.is_some() && !view.is_tool_details() && ui.overlay.is_none() {
                     if key.code == KeyCode::Char('o') && control {
                         terminal.enter_detail_screen(&mut stdout)?;
                         view = terminal.detail_view();
@@ -1709,6 +1747,16 @@ pub fn run(
                             &mut stdout,
                             current_events(&snapshot, current_agent.as_ref())?,
                             RedrawCause::ViewChanged,
+                            view,
+                        )?;
+                    } else if key.code == KeyCode::Char('/')
+                        && !control
+                        && ui.open_command_palette()
+                    {
+                        ui.redraw(
+                            &mut stdout,
+                            current_events(&snapshot, current_agent.as_ref())?,
+                            RedrawCause::InputChanged,
                             view,
                         )?;
                     }
@@ -1800,6 +1848,14 @@ pub fn run(
                                     } else {
                                         ui.overlay = None;
                                     }
+                                }
+                                SlashCommand::Stop => {
+                                    if let Some(agent_id) = current_agent.as_ref() {
+                                        commands.submit(UiCommand::AbortTurn {
+                                            agent_id: agent_id.clone(),
+                                        })?;
+                                    }
+                                    ui.overlay = None;
                                 }
                                 SlashCommand::Clear => {
                                     ui.overlay = current_agent
@@ -1917,6 +1973,7 @@ pub fn run(
                         }
                     }
                     if draft_agent_before_action.as_ref() == current_agent.as_ref()
+                        && ui.read_only_state.is_none()
                         && let Some(agent_id) = current_agent.as_ref()
                     {
                         sync_input_draft(commands, agent_id, &mut ui)?;
@@ -2097,7 +2154,7 @@ pub fn run(
                             &mut ui,
                         )?;
                         if ui.input == "/" {
-                            ui.overlay = Some(OverlayState::Commands { selected: 0 });
+                            ui.open_command_palette();
                         }
                         ui.redraw(
                             &mut stdout,
@@ -2114,7 +2171,7 @@ pub fn run(
                     continue;
                 }
                 let text = text.replace(['\r', '\n'], " ");
-                if let Some(OverlayState::Commands { selected }) = ui.overlay.as_mut() {
+                if let Some(OverlayState::Commands { selected, .. }) = ui.overlay.as_mut() {
                     ui.input.push_str(&text);
                     *selected = 0;
                 } else if ui.overlay.is_some() {
@@ -2122,8 +2179,10 @@ pub fn run(
                 } else {
                     ui.input.push_str(&text);
                 }
-                if ui.input.starts_with('/') {
-                    ui.overlay = Some(OverlayState::Commands { selected: 0 });
+                if ui.input.starts_with('/')
+                    && let Some(scope) = ui.command_scope()
+                {
+                    ui.overlay = Some(OverlayState::Commands { scope, selected: 0 });
                 }
                 sync_input_draft(commands, require_agent(current_agent.as_ref())?, &mut ui)?;
                 ui.redraw(
@@ -2185,8 +2244,8 @@ fn handle_overlay_key(
         return OverlayAction::Close;
     }
     match overlay {
-        OverlayState::Commands { selected } => {
-            let matches = matching_commands(input);
+        OverlayState::Commands { scope, selected } => {
+            let matches = matching_commands(input, *scope);
             match key {
                 KeyCode::Up => move_selection_up(selected, matches.len()),
                 KeyCode::Down => move_selection_down(selected, matches.len()),
@@ -2283,9 +2342,11 @@ fn handle_overlay_key(
     OverlayAction::Redraw
 }
 
-fn matching_commands(input: &str) -> Vec<SlashCommand> {
-    SlashCommand::ALL
-        .into_iter()
+fn matching_commands(input: &str, scope: CommandScope) -> Vec<SlashCommand> {
+    scope
+        .commands()
+        .iter()
+        .copied()
         .filter(|command| command.name().starts_with(input))
         .collect()
 }
@@ -2508,6 +2569,7 @@ impl TranscriptRenderer {
             rewrite_input_row(
                 stdout,
                 request.input,
+                request.orchestrator_name,
                 request.read_only_state,
                 terminal_width,
             )?;
@@ -3314,10 +3376,14 @@ fn render_overlay(stdout: &mut Stdout, overlay: &OverlayState, input: &str) -> R
 
 fn overlay_content(overlay: &OverlayState, input: &str) -> (String, String, Vec<String>, usize) {
     match overlay {
-        OverlayState::Commands { selected } => (
-            "Commands".into(),
+        OverlayState::Commands { scope, selected } => (
+            match scope {
+                CommandScope::Interactive => "Commands",
+                CommandScope::Worker => "Worker commands",
+            }
+            .into(),
             format!("筛选：{input}"),
-            matching_commands(input)
+            matching_commands(input, *scope)
                 .into_iter()
                 .map(|command| format!("{:<10} {}", command.name(), command.description()))
                 .collect(),
@@ -3422,7 +3488,7 @@ fn write_panel<W: Write>(
     let width = usize::from(terminal_width.saturating_sub(1).max(1));
     let visible_input = read_only_state.map_or_else(
         || tail(input, terminal_width.saturating_sub(3) as usize),
-        |state| format!("只读子 Agent · {state} · Tab 切换页面"),
+        |state| read_only_input_hint(orchestrator_name, state),
     );
     let status_text = panel_status_text(
         projection,
@@ -3484,8 +3550,13 @@ fn panel_status_text(
                 context_window,
             );
             let context = format_status_activity(&context, api_activity);
+            let controls = if orchestrator_name == "worker-agent" {
+                "/ 命令 · Tab 切换"
+            } else {
+                "Tab 切换"
+            };
             format!(
-                "{spinner} me · {agent_id} · {orchestrator_name} · {model_name} · {effort} · {context} · {state}   只读 · Tab 切换"
+                "{spinner} me · {agent_id} · {orchestrator_name} · {model_name} · {effort} · {context} · {state}   只读 · {controls}"
             )
         }
         None => main_status_text(
@@ -3505,13 +3576,14 @@ fn panel_status_text(
 fn rewrite_input_row<W: Write>(
     stdout: &mut W,
     input: &str,
+    orchestrator_name: &str,
     read_only_state: Option<ReadOnlyAgentState>,
     terminal_width: u16,
 ) -> Result<()> {
     let width = usize::from(terminal_width.saturating_sub(1).max(1));
     let visible_input = read_only_state.map_or_else(
         || tail(input, terminal_width.saturating_sub(3) as usize),
-        |state| format!("只读子 Agent · {state} · Tab 切换页面"),
+        |state| read_only_input_hint(orchestrator_name, state),
     );
     let input_row = if read_only_state.is_some() {
         format!("  {visible_input}")
@@ -3529,6 +3601,14 @@ fn rewrite_input_row<W: Write>(
         queue!(stdout, MoveToColumn(cursor_x), Show)?;
     }
     Ok(())
+}
+
+fn read_only_input_hint(orchestrator_name: &str, state: ReadOnlyAgentState) -> String {
+    if orchestrator_name == "worker-agent" {
+        format!("只读 Worker · {state} · / 命令 · Tab 切换页面")
+    } else {
+        format!("只读子 Agent · {state} · Tab 切换页面")
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5940,12 +6020,29 @@ mod tests {
         assert!(!output.contains("must not appear"));
         assert!(output.contains("\u{1b}[2A"));
         assert!(output.contains("\u{1b}[?25l"));
+
+        let mut worker_output = Vec::new();
+        write_panel(
+            &mut worker_output,
+            &ChatProjection::default(),
+            "must not appear",
+            "worker",
+            "worker-agent",
+            None,
+            UiApiActivity::default(),
+            Some(ReadOnlyAgentState::Working),
+            100,
+        )
+        .unwrap();
+        let worker_output = String::from_utf8(worker_output).unwrap();
+        assert!(worker_output.contains("只读 Worker · working · / 命令 · Tab 切换页面"));
+        assert!(!worker_output.contains("must not appear"));
     }
 
     #[test]
     fn ordinary_input_rewrite_touches_only_the_single_input_row() {
         let mut output = Vec::new();
-        rewrite_input_row(&mut output, "abcdefghi123456", None, 100).unwrap();
+        rewrite_input_row(&mut output, "abcdefghi123456", "main-agent", None, 100).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("abcdefghi123456"));
         assert!(output.contains("\u{1b}[2K"));
@@ -7131,21 +7228,33 @@ mod tests {
 
     #[test]
     fn slash_palette_filters_wraps_and_opens_commands() {
-        assert_eq!(matching_commands("/"), SlashCommand::ALL);
         assert_eq!(
-            matching_commands("/e"),
+            matching_commands("/", CommandScope::Interactive),
+            SlashCommand::INTERACTIVE
+        );
+        assert_eq!(
+            matching_commands("/e", CommandScope::Interactive),
             vec![SlashCommand::Effort, SlashCommand::Exit]
         );
-        assert_eq!(matching_commands("/m"), vec![SlashCommand::Model]);
         assert_eq!(
-            matching_commands("/agent-"),
+            matching_commands("/m", CommandScope::Interactive),
+            vec![SlashCommand::Model]
+        );
+        assert_eq!(
+            matching_commands("/agent-", CommandScope::Interactive),
             vec![SlashCommand::AgentAdd, SlashCommand::AgentDelete]
         );
-        assert_eq!(matching_commands("/rew"), vec![SlashCommand::Rewind]);
-        assert!(matching_commands("/unknown").is_empty());
+        assert_eq!(
+            matching_commands("/rew", CommandScope::Interactive),
+            vec![SlashCommand::Rewind]
+        );
+        assert!(matching_commands("/unknown", CommandScope::Interactive).is_empty());
 
         let mut input = "/".to_owned();
-        let mut overlay = OverlayState::Commands { selected: 0 };
+        let mut overlay = OverlayState::Commands {
+            scope: CommandScope::Interactive,
+            selected: 0,
+        };
         assert_eq!(
             handle_overlay_key(&mut overlay, &mut input, KeyCode::Up),
             OverlayAction::Redraw
@@ -7153,14 +7262,21 @@ mod tests {
         assert_eq!(
             overlay,
             OverlayState::Commands {
-                selected: SlashCommand::ALL.len() - 1
+                scope: CommandScope::Interactive,
+                selected: SlashCommand::INTERACTIVE.len() - 1
             }
         );
         assert_eq!(
             handle_overlay_key(&mut overlay, &mut input, KeyCode::Down),
             OverlayAction::Redraw
         );
-        assert_eq!(overlay, OverlayState::Commands { selected: 0 });
+        assert_eq!(
+            overlay,
+            OverlayState::Commands {
+                scope: CommandScope::Interactive,
+                selected: 0
+            }
+        );
 
         for character in "rewind".chars() {
             handle_overlay_key(&mut overlay, &mut input, KeyCode::Char(character));
@@ -7170,6 +7286,43 @@ mod tests {
             handle_overlay_key(&mut overlay, &mut input, KeyCode::Enter),
             OverlayAction::Open(SlashCommand::Rewind)
         );
+    }
+
+    #[test]
+    fn worker_reuses_the_palette_with_worker_only_commands() {
+        assert_eq!(
+            matching_commands("/", CommandScope::Worker),
+            SlashCommand::WORKER
+        );
+        assert_eq!(
+            matching_commands("/s", CommandScope::Worker),
+            vec![SlashCommand::Stop]
+        );
+        assert!(matching_commands("/agent", CommandScope::Worker).is_empty());
+        assert!(matching_commands("/rewind", CommandScope::Worker).is_empty());
+        assert!(matching_commands("/exit", CommandScope::Worker).is_empty());
+
+        let mut worker =
+            TuiSession::new("worker", "worker-agent", &[], 0, "/bin/bash", &[]).unwrap();
+        worker.read_only_state = Some(ReadOnlyAgentState::Working);
+        assert_eq!(worker.command_scope(), Some(CommandScope::Worker));
+        assert!(worker.open_command_palette());
+        assert_eq!(worker.input, "/");
+        assert_eq!(
+            worker.overlay,
+            Some(OverlayState::Commands {
+                scope: CommandScope::Worker,
+                selected: 0
+            })
+        );
+        assert_eq!(worker.read_only_state, Some(ReadOnlyAgentState::Working));
+
+        let mut ordinary_child =
+            TuiSession::new("child", "main-agent", &[], 0, "/bin/bash", &[]).unwrap();
+        ordinary_child.read_only_state = Some(ReadOnlyAgentState::Working);
+        assert_eq!(ordinary_child.command_scope(), None);
+        assert!(!ordinary_child.open_command_palette());
+        assert!(ordinary_child.overlay.is_none());
     }
 
     #[test]
