@@ -708,8 +708,57 @@ fn project_worker_activity(events: &[Event], wait: &ToolCard) -> Option<WorkerAc
         .position(|event| matches!(event, Event::ManagerPrompt(_)))
         .map(|offset| prompt_index + 1 + offset)
         .unwrap_or(events.len());
-    let projected = ChatProjection::replay_events(&events[prompt_index..end]).ok()?;
-    let tools = projected
+    let tools = project_worker_turn_tools(&events[prompt_index..end]).ok()?;
+    Some(WorkerActivity {
+        state: worker_wait_state(wait),
+        tools,
+    })
+}
+
+fn project_worker_turn_tools(events: &[Event]) -> Result<Vec<ToolCard>> {
+    let errored_api_calls = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ApiStateUpdate(update) if update.state == ApiState::Error => {
+                Some(update.api_call_id)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut skipped_tool_calls = BTreeSet::new();
+    let mut projection = ChatProjection {
+        completed_compact_tools: events
+            .iter()
+            .filter_map(|event| match event {
+                Event::CompactStateUpdate(update) if update.state == CompactState::Completed => {
+                    Some(update.tool_call_id)
+                }
+                _ => None,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    for event in events {
+        match event {
+            Event::ToolCall(call) if errored_api_calls.contains(&call.api_call_id) => {
+                skipped_tool_calls.insert(call.id);
+            }
+            Event::ToolCall(_) => projection.project_event(event)?,
+            Event::ToolInfoUpdate(info) if !skipped_tool_calls.contains(&info.tool_call_id) => {
+                projection.project_event(event)?;
+            }
+            Event::ToolCallResult(result) if !skipped_tool_calls.contains(&result.tool_call_id) => {
+                projection.project_event(event)?;
+            }
+            Event::TerminalSessionCreated(created)
+                if !skipped_tool_calls.contains(&created.tool_call_id) =>
+            {
+                projection.project_event(event)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(projection
         .messages
         .into_iter()
         .filter_map(|message| {
@@ -717,11 +766,7 @@ fn project_worker_activity(events: &[Event], wait: &ToolCard) -> Option<WorkerAc
                 .then_some(message.tool)
                 .flatten()
         })
-        .collect();
-    Some(WorkerActivity {
-        state: worker_wait_state(wait),
-        tools,
-    })
+        .collect())
 }
 
 fn effective_api_usage(events: &[&Event], model_event_id: EventId) -> Option<ApiUsage> {
@@ -7655,6 +7700,7 @@ mod tests {
             r#"{"state":"wait_interrupted","reason":"follow_up"}"#.into();
         assert!(!worker_wait_is_visible(&historical_wait));
 
+        worker.append_context_cleared().unwrap();
         let mut completed_wait = wait.clone();
         completed_wait.result = Some(ToolCardResult {
             state: ToolResultState::Succeeded,
@@ -7682,6 +7728,16 @@ mod tests {
             MarkdownColorRole::Success
         );
         assert!(!rows[1].markdown_spans.as_ref().unwrap()[1].style.bold);
+        for (state, title) in [("interrupted", "● 已中断"), ("failed", "● 未完成")] {
+            let mut terminal_wait = completed_wait.clone();
+            terminal_wait.result.as_mut().unwrap().detail =
+                format!(r#"{{"state":"{state}","turn_id":{prompt_id}}}"#);
+            let activity = project_worker_activity(worker.events(), &terminal_wait).unwrap();
+            assert_eq!(activity.tools.len(), 2);
+            let rows = worker_activity_rows(&terminal_wait, Some(&activity), 80);
+            assert_eq!(rows[0].text, title);
+            assert_eq!(rows.len(), 3);
+        }
 
         let mut failed_wait = wait.clone();
         failed_wait.result = Some(ToolCardResult {

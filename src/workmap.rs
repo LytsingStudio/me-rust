@@ -2285,7 +2285,7 @@ fn instructions(tool: &str) -> &'static str {
             "Without objective_id return closed Objective summaries; with objective_id return that complete closed Objective."
         }
         "Start" => {
-            "Create one Current Objective and an ordered non-empty Plan list. The first Plan becomes active."
+            "Create one Current Objective and an ordered non-empty Plan list. Input must be {\"objective\":{\"title\":\"...\",\"description\":\"...\"},\"plans\":[{\"title\":\"...\",\"description\":\"...\"}]}. objective and every plans item must each be an object; never pass them as strings. description is optional. The first Plan becomes active."
         }
         "UpdatePlanState" => {
             "Complete, cancel, or supersede a Plan. Closing the active Plan automatically advances the route."
@@ -2316,7 +2316,9 @@ fn route(tool: &str) -> &'static str {
         "ReadHistory" => {
             "Use only when earlier closed work is genuinely needed; never for routine final audits."
         }
-        "Start" => "Use when Read reports Current=null and substantial work begins.",
+        "Start" => {
+            "Use when Read reports Current=null and substantial work begins. Pass objective as an object with title and optional description, and plans as a non-empty array of those objects; objective or Plan strings are invalid."
+        }
         "UpdatePlanState" => "Use when a Plan reaches a truthful terminal boundary.",
         "AddNote" => {
             "Use throughout execution at each meaningful boundary, before proceeding to the next meaningful action; preserve material actions and results, findings, decisions, validation, adjustments, blockers, and exact continuation points."
@@ -2468,6 +2470,18 @@ mod tests {
                 .contains("only when a successful UpdatePlanState result did not already")
         );
         assert!(!read.route.contains("mandatory final audit"));
+        let start = tools.iter().find(|tool| tool.full_name == START).unwrap();
+        assert!(start.route.contains("objective as an object"));
+        assert!(
+            start
+                .route
+                .contains("objective or Plan strings are invalid")
+        );
+        assert!(
+            start
+                .instructions
+                .contains("every plans item must each be an object")
+        );
         let add_note = tools
             .iter()
             .find(|tool| tool.full_name == ADD_NOTE)
