@@ -33,9 +33,6 @@ const state = {
   expandedTools: new Set(),
   expandedHistoryObjectives: new Set(),
   workerActivityIndexes: new Map(),
-  transcriptScrollFrame: null,
-  transcriptAutoFollow: true,
-  transcriptScrollSettleTimer: null,
   pendingRender: emptyRenderRequest(),
   inputResizeFrame: null,
   apiAnimationTick: 0,
@@ -77,6 +74,7 @@ const elements = {
   workmapView: $("#workmap-view"),
   terminalView: $("#terminal-view"),
   transcript: $("#transcript"),
+  transcriptContent: $("#transcript-content"),
   scrollToBottom: $("#scroll-to-bottom"),
   objective: $("#objective-summary"),
   composer: $("#composer-shell"),
@@ -1132,8 +1130,7 @@ function renderAll() {
   renderWorkMap();
   renderComposer();
   renderStatus();
-  if (state.transcriptAutoFollow) scrollTranscriptToBottomAfterLayout();
-  else updateScrollToBottomButton();
+  transcriptBottomFollower.layoutChanged();
   if (state.view.kind === "terminal") void renderTerminal();
 }
 
@@ -1166,8 +1163,7 @@ function renderIncremental(request) {
   if (changes.turn) renderComposer();
   if (request.status || changes.status) renderStatus();
   if (transcriptChanged) {
-    if (state.transcriptAutoFollow) scrollTranscriptToBottomAfterLayout();
-    else updateScrollToBottomButton();
+    transcriptBottomFollower.layoutChanged();
   }
   if (state.view.kind === "terminal") void renderTerminal();
 }
@@ -1201,6 +1197,72 @@ function transcriptIsNearBottom() {
     - elements.transcript.clientHeight <= TRANSCRIPT_BOTTOM_THRESHOLD_PX;
 }
 
+function createTranscriptBottomFollower(viewport, content, onPositionChange, runtime = {}) {
+  const requestFrame = runtime.requestFrame || ((callback) => requestAnimationFrame(callback));
+  const cancelFrame = runtime.cancelFrame || ((id) => cancelAnimationFrame(id));
+  const setDelay = runtime.setDelay || ((callback, delay) => setTimeout(callback, delay));
+  const clearDelay = runtime.clearDelay || ((id) => clearTimeout(id));
+  const createResizeObserver = runtime.createResizeObserver
+    || ((callback) => new ResizeObserver(callback));
+  const threshold = runtime.threshold ?? TRANSCRIPT_BOTTOM_THRESHOLD_PX;
+  let following = true;
+  let interacting = false;
+  let frame = null;
+  let interactionTimer = null;
+
+  const isNearBottom = () => viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight
+    <= threshold;
+  const notify = () => onPositionChange?.();
+  const cancelScheduledFollow = () => {
+    if (frame === null) return;
+    cancelFrame(frame);
+    frame = null;
+  };
+  const scheduleFollow = () => {
+    if (!following || interacting || frame !== null) return;
+    frame = requestFrame(() => {
+      frame = null;
+      if (!following || interacting) return;
+      viewport.scrollTop = viewport.scrollHeight;
+      notify();
+    });
+  };
+  const layoutChanged = () => {
+    if (following) scheduleFollow(); else notify();
+  };
+  const resizeObserver = createResizeObserver(layoutChanged);
+  resizeObserver.observe(viewport);
+  resizeObserver.observe(content);
+
+  return {
+    isFollowing: () => following,
+    isNearBottom,
+    follow() {
+      following = true;
+      interacting = false;
+      if (interactionTimer !== null) clearDelay(interactionTimer);
+      interactionTimer = null;
+      scheduleFollow();
+    },
+    noteUserInteraction() {
+      interacting = true;
+      cancelScheduledFollow();
+      if (interactionTimer !== null) clearDelay(interactionTimer);
+      interactionTimer = setDelay(() => {
+        interactionTimer = null;
+        interacting = false;
+        if (following) scheduleFollow();
+        notify();
+      }, 120);
+    },
+    noteScroll() {
+      if (interacting) following = isNearBottom();
+      notify();
+    },
+    layoutChanged,
+  };
+}
+
 function updateScrollToBottomButton() {
   const overflow = elements.transcript.scrollHeight - elements.transcript.clientHeight
     > TRANSCRIPT_BOTTOM_THRESHOLD_PX;
@@ -1209,35 +1271,12 @@ function updateScrollToBottomButton() {
 }
 
 function scrollTranscriptToBottomAfterLayout() {
-  state.transcriptAutoFollow = true;
-  cancelTranscriptBottomFollow();
   if (state.view.kind !== "chat") return;
-  state.transcriptScrollFrame = requestAnimationFrame(() => {
-    if (state.view.kind !== "chat") {
-      state.transcriptScrollFrame = null;
-      return;
-    }
-    elements.transcript.scrollTop = elements.transcript.scrollHeight;
-    updateScrollToBottomButton();
-    state.transcriptScrollFrame = null;
-  });
-}
-
-function cancelTranscriptBottomFollow() {
-  if (state.transcriptScrollFrame === null) return;
-  cancelAnimationFrame(state.transcriptScrollFrame);
-  state.transcriptScrollFrame = null;
+  transcriptBottomFollower.follow();
 }
 
 function suspendTranscriptAutoFollow() {
-  state.transcriptAutoFollow = false;
-  cancelTranscriptBottomFollow();
-  clearTimeout(state.transcriptScrollSettleTimer);
-  state.transcriptScrollSettleTimer = setTimeout(() => {
-    state.transcriptScrollSettleTimer = null;
-    state.transcriptAutoFollow = transcriptIsNearBottom();
-    updateScrollToBottomButton();
-  }, 120);
+  transcriptBottomFollower.noteUserInteraction();
 }
 
 function renderConnection() {
@@ -1321,7 +1360,7 @@ function selectAgent(id) {
   closeAgentMenu();
   saveDraft();
   state.selectedAgent = id;
-  state.transcriptAutoFollow = true;
+  transcriptBottomFollower.follow();
   state.view = { kind: "chat", sessionId: null };
   state.terminals = [];
   state.terminalRevisions.clear();
@@ -1379,17 +1418,17 @@ function renderTranscript(forceFull = false, changedFrom = 0) {
   }
   if (!messages.length) {
     const environment = state.snapshot.environment;
-    if (!elements.transcript.querySelector(":scope > .empty-state")) {
-      elements.transcript.innerHTML = `<div class="empty-state"><div><strong>ME-RUST</strong><p>从这里开始一段对话。</p>${environment ? `<small>${escapeHtml(environment.workspace)}<br>${escapeHtml(environment.system)}</small>` : ""}</div></div>`;
+    if (!elements.transcriptContent.querySelector(":scope > .empty-state")) {
+      elements.transcriptContent.innerHTML = `<div class="empty-state"><div><strong>ME-RUST</strong><p>从这里开始一段对话。</p>${environment ? `<small>${escapeHtml(environment.workspace)}<br>${escapeHtml(environment.system)}</small>` : ""}</div></div>`;
     }
     return;
   }
-  if (forceFull) elements.transcript.replaceChildren();
+  if (forceFull) elements.transcriptContent.replaceChildren();
   reconcileTranscript(messages, forceFull ? 0 : changedFrom);
 }
 
 function reconcileTranscript(messages, changedFrom = 0) {
-  if (elements.transcript.querySelector(":scope > .empty-state")) elements.transcript.replaceChildren();
+  if (elements.transcriptContent.querySelector(":scope > .empty-state")) elements.transcriptContent.replaceChildren();
   const start = Math.max(0, Math.min(changedFrom, messages.length));
   let previousKind = previousVisibleRenderedKind(start);
   for (let index = start; index < messages.length; index += 1) {
@@ -1398,21 +1437,21 @@ function reconcileTranscript(messages, changedFrom = 0) {
     const afterTool = visible && isToolLikeKind(previousKind) && message.kind === "assistant";
     const key = messageDomKey(message, index);
     const revision = messageRenderRevision(message, afterTool);
-    const current = elements.transcript.children[index];
+    const current = elements.transcriptContent.children[index];
     if (!current || current.dataset.messageKey !== key) {
-      while (elements.transcript.children.length > index) elements.transcript.lastElementChild.remove();
-      elements.transcript.append(createMessageFragment(messages, index, previousKind));
+      while (elements.transcriptContent.children.length > index) elements.transcriptContent.lastElementChild.remove();
+      elements.transcriptContent.append(createMessageFragment(messages, index, previousKind));
       return;
     }
     if (current.meRenderRevision !== revision) updateMessageNode(current, message, afterTool, index);
     if (visible) previousKind = message.kind;
   }
-  while (elements.transcript.children.length > messages.length) elements.transcript.lastElementChild.remove();
+  while (elements.transcriptContent.children.length > messages.length) elements.transcriptContent.lastElementChild.remove();
 }
 
 function previousVisibleRenderedKind(index) {
   for (let previous = index - 1; previous >= 0; previous -= 1) {
-    const node = elements.transcript.children[previous];
+    const node = elements.transcriptContent.children[previous];
     if (node?.dataset.messageVisible === "true") return node.dataset.messageKind || null;
   }
   return null;
@@ -1681,7 +1720,7 @@ function renderWorkerActivity(wait) {
 
 function refreshWorkerActivityCards() {
   const projection = currentProjection();
-  elements.transcript.querySelectorAll(":scope > [data-worker-wait]").forEach((node) => {
+  elements.transcriptContent.querySelectorAll(":scope > [data-worker-wait]").forEach((node) => {
     const message = projection._messageByKey.get(`tool:${node.dataset.workerWait}`);
     if (!message) return;
     updateWorkerActivityNode(node, message.tool);
@@ -2787,9 +2826,14 @@ window.addEventListener("resize", () => {
   if (state.view.kind === "terminal") void renderTerminal();
 });
 window.addEventListener("pagehide", flushDraftBeforePageCloses);
+const transcriptBottomFollower = createTranscriptBottomFollower(
+  elements.transcript,
+  elements.transcriptContent,
+  updateScrollToBottomButton,
+);
 elements.transcript.addEventListener("scroll", () => {
   closeUserMessageMenu();
-  updateScrollToBottomButton();
+  transcriptBottomFollower.noteScroll();
 }, { passive: true });
 elements.agents.addEventListener("scroll", closeAgentMenu, { passive: true });
 elements.transcript.addEventListener("wheel", suspendTranscriptAutoFollow, { passive: true });
@@ -2799,7 +2843,7 @@ elements.transcript.addEventListener("pointerdown", suspendTranscriptAutoFollow)
 elements.transcript.addEventListener("pointerup", suspendTranscriptAutoFollow);
 function refreshRunningToolElapsed() {
   if (inputHasPriority()) return;
-  elements.transcript.querySelectorAll("[data-running-started]").forEach((node) => {
+  elements.transcriptContent.querySelectorAll("[data-running-started]").forEach((node) => {
     const text = `Running ... ${formatDuration(Date.now() - Number(node.dataset.runningStarted))}`;
     if (node.textContent !== text) node.textContent = text;
   });

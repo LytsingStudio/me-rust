@@ -1353,9 +1353,7 @@ mod tests {
         assert!(APP_JS.contains(
             "if (current.meRenderRevision !== revision) updateMessageNode(current, message, afterTool, index)"
         ));
-        assert!(
-            APP_JS.contains("elements.transcript.scrollTop = elements.transcript.scrollHeight")
-        );
+        assert!(APP_JS.contains("viewport.scrollTop = viewport.scrollHeight"));
         assert!(
             !APP_JS.contains("current.replaceWith(createMessageNode(message, afterTool, index))")
         );
@@ -1437,20 +1435,27 @@ mod tests {
 
     #[test]
     fn embedded_webui_does_not_fight_manual_scrolling() {
-        assert!(APP_JS.contains("transcriptAutoFollow: true"));
+        assert!(INDEX_HTML.contains("id=\"transcript-content\""));
+        assert!(APP_JS.contains("function createTranscriptBottomFollower("));
+        assert!(APP_JS.contains("new ResizeObserver(callback)"));
+        assert!(APP_JS.contains("resizeObserver.observe(viewport)"));
+        assert!(APP_JS.contains("resizeObserver.observe(content)"));
         assert!(APP_JS.contains("function suspendTranscriptAutoFollow()"));
-        assert!(APP_JS.contains("state.transcriptAutoFollow = false"));
+        assert!(APP_JS.contains("if (interacting) following = isNearBottom()"));
         assert!(APP_JS.contains(
             "elements.transcript.addEventListener(\"wheel\", suspendTranscriptAutoFollow"
         ));
         assert_eq!(
             APP_JS
-                .matches("elements.transcript.scrollTop = elements.transcript.scrollHeight")
+                .matches("viewport.scrollTop = viewport.scrollHeight")
                 .count(),
             1
         );
         assert!(!APP_JS.contains("elements.transcript.scrollTop = previousScrollTop"));
         assert!(STYLE_CSS.contains("overflow-anchor: auto"));
+        assert!(
+            STYLE_CSS.contains(".transcript-content { display: flow-root; min-height: 100%; }")
+        );
         assert!(APP_JS.contains("function createAgentRow(agent)"));
         assert!(!APP_JS.contains("elements.agents.innerHTML = state.snapshot.agents.map"));
     }
