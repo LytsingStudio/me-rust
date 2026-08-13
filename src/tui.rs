@@ -20,10 +20,12 @@ use crate::{
     event::{
         AgentKind, AgentTurnState, ApiState, ApiUsage, CompactKind, CompactState, EdbMutation,
         Event, EventDataBase, EventId, ModelChangeCause, ReasoningEffortChangeCause,
-        ToolInfoContent, ToolOutputStream, ToolResultState, effective_ui_events, latest_agent_turn,
+        ToolInfoContent, ToolOutputStream, ToolResultState, effective_conversation_events,
+        effective_ui_events, latest_agent_turn, latest_context_usage,
     },
     orchestrator::{UserTurnState, current_user_turn_state},
     terminal::{TerminalColor, TerminalFrame, TerminalSessionPreview, TerminalStyle},
+    turn_history,
     ui_backend::{
         ChatToolPresentation, UiAgentSnapshot, UiApiActivity, UiBackend, UiCommand,
         UiCommandGateway, UiCommandReceipt, UiModelOption, UiSnapshot, tool_chat_presentation,
@@ -777,6 +779,7 @@ enum SlashCommand {
     AgentDelete,
     Model,
     Effort,
+    Context,
     Stop,
     Clear,
     Rewind,
@@ -784,16 +787,23 @@ enum SlashCommand {
 }
 
 impl SlashCommand {
-    const INTERACTIVE: [Self; 7] = [
+    const INTERACTIVE: [Self; 8] = [
         Self::AgentAdd,
         Self::AgentDelete,
         Self::Model,
         Self::Effort,
+        Self::Context,
         Self::Clear,
         Self::Rewind,
         Self::Exit,
     ];
-    const WORKER: [Self; 4] = [Self::Model, Self::Effort, Self::Stop, Self::Clear];
+    const WORKER: [Self; 5] = [
+        Self::Model,
+        Self::Effort,
+        Self::Context,
+        Self::Stop,
+        Self::Clear,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -801,6 +811,7 @@ impl SlashCommand {
             Self::AgentDelete => "/agent-delete",
             Self::Model => "/model",
             Self::Effort => "/effort",
+            Self::Context => "/context",
             Self::Stop => "/stop",
             Self::Clear => "/clear",
             Self::Rewind => "/rewind",
@@ -814,6 +825,7 @@ impl SlashCommand {
             Self::AgentDelete => "永久删除当前空闲 Agent",
             Self::Model => "切换当前模型",
             Self::Effort => "选择推理强度",
+            Self::Context => "查看上下文用量",
             Self::Stop => "停止 Worker 当前任务",
             Self::Clear => "清空当前上下文",
             Self::Rewind => "回溯到指定消息、上下文清理或上下文压缩之前",
@@ -843,6 +855,152 @@ struct RewindChoice {
     kind: RewindChoiceKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextCategory {
+    System,
+    Compact,
+    Memory,
+    User,
+    Model,
+    Tool,
+    Reserve,
+    Remaining,
+}
+
+impl ContextCategory {
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "系统提示词",
+            Self::Compact => "上下文压缩",
+            Self::Memory => "记忆",
+            Self::User => "用户消息",
+            Self::Model => "模型输出",
+            Self::Tool => "工具调用",
+            Self::Reserve => "输出预留",
+            Self::Remaining => "剩余空间",
+        }
+    }
+
+    fn color(self) -> MarkdownColorRole {
+        match self {
+            Self::System => MarkdownColorRole::Accent,
+            Self::Compact => MarkdownColorRole::SyntaxFunction,
+            Self::Memory => MarkdownColorRole::SyntaxType,
+            Self::User => MarkdownColorRole::SyntaxString,
+            Self::Model => MarkdownColorRole::SyntaxVariable,
+            Self::Tool => MarkdownColorRole::Warning,
+            Self::Reserve => MarkdownColorRole::SyntaxKeyword,
+            Self::Remaining => MarkdownColorRole::Muted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ContextTokenValues {
+    system: u64,
+    compact: u64,
+    memory: u64,
+    user: u64,
+    model: u64,
+    tool: u64,
+}
+
+impl ContextTokenValues {
+    fn value(&self, category: ContextCategory, reserve: u64) -> u64 {
+        match category {
+            ContextCategory::System => self.system,
+            ContextCategory::Compact => self.compact,
+            ContextCategory::Memory => self.memory,
+            ContextCategory::User => self.user,
+            ContextCategory::Model => self.model,
+            ContextCategory::Tool => self.tool,
+            ContextCategory::Reserve => reserve,
+            ContextCategory::Remaining => 0,
+        }
+    }
+
+    fn sum(&self) -> u64 {
+        self.system
+            .saturating_add(self.compact)
+            .saturating_add(self.memory)
+            .saturating_add(self.user)
+            .saturating_add(self.model)
+            .saturating_add(self.tool)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContextUsageBreakdown {
+    total: Option<u64>,
+    limit: Option<u64>,
+    reserve: u64,
+    values: ContextTokenValues,
+    compact_content: Option<String>,
+    memory_content: Option<String>,
+    can_clear: bool,
+}
+
+impl ContextUsageBreakdown {
+    fn categories(&self) -> Vec<ContextCategory> {
+        let mut categories = vec![ContextCategory::System];
+        if self.compact_content.is_some() {
+            categories.push(ContextCategory::Compact);
+        }
+        if self.memory_content.is_some() {
+            categories.push(ContextCategory::Memory);
+        }
+        categories.extend([
+            ContextCategory::User,
+            ContextCategory::Model,
+            ContextCategory::Tool,
+            ContextCategory::Reserve,
+            ContextCategory::Remaining,
+        ]);
+        categories
+    }
+
+    fn value(&self, category: ContextCategory) -> u64 {
+        if category == ContextCategory::Remaining {
+            return self
+                .limit
+                .unwrap_or(0)
+                .saturating_sub(self.total.unwrap_or(0).saturating_add(self.reserve));
+        }
+        self.values.value(category, self.reserve)
+    }
+
+    fn actions(&self) -> Vec<ContextAction> {
+        let mut actions = Vec::new();
+        if self.compact_content.is_some() {
+            actions.push(ContextAction::CompactDetail);
+        }
+        if self.memory_content.is_some() {
+            actions.push(ContextAction::MemoryDetail);
+        }
+        if self.can_clear {
+            actions.push(ContextAction::Clear);
+        }
+        actions
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextAction {
+    CompactDetail,
+    MemoryDetail,
+    Clear,
+}
+
+impl ContextAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CompactDetail => "查看上下文压缩",
+            Self::MemoryDetail => "查看记忆",
+            Self::Clear => "清空上下文",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RewindChoiceKind {
     UserPrompt(String),
@@ -866,6 +1024,18 @@ enum OverlayState {
     },
     Clear {
         selected: usize,
+    },
+    Context {
+        breakdown: Box<ContextUsageBreakdown>,
+        selected: usize,
+    },
+    ContextDetail {
+        breakdown: Box<ContextUsageBreakdown>,
+        selected: usize,
+        title: String,
+        content: String,
+        markdown: bool,
+        scroll: usize,
     },
     Rewind {
         choices: Vec<RewindChoice>,
@@ -892,7 +1062,7 @@ struct TuiSession {
     renderer: TranscriptRenderer,
     agent_id: String,
     orchestrator_name: String,
-    context_windows: BTreeMap<String, u64>,
+    model_options: BTreeMap<String, UiModelOption>,
     pending_escape_rewind: Option<EventId>,
     input_draft_revision: u64,
     api_activity: UiApiActivity,
@@ -948,9 +1118,9 @@ impl TuiSession {
             )),
             agent_id: agent_id.to_owned(),
             orchestrator_name: orchestrator_name.to_owned(),
-            context_windows: models
+            model_options: models
                 .iter()
-                .map(|model| (model.name.clone(), model.context_window))
+                .map(|model| (model.name.clone(), model.clone()))
                 .collect(),
             pending_escape_rewind: None,
             input_draft_revision: 0,
@@ -970,6 +1140,35 @@ impl TuiSession {
 
     fn current_model(&self) -> Option<&str> {
         self.projection.model_name.as_deref()
+    }
+
+    fn current_model_option(&self) -> Option<&UiModelOption> {
+        self.current_model()
+            .and_then(|model| self.model_options.get(model))
+    }
+
+    fn context_usage_breakdown(&self, events: &[Event]) -> Result<ContextUsageBreakdown> {
+        let model = self.current_model_option();
+        let reserve = model
+            .and_then(|model| {
+                self.current_effort()
+                    .and_then(|effort| model.output_token_reservations.get(effort))
+            })
+            .copied()
+            .unwrap_or(0);
+        let memory_content = if self.orchestrator_name == "worker-agent" {
+            None
+        } else {
+            turn_history::latest_snapshot(events)?
+        };
+        estimate_context_breakdown(
+            events,
+            latest_context_usage(events),
+            model.map(|model| model.context_window),
+            reserve,
+            memory_content,
+            self.read_only_state.is_none(),
+        )
     }
 
     fn command_scope(&self) -> Option<CommandScope> {
@@ -998,9 +1197,8 @@ impl TuiSession {
         view: TuiView,
     ) -> Result<()> {
         let context_window = self
-            .current_model()
-            .and_then(|model| self.context_windows.get(model))
-            .copied();
+            .current_model_option()
+            .map(|model| model.context_window);
         self.renderer.redraw(
             stdout,
             &mut self.projection,
@@ -1039,9 +1237,8 @@ impl TuiSession {
             return self.redraw(stdout, events, RedrawCause::EdbUpdated, TuiView::Transcript);
         }
         let context_window = self
-            .current_model()
-            .and_then(|model| self.context_windows.get(model))
-            .copied();
+            .current_model_option()
+            .map(|model| model.context_window);
         self.renderer.redraw_status(
             stdout,
             &self.projection,
@@ -1849,6 +2046,22 @@ pub fn run(
                                         ui.overlay = None;
                                     }
                                 }
+                                SlashCommand::Context => {
+                                    ui.overlay = if current_agent.is_some() {
+                                        let events = current_events(
+                                            &snapshot,
+                                            current_agent.as_ref(),
+                                        )?;
+                                        Some(OverlayState::Context {
+                                            breakdown: Box::new(
+                                                ui.context_usage_breakdown(events)?,
+                                            ),
+                                            selected: 0,
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                }
                                 SlashCommand::Stop => {
                                     if let Some(agent_id) = current_agent.as_ref() {
                                         commands.submit(UiCommand::AbortTurn {
@@ -1904,6 +2117,42 @@ pub fn run(
                             commands.submit(UiCommand::ClearContext {
                                 agent_id: require_agent(current_agent.as_ref())?.clone(),
                             })?;
+                        }
+                        OverlayAction::OpenContextDetail(action) => {
+                            let Some(OverlayState::Context {
+                                breakdown,
+                                selected,
+                            }) = ui.overlay.take()
+                            else {
+                                return Err("context action requires its context panel".into());
+                            };
+                            let content = match action {
+                                ContextAction::CompactDetail => breakdown.compact_content.clone(),
+                                ContextAction::MemoryDetail => breakdown.memory_content.clone(),
+                                ContextAction::Clear => None,
+                            }
+                            .ok_or("selected context detail is not available")?;
+                            let title = action.label().trim_start_matches("查看").to_owned();
+                            ui.overlay = Some(OverlayState::ContextDetail {
+                                breakdown,
+                                selected,
+                                title,
+                                content,
+                                markdown: action == ContextAction::CompactDetail,
+                                scroll: 0,
+                            });
+                        }
+                        OverlayAction::ConfirmContextClear => {
+                            ui.overlay = Some(OverlayState::Clear { selected: 0 });
+                        }
+                        OverlayAction::BackToContext {
+                            breakdown,
+                            selected,
+                        } => {
+                            ui.overlay = Some(OverlayState::Context {
+                                breakdown,
+                                selected,
+                            });
                         }
                         OverlayAction::SubmitRewind(event_id) => {
                             ui.overlay = None;
@@ -2230,6 +2479,12 @@ enum OverlayAction {
     SubmitModel(String),
     SubmitEffort(String),
     SubmitClear,
+    OpenContextDetail(ContextAction),
+    ConfirmContextClear,
+    BackToContext {
+        breakdown: Box<ContextUsageBreakdown>,
+        selected: usize,
+    },
     SubmitRewind(EventId),
     SubmitAgentAdd(String),
     SubmitAgentDelete(AgentId),
@@ -2241,6 +2496,17 @@ fn handle_overlay_key(
     key: KeyCode,
 ) -> OverlayAction {
     if key == KeyCode::Esc {
+        if let OverlayState::ContextDetail {
+            breakdown,
+            selected,
+            ..
+        } = overlay
+        {
+            return OverlayAction::BackToContext {
+                breakdown: breakdown.clone(),
+                selected: *selected,
+            };
+        }
         return OverlayAction::Close;
     }
     match overlay {
@@ -2298,6 +2564,34 @@ fn handle_overlay_key(
             KeyCode::Up | KeyCode::Down => *selected = 1_usize.saturating_sub(*selected),
             KeyCode::Enter if *selected == 0 => return OverlayAction::SubmitClear,
             KeyCode::Enter => return OverlayAction::Close,
+            _ => {}
+        },
+        OverlayState::Context {
+            breakdown,
+            selected,
+        } => {
+            let actions = breakdown.actions();
+            match key {
+                KeyCode::Up => move_selection_up(selected, actions.len()),
+                KeyCode::Down => move_selection_down(selected, actions.len()),
+                KeyCode::Enter => {
+                    return actions
+                        .get(*selected)
+                        .copied()
+                        .map(|action| match action {
+                            ContextAction::Clear => OverlayAction::ConfirmContextClear,
+                            _ => OverlayAction::OpenContextDetail(action),
+                        })
+                        .unwrap_or(OverlayAction::Redraw);
+                }
+                _ => {}
+            }
+        }
+        OverlayState::ContextDetail { scroll, .. } => match key {
+            KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+            KeyCode::Down => *scroll = scroll.saturating_add(1),
+            KeyCode::PageDown => *scroll = scroll.saturating_add(10),
             _ => {}
         },
         OverlayState::Rewind { choices, selected } => match key {
@@ -3311,6 +3605,12 @@ fn print_terminal_preview_status<W: Write>(
 }
 
 fn render_overlay(stdout: &mut Stdout, overlay: &OverlayState, input: &str) -> Result<()> {
+    if matches!(overlay, OverlayState::Context { .. }) {
+        return render_context_overlay(stdout, overlay);
+    }
+    if matches!(overlay, OverlayState::ContextDetail { .. }) {
+        return render_context_detail_overlay(stdout, overlay);
+    }
     let (terminal_width, terminal_height) = terminal::size()?;
     let screen_width = usize::from(terminal_width.max(1));
     let box_width = screen_width
@@ -3374,6 +3674,275 @@ fn render_overlay(stdout: &mut Stdout, overlay: &OverlayState, input: &str) -> R
     Ok(())
 }
 
+fn render_context_overlay(stdout: &mut Stdout, overlay: &OverlayState) -> Result<()> {
+    let OverlayState::Context {
+        breakdown,
+        selected,
+    } = overlay
+    else {
+        return Err("context renderer requires a context overlay".into());
+    };
+    let (terminal_width, terminal_height) = terminal::size()?;
+    let screen_width = usize::from(terminal_width.max(1));
+    let box_width = screen_width
+        .saturating_sub(4)
+        .clamp(44, 96)
+        .min(screen_width);
+    let inner = box_width.saturating_sub(2);
+    let mut rows = vec![UiRow::new(
+        framed_title("Context", box_width),
+        RowTone::OverlayBorder,
+    )];
+    rows.push(UiRow::new(
+        framed_line(&context_usage_summary(breakdown), inner),
+        RowTone::OverlayText,
+    ));
+    rows.push(context_usage_bar_row(breakdown, box_width));
+    rows.push(UiRow::new(framed_line("", inner), RowTone::OverlayText));
+    for category in breakdown.categories() {
+        rows.push(context_category_row(breakdown, category, box_width));
+    }
+    let actions = breakdown.actions();
+    if !actions.is_empty() {
+        rows.push(UiRow::new(framed_line("", inner), RowTone::OverlayText));
+        for (index, action) in actions.iter().enumerate() {
+            rows.push(UiRow::new(
+                framed_line(action.label(), inner),
+                if index == *selected {
+                    RowTone::OverlaySelected
+                } else {
+                    RowTone::OverlayText
+                },
+            ));
+        }
+    }
+    rows.push(UiRow::new(
+        framed_line("↑↓ 选择 · Enter 确认 · Esc 返回", inner),
+        RowTone::OverlayHint,
+    ));
+    rows.push(UiRow::new(
+        format!("╰{}╯", "─".repeat(inner)),
+        RowTone::OverlayBorder,
+    ));
+    render_centered_overlay_rows(stdout, &rows, box_width, terminal_height)
+}
+
+fn render_context_detail_overlay(stdout: &mut Stdout, overlay: &OverlayState) -> Result<()> {
+    let OverlayState::ContextDetail {
+        title,
+        content,
+        markdown,
+        scroll,
+        ..
+    } = overlay
+    else {
+        return Err("context detail renderer requires a detail overlay".into());
+    };
+    let (terminal_width, terminal_height) = terminal::size()?;
+    let screen_width = usize::from(terminal_width.max(1));
+    let box_width = screen_width
+        .saturating_sub(4)
+        .clamp(44, 110)
+        .min(screen_width);
+    let inner = box_width.saturating_sub(2);
+    let content_width = inner.saturating_sub(2).max(1);
+    let content_lines = if *markdown {
+        agent_markdown_renderer::render(content, content_width)
+            .into_iter()
+            .map(|line| line.spans)
+            .collect::<Vec<_>>()
+    } else {
+        wrap(content, content_width)
+            .into_iter()
+            .map(|line| vec![MarkdownSpan::new(line, MarkdownTextStyle::default())])
+            .collect::<Vec<_>>()
+    };
+    let capacity = usize::from(terminal_height).saturating_sub(3).max(1);
+    let start = (*scroll).min(content_lines.len().saturating_sub(capacity));
+    let end = start.saturating_add(capacity).min(content_lines.len());
+    let mut rows = vec![UiRow::new(
+        framed_title(title, box_width),
+        RowTone::OverlayBorder,
+    )];
+    if content_lines.is_empty() {
+        rows.push(UiRow::new(
+            framed_line("没有可显示的内容", inner),
+            RowTone::OverlayText,
+        ));
+    } else {
+        for spans in &content_lines[start..end] {
+            rows.push(framed_markdown_row(spans, box_width));
+        }
+    }
+    rows.push(UiRow::new(
+        framed_line("↑↓/PgUp/PgDn 滚动 · Esc 返回", inner),
+        RowTone::OverlayHint,
+    ));
+    rows.push(UiRow::new(
+        format!("╰{}╯", "─".repeat(inner)),
+        RowTone::OverlayBorder,
+    ));
+    render_centered_overlay_rows(stdout, &rows, box_width, terminal_height)
+}
+
+fn render_centered_overlay_rows(
+    stdout: &mut Stdout,
+    rows: &[UiRow],
+    box_width: usize,
+    terminal_height: u16,
+) -> Result<()> {
+    let screen_width = usize::from(terminal::size()?.0.max(1));
+    clear_for_full_redraw(stdout, false)?;
+    let x = u16::try_from(screen_width.saturating_sub(box_width) / 2).unwrap_or(0);
+    let y = terminal_height.saturating_sub(rows.len() as u16) / 2;
+    for (offset, row) in rows.iter().enumerate() {
+        queue!(stdout, MoveTo(x, y.saturating_add(offset as u16)))?;
+        print_row(stdout, row, box_width)?;
+    }
+    queue!(stdout, Hide)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn context_usage_summary(breakdown: &ContextUsageBreakdown) -> String {
+    let percentage = match (breakdown.total, breakdown.limit) {
+        (Some(total), Some(limit)) if limit > 0 => {
+            format!("{}%", total.saturating_mul(100) / limit)
+        }
+        _ => "—".into(),
+    };
+    format!(
+        "{} / {}  ·  {percentage}",
+        format_context_tokens(breakdown.total),
+        breakdown
+            .limit
+            .map(format_context_limit)
+            .unwrap_or_else(|| "—".into())
+    )
+}
+
+fn context_usage_bar_row(breakdown: &ContextUsageBreakdown, box_width: usize) -> UiRow {
+    let inner = box_width.saturating_sub(2);
+    let bar_width = inner.saturating_sub(2);
+    let denominator = breakdown.limit.or(breakdown.total).unwrap_or(0).max(1);
+    let mut remaining = bar_width;
+    let mut spans = vec![MarkdownSpan::new(
+        "│ ",
+        MarkdownTextStyle::colored(MarkdownColorRole::Accent),
+    )];
+    for category in breakdown.categories() {
+        if category != ContextCategory::Remaining
+            && (breakdown.total.is_some() || category == ContextCategory::Reserve)
+        {
+            let value = breakdown.value(category);
+            let width = usize::try_from(
+                value
+                    .saturating_mul(bar_width as u64)
+                    .saturating_add(denominator / 2)
+                    / denominator,
+            )
+            .unwrap_or(bar_width)
+            .min(remaining);
+            if width > 0 {
+                spans.push(MarkdownSpan::new(
+                    "█".repeat(width),
+                    MarkdownTextStyle::colored(category.color()),
+                ));
+                remaining -= width;
+            }
+        }
+    }
+    let mut remaining_style = MarkdownTextStyle::colored(MarkdownColorRole::Muted);
+    remaining_style.dim = true;
+    spans.push(MarkdownSpan::new("░".repeat(remaining), remaining_style));
+    spans.push(MarkdownSpan::new(
+        " │",
+        MarkdownTextStyle::colored(MarkdownColorRole::Accent),
+    ));
+    UiRow::markdown(spans, RowTone::OverlayText)
+}
+
+fn context_category_row(
+    breakdown: &ContextUsageBreakdown,
+    category: ContextCategory,
+    box_width: usize,
+) -> UiRow {
+    let value = breakdown.value(category);
+    let formatted = if category == ContextCategory::Remaining && breakdown.total.is_none() {
+        "—".into()
+    } else if matches!(
+        category,
+        ContextCategory::Reserve | ContextCategory::Remaining
+    ) {
+        format_context_tokens(Some(value))
+    } else if breakdown.total.is_some() {
+        format_estimated_context_tokens(value)
+    } else {
+        "—".into()
+    };
+    let share = if category == ContextCategory::Remaining && breakdown.total.is_none() {
+        None
+    } else if matches!(
+        category,
+        ContextCategory::Reserve | ContextCategory::Remaining
+    ) {
+        breakdown
+            .limit
+            .filter(|limit| *limit > 0)
+            .map(|limit| value as f64 / limit as f64 * 100.0)
+    } else {
+        breakdown
+            .total
+            .filter(|total| *total > 0)
+            .map(|total| value as f64 / total as f64 * 100.0)
+    };
+    let share = share.map_or_else(|| "—".into(), |share| format!("{share:.1}%"));
+    let content = format!("● {:<12} {:>10}  {:>6}", category.label(), formatted, share);
+    let available = box_width.saturating_sub(4);
+    let content = truncate(&content, available);
+    let padding = " ".repeat(available.saturating_sub(display_width(&content)));
+    UiRow::markdown(
+        vec![
+            MarkdownSpan::new("│ ", MarkdownTextStyle::colored(MarkdownColorRole::Accent)),
+            MarkdownSpan::new("●", MarkdownTextStyle::colored(category.color()).bold()),
+            MarkdownSpan::new(
+                content.strip_prefix('●').unwrap_or(&content),
+                Default::default(),
+            ),
+            MarkdownSpan::new(padding, Default::default()),
+            MarkdownSpan::new(" │", MarkdownTextStyle::colored(MarkdownColorRole::Accent)),
+        ],
+        RowTone::OverlayText,
+    )
+}
+
+fn framed_markdown_row(spans: &[MarkdownSpan], box_width: usize) -> UiRow {
+    let available = box_width.saturating_sub(4);
+    let mut content = Vec::with_capacity(spans.len() + 3);
+    content.push(MarkdownSpan::new(
+        "│ ",
+        MarkdownTextStyle::colored(MarkdownColorRole::Accent),
+    ));
+    let mut used = 0;
+    for span in spans {
+        if used >= available {
+            break;
+        }
+        let text = take_display_width(&span.text, available - used);
+        used += display_width(&text);
+        content.push(MarkdownSpan::new(text, span.style));
+    }
+    content.push(MarkdownSpan::new(
+        " ".repeat(available.saturating_sub(used)),
+        MarkdownTextStyle::default(),
+    ));
+    content.push(MarkdownSpan::new(
+        " │",
+        MarkdownTextStyle::colored(MarkdownColorRole::Accent),
+    ));
+    UiRow::markdown(content, RowTone::OverlayText)
+}
+
 fn overlay_content(overlay: &OverlayState, input: &str) -> (String, String, Vec<String>, usize) {
     match overlay {
         OverlayState::Commands { scope, selected } => (
@@ -3403,10 +3972,13 @@ fn overlay_content(overlay: &OverlayState, input: &str) -> (String, String, Vec<
         ),
         OverlayState::Clear { selected } => (
             "Clear context".into(),
-            "保留 system prompt，清空当前消息上下文".into(),
+            "确认清空当前上下文？".into(),
             vec!["清空上下文".into(), "取消".into()],
             *selected,
         ),
+        OverlayState::Context { .. } | OverlayState::ContextDetail { .. } => {
+            unreachable!("context overlays use their dedicated renderer")
+        }
         OverlayState::Rewind { choices, selected } => (
             "Rewind".into(),
             "目标事件及其后内容将从 EDB 删除".into(),
@@ -4154,6 +4726,208 @@ fn format_context_usage(context_tokens: Option<u64>, context_window: Option<u64>
         .map(format_context_limit)
         .unwrap_or_else(|| "—".to_owned());
     format!("{used}/{total}")
+}
+
+fn estimate_context_breakdown(
+    events: &[Event],
+    usage: Option<ApiUsage>,
+    limit: Option<u64>,
+    reserve: u64,
+    memory_content: Option<String>,
+    can_clear: bool,
+) -> Result<ContextUsageBreakdown> {
+    let effective = effective_conversation_events(events)?;
+    let compact_content = effective.iter().find_map(|event| match event {
+        Event::CompactStateUpdate(update) if update.state == CompactState::Completed => {
+            Some(update.content.clone())
+        }
+        _ => None,
+    });
+    let Some(usage) = usage else {
+        return Ok(ContextUsageBreakdown {
+            total: None,
+            limit,
+            reserve,
+            values: ContextTokenValues::default(),
+            compact_content,
+            memory_content,
+            can_clear,
+        });
+    };
+    let Some(boundary) = latest_usage_boundary(events, usage)? else {
+        return Ok(ContextUsageBreakdown {
+            total: Some(usage.total_tokens),
+            limit,
+            reserve,
+            values: ContextTokenValues {
+                system: usage.total_tokens,
+                ..ContextTokenValues::default()
+            },
+            compact_content,
+            memory_content,
+            can_clear,
+        });
+    };
+    let mut values = ContextTokenValues::default();
+    let mut active_compact_content = None;
+    let mut active_memory_content = None;
+    for event in effective_conversation_events(&events[..=boundary])? {
+        match event {
+            Event::UserPrompt(prompt) => {
+                values.user = values
+                    .user
+                    .saturating_add(estimate_token_weight(&prompt.content).saturating_add(8));
+            }
+            Event::ManagerPrompt(prompt) => {
+                values.user = values
+                    .user
+                    .saturating_add(estimate_token_weight(&prompt.content).saturating_add(8));
+            }
+            Event::ParentAgentPrompt(prompt) => {
+                values.user = values
+                    .user
+                    .saturating_add(estimate_token_weight(&prompt.content).saturating_add(8));
+            }
+            Event::FollowUpPrompt(prompt) => {
+                values.user = values
+                    .user
+                    .saturating_add(estimate_token_weight(&prompt.content).saturating_add(8));
+            }
+            Event::AssistResponse(response) => {
+                values.model = values
+                    .model
+                    .saturating_add(estimate_token_weight(&response.content));
+            }
+            Event::ToolCall(call) => {
+                values.model = values
+                    .model
+                    .saturating_add(estimate_token_weight(&call.name))
+                    .saturating_add(estimate_token_weight(&call.arguments))
+                    .saturating_add(12);
+            }
+            Event::ToolInfoUpdate(update) => {
+                let content = match &update.content {
+                    ToolInfoContent::Text(content) => content.clone(),
+                    ToolInfoContent::Terminal(_) => serde_json::to_string(&update.content)?,
+                };
+                values.tool = values
+                    .tool
+                    .saturating_add(estimate_token_weight(&content).saturating_add(6));
+            }
+            Event::ToolCallResult(result) => {
+                values.tool = values
+                    .tool
+                    .saturating_add(estimate_token_weight(&result.detail).saturating_add(8));
+            }
+            Event::ModelContextItem(item) => {
+                values.model = values
+                    .model
+                    .saturating_add(estimate_token_weight(&item.content));
+            }
+            Event::CompactStateUpdate(update) if update.state == CompactState::Completed => {
+                active_compact_content = Some(update.content.clone());
+                values.compact = values
+                    .compact
+                    .saturating_add(estimate_token_weight(&update.content).saturating_add(12));
+                if let Some(memory) = &memory_content {
+                    active_memory_content = Some(memory.clone());
+                    values.memory = values
+                        .memory
+                        .saturating_add(estimate_token_weight(memory).saturating_add(12));
+                }
+            }
+            _ => {}
+        }
+    }
+    let known = values.sum();
+    if known <= usage.total_tokens {
+        values.system = values
+            .system
+            .saturating_add(usage.total_tokens.saturating_sub(known));
+    } else if known > 0 {
+        let scaled = |value: u64| {
+            value
+                .saturating_mul(usage.total_tokens)
+                .checked_div(known)
+                .unwrap_or(0)
+        };
+        values.system = scaled(values.system);
+        values.compact = scaled(values.compact);
+        values.memory = scaled(values.memory);
+        values.user = scaled(values.user);
+        values.model = scaled(values.model);
+        values.tool = scaled(values.tool);
+        values.system = values
+            .system
+            .saturating_add(usage.total_tokens.saturating_sub(values.sum()));
+    }
+    Ok(ContextUsageBreakdown {
+        total: Some(usage.total_tokens),
+        limit,
+        reserve,
+        values,
+        compact_content: active_compact_content,
+        memory_content: active_memory_content,
+        can_clear,
+    })
+}
+
+fn latest_usage_boundary(events: &[Event], expected: ApiUsage) -> Result<Option<usize>> {
+    let effective = effective_conversation_events(events)?;
+    let mut errored = BTreeSet::new();
+    let mut boundary = None;
+    for event in effective {
+        let Event::ApiStateUpdate(update) = event else {
+            continue;
+        };
+        if update.state == ApiState::Error {
+            errored.insert(update.api_call_id);
+        }
+        let committed = update.state == ApiState::Completed
+            || (update.state == ApiState::Interrupted && !errored.contains(&update.api_call_id));
+        if committed && update.usage.is_some() {
+            boundary = Some((update.id, update.usage));
+        }
+    }
+    let Some((event_id, usage)) = boundary else {
+        return Ok(None);
+    };
+    if usage != Some(expected) {
+        return Ok(None);
+    }
+    Ok(events.iter().position(|event| event.id() == event_id))
+}
+
+fn estimate_token_weight(text: &str) -> u64 {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut ascii = 0_u64;
+    let mut non_ascii = 0_u64;
+    for character in text.chars() {
+        if character.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    ((ascii.saturating_add(3)) / 4)
+        .saturating_add(non_ascii)
+        .max(1)
+}
+
+fn format_context_tokens(tokens: Option<u64>) -> String {
+    tokens
+        .map(|tokens| format!("{:.1}k", tokens as f64 / 1_000.0))
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+fn format_estimated_context_tokens(tokens: u64) -> String {
+    if tokens < 1_000 {
+        format!("≈{tokens} tok")
+    } else {
+        format!("≈{:.1}k", tokens as f64 / 1_000.0)
+    }
 }
 
 fn format_context_limit(tokens: u64) -> String {
@@ -7241,6 +8015,10 @@ mod tests {
             vec![SlashCommand::Model]
         );
         assert_eq!(
+            matching_commands("/context", CommandScope::Interactive),
+            vec![SlashCommand::Context]
+        );
+        assert_eq!(
             matching_commands("/agent-", CommandScope::Interactive),
             vec![SlashCommand::AgentAdd, SlashCommand::AgentDelete]
         );
@@ -7297,6 +8075,10 @@ mod tests {
         assert_eq!(
             matching_commands("/s", CommandScope::Worker),
             vec![SlashCommand::Stop]
+        );
+        assert_eq!(
+            matching_commands("/context", CommandScope::Worker),
+            vec![SlashCommand::Context]
         );
         assert!(matching_commands("/agent", CommandScope::Worker).is_empty());
         assert!(matching_commands("/rewind", CommandScope::Worker).is_empty());
@@ -8476,6 +9258,131 @@ mod tests {
         assert_eq!(format_context_usage(Some(19), Some(272_000)), "0.0k/272k");
         assert_eq!(format_context_usage(None, Some(1_000_000)), "—/1000k");
         assert_eq!(format_context_usage(Some(14), None), "0.0k/—");
+    }
+
+    #[test]
+    fn context_breakdown_matches_webui_categories_and_real_usage_total() {
+        let mut edb = EventDataBase::new();
+        edb.append_initial_model("model").unwrap();
+        let first = edb.append_user_prompt("first request").unwrap();
+        let first_api = edb.append_api_requesting(first).unwrap();
+        let compact_call = edb
+            .append_tool_call(first_api, first, "compact", "Compact", "{}")
+            .unwrap();
+        edb.append_tool_result(compact_call, ToolResultState::Succeeded, None, "ok")
+            .unwrap();
+        let compact = edb
+            .append_compact_started(compact_call, first, CompactKind::SingleTurn)
+            .unwrap();
+        edb.append_compact_terminal(
+            compact,
+            CompactState::Completed,
+            "## Summary\nkept state",
+            "",
+        )
+        .unwrap();
+
+        let second = edb.append_user_prompt("second request").unwrap();
+        let tool_api = edb.append_api_requesting(second).unwrap();
+        let file_call = edb
+            .append_tool_call(tool_api, second, "read", "File.Read", r#"{"path":"a.txt"}"#)
+            .unwrap();
+        edb.append_api_state_with_usage(
+            tool_api,
+            second,
+            ApiState::Completed,
+            Some(ApiUsage {
+                input_tokens: 30_000,
+                output_tokens: 1_000,
+                total_tokens: 31_000,
+            }),
+            "",
+        )
+        .unwrap();
+        edb.append_tool_result(file_call, ToolResultState::Succeeded, None, "file contents")
+            .unwrap();
+        let final_api = edb.append_api_requesting(second).unwrap();
+        edb.append_assist_response(second, "final answer", true)
+            .unwrap();
+        let usage = ApiUsage {
+            input_tokens: 39_000,
+            output_tokens: 1_000,
+            total_tokens: 40_000,
+        };
+        edb.append_api_state_with_usage(final_api, second, ApiState::Completed, Some(usage), "")
+            .unwrap();
+
+        let memory = turn_history::latest_snapshot(edb.events()).unwrap();
+        let breakdown = estimate_context_breakdown(
+            edb.events(),
+            Some(usage),
+            Some(100_000),
+            10_000,
+            memory,
+            true,
+        )
+        .unwrap();
+        assert_eq!(breakdown.total, Some(40_000));
+        assert_eq!(breakdown.limit, Some(100_000));
+        assert_eq!(breakdown.reserve, 10_000);
+        assert_eq!(breakdown.values.sum(), 40_000);
+        assert!(breakdown.values.system > 0);
+        assert!(breakdown.values.compact > 0);
+        assert!(breakdown.values.memory > 0);
+        assert!(breakdown.values.user > 0);
+        assert!(breakdown.values.model > 0);
+        assert!(breakdown.values.tool > 0);
+        assert!(
+            breakdown
+                .compact_content
+                .as_deref()
+                .unwrap()
+                .contains("Summary")
+        );
+        assert!(
+            breakdown
+                .memory_content
+                .as_deref()
+                .unwrap()
+                .contains("first request")
+        );
+        assert_eq!(
+            breakdown.actions(),
+            vec![
+                ContextAction::CompactDetail,
+                ContextAction::MemoryDetail,
+                ContextAction::Clear,
+            ]
+        );
+        let bar = context_usage_bar_row(&breakdown, 80);
+        assert_eq!(display_width(&bar.text), 80);
+        assert_eq!(context_usage_summary(&breakdown), "40.0k / 100k  ·  40%");
+    }
+
+    #[test]
+    fn readonly_context_is_viewable_without_a_clear_action() {
+        let breakdown = ContextUsageBreakdown {
+            total: Some(20_000),
+            limit: Some(100_000),
+            reserve: 10_000,
+            values: ContextTokenValues {
+                system: 20_000,
+                ..ContextTokenValues::default()
+            },
+            compact_content: Some("summary".into()),
+            memory_content: None,
+            can_clear: false,
+        };
+        assert_eq!(breakdown.actions(), vec![ContextAction::CompactDetail]);
+        let mut overlay = OverlayState::Context {
+            breakdown: Box::new(breakdown),
+            selected: 0,
+        };
+        let mut input = String::new();
+        assert_eq!(
+            handle_overlay_key(&mut overlay, &mut input, KeyCode::Enter),
+            OverlayAction::OpenContextDetail(ContextAction::CompactDetail)
+        );
     }
 
     #[test]
