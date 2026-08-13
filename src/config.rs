@@ -513,6 +513,29 @@ mod tests {
     }
 
     #[test]
+    fn built_in_deepseek_models_use_the_shared_output_limit() {
+        let directory = temporary_path("default-deepseek-output-limits");
+        let config = default_global_config(&directory).unwrap();
+        let deepseek_models = config
+            .models
+            .iter()
+            .filter(|model| model.name.contains("deepseek"))
+            .collect::<Vec<_>>();
+
+        assert!(!deepseek_models.is_empty());
+        for model in deepseek_models {
+            assert_eq!(model.capabilities.max_output_tokens, Some(262_144));
+            assert_eq!(
+                model
+                    .parameters
+                    .get("max_tokens")
+                    .and_then(toml::Value::as_integer),
+                Some(262_144)
+            );
+        }
+    }
+
+    #[test]
     fn built_in_xiaomi_mimo_models_use_their_shared_private_credential() {
         let directory = temporary_path("default-xiaomi-credential");
         let config = default_global_config(&directory).unwrap();

@@ -68,8 +68,8 @@ endpoint = "/chat/completions"
 model = "deepseek-v4-pro"
 source_url = "https://www.cometapi.com/models/deepseek/deepseek-v4/"
 timeout_seconds = 120
-capabilities = { context_window = 1000000, max_output_tokens = 393216, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["none", "thinking"], reasoning_efforts = ["none", "high", "max"], tools = true, streaming = true }
-parameters = { max_tokens = 393216 }
+capabilities = { context_window = 1000000, max_output_tokens = 262144, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["none", "thinking"], reasoning_efforts = ["none", "high", "max"], tools = true, streaming = true }
+parameters = { max_tokens = 262144 }
 effort_parameters = { none = { thinking = { type = "disabled" } }, high = { thinking = { type = "enabled" }, reasoning_effort = "high" }, max = { thinking = { type = "enabled" }, reasoning_effort = "max" } }
 
 [[models]]
@@ -80,8 +80,8 @@ endpoint = "/chat/completions"
 model = "deepseek-v4-flash"
 source_url = "https://www.cometapi.com/models/deepseek/deepseek-v4-flash/"
 timeout_seconds = 120
-capabilities = { context_window = 1000000, max_output_tokens = 393216, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["none", "thinking", "thinking-max"], reasoning_efforts = ["none", "high", "max"], tools = true, streaming = true }
-parameters = { max_tokens = 393216 }
+capabilities = { context_window = 1000000, max_output_tokens = 262144, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["none", "thinking", "thinking-max"], reasoning_efforts = ["none", "high", "max"], tools = true, streaming = true }
+parameters = { max_tokens = 262144 }
 effort_parameters = { none = { thinking = { type = "disabled" } }, high = { thinking = { type = "enabled" }, reasoning_effort = "high" }, max = { thinking = { type = "enabled" }, reasoning_effort = "max" } }
 
 [[models]]

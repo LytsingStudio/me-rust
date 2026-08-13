@@ -1495,7 +1495,7 @@ function renderMessageHtml(message, afterTool) {
   if (!messageIsVisible(message)) return `<div class="message-block projection-hidden hidden" aria-hidden="true"></div>`;
   if (message.kind === "user") return `<div class="message-block user"><div class="user-message-content"> ${escapeHtml(message.content)}</div><button class="user-message-actions" type="button" aria-label="消息操作" aria-haspopup="menu" aria-expanded="false">···</button></div>`;
   if (message.kind === "assistant") return `<div class="message-block assistant ${afterTool ? "after-tool" : ""}"><span class="block-marker">●</span><div class="markdown">${renderMarkdown(message.content.trim())}</div></div>`;
-  if (message.kind === "turn-toolbar") return `<div class="message-block turn-toolbar" aria-label="本轮用时"><span>▶ 用时 ${formatTurnElapsed(message.durationMs)} · ${formatTurnTokens(message.tokenCount)}</span><div class="turn-actions"><button class="clone-turn" type="button">克隆</button><button class="regenerate-turn" type="button">重新生成</button></div></div>`;
+  if (message.kind === "turn-toolbar") return `<div class="message-block turn-toolbar" aria-label="本轮用时"><span>▶ 用时 ${formatTurnElapsed(message.durationMs)} · ${formatTurnTokens(message.tokenCount)} · ${formatTurnCompletedAt(message.timestamp)}</span><div class="turn-actions"><button class="clone-turn" type="button">克隆</button><button class="regenerate-turn" type="button">重新生成</button></div></div>`;
   if (message.kind === "tool") return renderToolCard(message.tool);
   if (message.kind === "worker-activity") return renderWorkerActivity(message.tool);
   const className = message.kind === "session" ? "session" : "notice";
@@ -2642,6 +2642,17 @@ function formatTurnElapsed(ms) {
   if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
   if (minutes > 0) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
   return `${seconds}s`;
+}
+
+function formatTurnCompletedAt(timestamp, now = Date.now()) {
+  const completed = new Date(Number(timestamp));
+  const current = new Date(Number(now));
+  if (Number.isNaN(completed.getTime()) || Number.isNaN(current.getTime())) return "—";
+  const calendarDay = (value) => Date.UTC(value.getFullYear(), value.getMonth(), value.getDate());
+  const daysAgo = Math.max(0, Math.round((calendarDay(current) - calendarDay(completed)) / 86400000));
+  const day = daysAgo === 0 ? "今天" : daysAgo === 1 ? "昨天" : daysAgo === 2 ? "前天" : `${daysAgo} 天前`;
+  const time = `${String(completed.getHours()).padStart(2, "0")}:${String(completed.getMinutes()).padStart(2, "0")}`;
+  return `${day} ${time}`;
 }
 
 function completedTurnContextGrowth(completedApiUsage, promptId, contextBaseline) {

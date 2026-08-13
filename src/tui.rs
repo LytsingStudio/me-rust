@@ -36,6 +36,7 @@ use crate::{
         WorkMapObjectiveSnapshot, WorkMapPlanSnapshot, WorkMapProjection, WorkMapSnapshot,
     },
 };
+use chrono::{DateTime, Local, Utc};
 use crossterm::{
     cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition, Show},
     event::{self, Event as TerminalEvent, KeyCode, KeyEventKind, KeyModifiers},
@@ -5441,7 +5442,11 @@ fn chat_rows(
             }
             (ChatBlockKind::TurnToolbar, None) => {
                 rows.push(UiRow::new(
-                    format!("  ▶ 用时 {}", message.content),
+                    format!(
+                        "  ▶ 用时 {} · {}",
+                        message.content,
+                        format_turn_completed_at(message.timestamp_ms),
+                    ),
                     RowTone::TurnToolbar,
                 ));
             }
@@ -5536,6 +5541,37 @@ fn format_turn_tokens(tokens: Option<u64>) -> String {
     tokens
         .map(|tokens| format!("{:.1}k", tokens as f64 / 1_000.0))
         .unwrap_or_else(|| "—".to_owned())
+}
+
+fn format_turn_completed_at(timestamp_ms: u64) -> String {
+    format_turn_completed_at_relative(timestamp_ms, current_timestamp_ms())
+}
+
+fn format_turn_completed_at_relative(timestamp_ms: u64, now_ms: u64) -> String {
+    let to_local = |value: u64| {
+        i64::try_from(value)
+            .ok()
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
+            .map(|value| value.with_timezone(&Local))
+    };
+    let Some(completed) = to_local(timestamp_ms) else {
+        return "—".to_owned();
+    };
+    let Some(now) = to_local(now_ms) else {
+        return "—".to_owned();
+    };
+    let days_ago = now
+        .date_naive()
+        .signed_duration_since(completed.date_naive())
+        .num_days()
+        .max(0);
+    let day = match days_ago {
+        0 => "今天".to_owned(),
+        1 => "昨天".to_owned(),
+        2 => "前天".to_owned(),
+        days => format!("{days} 天前"),
+    };
+    format!("{day} {}", completed.format("%H:%M"))
 }
 
 fn tool_card_precedes_assistant(previous: &ChatMessage, current: &ChatMessage) -> bool {
@@ -7318,6 +7354,7 @@ mod tests {
         assert_eq!(full.messages[3].kind, ChatBlockKind::Assistant);
         assert_eq!(full.messages[4].kind, ChatBlockKind::TurnToolbar);
         assert_eq!(full.messages[4].content, "1h 43m 03s · 4.0k");
+        let completed_label = format_turn_completed_at(completed_at_ms);
 
         let rows = chat_rows(&full, 80, false, completed_at_ms);
         let final_answer = rows
@@ -7326,7 +7363,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows[final_answer + 1],
-            UiRow::new("  ▶ 用时 1h 43m 03s · 4.0k", RowTone::TurnToolbar)
+            UiRow::new(
+                format!("  ▶ 用时 1h 43m 03s · 4.0k · {completed_label}"),
+                RowTone::TurnToolbar,
+            )
         );
         assert_ne!(rows[final_answer + 1].tone, RowTone::Spacer);
 
@@ -7407,6 +7447,50 @@ mod tests {
         assert_eq!(format_turn_tokens(Some(12_649)), "12.6k");
         assert_eq!(format_turn_tokens(Some(103_000)), "103.0k");
         assert_eq!(format_turn_tokens(None), "—");
+    }
+
+    #[test]
+    fn turn_completion_time_uses_local_calendar_days() {
+        use chrono::{Days, TimeZone as _};
+
+        let now = Local
+            .with_ymd_and_hms(2026, 8, 13, 0, 5, 0)
+            .single()
+            .unwrap();
+        let completed_at = |days_ago: u64| {
+            let date = now
+                .date_naive()
+                .checked_sub_days(Days::new(days_ago))
+                .unwrap();
+            date.and_hms_opt(23, 24, 0)
+                .unwrap()
+                .and_local_timezone(Local)
+                .single()
+                .unwrap()
+                .timestamp_millis() as u64
+        };
+        let now_ms = now.timestamp_millis() as u64;
+
+        assert_eq!(
+            format_turn_completed_at_relative(completed_at(0), now_ms),
+            "今天 23:24"
+        );
+        assert_eq!(
+            format_turn_completed_at_relative(completed_at(1), now_ms),
+            "昨天 23:24"
+        );
+        assert_eq!(
+            format_turn_completed_at_relative(completed_at(2), now_ms),
+            "前天 23:24"
+        );
+        assert_eq!(
+            format_turn_completed_at_relative(completed_at(5), now_ms),
+            "5 天前 23:24"
+        );
+        assert_eq!(
+            format_turn_completed_at_relative(completed_at(132), now_ms),
+            "132 天前 23:24"
+        );
     }
 
     #[test]

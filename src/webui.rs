@@ -1472,6 +1472,13 @@ mod tests {
         assert!(APP_JS.contains("projection.messages.at(-1) === assistant"));
         assert!(APP_JS.contains("kind: \"turn-toolbar\""));
         assert!(APP_JS.contains("function formatTurnElapsed(ms)"));
+        assert!(APP_JS.contains("function formatTurnCompletedAt(timestamp, now = Date.now())"));
+        assert!(
+            APP_JS.contains("Date.UTC(value.getFullYear(), value.getMonth(), value.getDate())")
+        );
+        assert!(APP_JS.contains(
+            "daysAgo === 0 ? \"今天\" : daysAgo === 1 ? \"昨天\" : daysAgo === 2 ? \"前天\""
+        ));
         assert!(APP_JS.contains("_turnContextBaseline: new Map()"));
         assert!(APP_JS.contains(
             "function completedTurnContextGrowth(completedApiUsage, promptId, contextBaseline)"
@@ -1481,7 +1488,7 @@ mod tests {
         assert!(APP_JS.contains("`${hours}h ${String(minutes).padStart(2, \"0\")}m ${String(seconds).padStart(2, \"0\")}s`"));
         assert!(APP_JS.contains("return `${seconds}s`;"));
         assert!(APP_JS.contains("aria-label=\"本轮用时\""));
-        assert!(APP_JS.contains("<span>▶ 用时 ${formatTurnElapsed(message.durationMs)} · ${formatTurnTokens(message.tokenCount)}</span>"));
+        assert!(APP_JS.contains("<span>▶ 用时 ${formatTurnElapsed(message.durationMs)} · ${formatTurnTokens(message.tokenCount)} · ${formatTurnCompletedAt(message.timestamp)}</span>"));
         assert!(STYLE_CSS.contains(".message-block.turn-toolbar"));
         assert!(STYLE_CSS.contains(".message-block.turn-toolbar span"));
         assert!(STYLE_CSS.contains("font-variant-numeric: tabular-nums"));
