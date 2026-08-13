@@ -3306,7 +3306,7 @@ impl LiveIndicators {
                     }
                 }
                 if api_active {
-                    let frame = API_SPINNER_FRAMES[tick % API_SPINNER_FRAMES.len()];
+                    let frame = api_spinner_frame_at(now_ms);
                     let _ = paint_api_spinner(&mut stdout, frame);
                 }
                 drop(_output_guard);
@@ -3347,6 +3347,14 @@ const API_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"
 const TOOL_ANIMATION_TICKS: usize = 2;
 const INPUT_ANIMATION_QUIET_PERIOD_MS: u64 = 250;
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(100);
+
+fn api_spinner_frame_at(timestamp_ms: u64) -> &'static str {
+    let frame_duration_ms = u64::try_from(ANIMATION_INTERVAL.as_millis())
+        .unwrap_or(1)
+        .max(1);
+    let frame = timestamp_ms / frame_duration_ms;
+    API_SPINNER_FRAMES[frame as usize % API_SPINNER_FRAMES.len()]
+}
 
 fn input_has_animation_priority(last_input_at_ms: u64, now_ms: u64) -> bool {
     now_ms.saturating_sub(last_input_at_ms) < INPUT_ANIMATION_QUIET_PERIOD_MS
@@ -4155,10 +4163,11 @@ fn panel_status_text(
 ) -> String {
     let model_name = projection.model_name.as_deref().unwrap_or("<unset>");
     let effort = projection.effort.as_deref().unwrap_or("<unset>");
+    let spinner_frame = api_spinner_frame_at(current_timestamp_ms());
     match read_only_state {
         Some(state) => {
             let spinner = if api_activity.active || api_is_active(projection.api_state) {
-                API_SPINNER_FRAMES[0]
+                spinner_frame
             } else {
                 " "
             };
@@ -4185,7 +4194,7 @@ fn panel_status_text(
             projection.api_usage.map(|usage| usage.total_tokens),
             context_window,
             api_activity,
-            API_SPINNER_FRAMES[0],
+            spinner_frame,
         ),
     }
 }
@@ -9202,6 +9211,34 @@ mod tests {
         let spinner = String::from_utf8(spinner).unwrap();
         assert!(spinner.contains(API_SPINNER_FRAMES[3]));
         assert_ne!(API_SPINNER_FRAMES[0], API_SPINNER_FRAMES[1]);
+    }
+
+    #[test]
+    fn api_spinner_frame_is_driven_only_by_time() {
+        assert_eq!(api_spinner_frame_at(0), API_SPINNER_FRAMES[0]);
+        assert_eq!(api_spinner_frame_at(99), API_SPINNER_FRAMES[0]);
+        assert_eq!(api_spinner_frame_at(100), API_SPINNER_FRAMES[1]);
+        assert_eq!(api_spinner_frame_at(999), API_SPINNER_FRAMES[9]);
+        assert_eq!(api_spinner_frame_at(1_000), API_SPINNER_FRAMES[0]);
+
+        let frame = api_spinner_frame_at(400);
+        for received_sse_events in [0, 1, 100, 100_000] {
+            let text = main_status_text(
+                Some(ApiState::Streaming),
+                "main",
+                "main-agent",
+                "model",
+                "unset",
+                Some(12_345),
+                Some(500_000),
+                UiApiActivity {
+                    active: true,
+                    received_sse_events,
+                },
+                frame,
+            );
+            assert!(text.starts_with(&format!("{frame} me")));
+        }
     }
 
     #[test]
