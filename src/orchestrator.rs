@@ -35,7 +35,7 @@ use crate::{
     tool_result_truncation,
     toolbox::{
         ToolboxCatalog, ToolboxExecutionError, ToolboxObserver, ToolboxRuntime, ToolboxUpdate,
-        WORKSPACE_TEMP_DIRECTORY,
+        WORKSPACE_TEMP_DIRECTORY, disabled_tool_full_name,
     },
     turn_history,
     workflow::{AgentDefinition, AgentId, WorkflowHandle},
@@ -4978,8 +4978,8 @@ impl MainResponseBuffer {
                 if tool.arguments.is_empty() {
                     return Err("model tool call has no arguments".into());
                 }
-                let name = catalog
-                    .resolve_api_name(&tool.name)
+                let name = disabled_tool_full_name(&tool.name)
+                    .or_else(|| catalog.resolve_api_name(&tool.name))
                     .ok_or_else(|| format!("model called unavailable tool {}", tool.name))?;
                 Ok(CompletedToolCall {
                     provider_call_id: tool.provider_call_id,
@@ -9930,19 +9930,29 @@ for line in sys.stdin:
     #[test]
     fn model_context_safely_truncates_tool_json_without_changing_edb_detail() {
         let mut edb = main_agent_pending_tool("File.Read", r#"{"path":"large.txt"}"#);
-        let content = (0..12_000)
-            .map(|line| format!("line-{line:05} {}\n", "内容".repeat(10)))
-            .collect::<String>();
+        let lines = (0..12_000)
+            .map(|line| {
+                (
+                    (line + 1).to_string(),
+                    json!(format!("line-{line:05} {}\n", "内容".repeat(10))),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let size = lines
+            .values()
+            .filter_map(Value::as_str)
+            .map(str::len)
+            .sum::<usize>();
         let detail = json!({
             "path":"large.txt",
-            "content":content,
+            "lines":lines,
             "start_line":1,
             "end_line":12_000,
             "total_lines":12_000,
             "eof":true,
             "truncated":false,
             "hash":"1234abcd",
-            "size":content.len(),
+            "size":size,
             "encoding":"utf-8",
             "encoding_confidence":1.0,
             "bom":false
@@ -9960,18 +9970,14 @@ for line in sys.stdin:
         let result: Value = serde_json::from_str(tool["content"].as_str().unwrap()).unwrap();
         assert_eq!(result["truncate"], true);
         assert_eq!(result["truncate_info"]["tool"], "File.Read");
-        assert!(result["result"]["detail"]["content"].is_null());
-        assert_eq!(
-            result["result"]["detail"]["content_segments"][0]["start_line"],
-            1
-        );
-        assert_eq!(
-            result["result"]["detail"]["content_segments"]
+        let retained = result["result"]["detail"]["lines"].as_object().unwrap();
+        assert!(retained.contains_key("1"));
+        assert!(retained.contains_key("12000"));
+        assert!(retained.len() < 12_000);
+        assert!(
+            result["truncate_info"]["ranges"]["lines"]["removed_line_ranges"]
                 .as_array()
-                .unwrap()
-                .last()
-                .unwrap()["end_line"],
-            12_000
+                .is_some_and(|ranges| !ranges.is_empty())
         );
         let persisted = edb
             .events()
@@ -10060,6 +10066,24 @@ for line in sys.stdin:
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].provider_call_id, "call-1");
         assert_eq!(tools[0].name, terminal::LIST);
+        assert_eq!(tools[0].arguments, "{}");
+    }
+
+    #[test]
+    fn main_response_preserves_disabled_apply_patch_for_a_tool_error() {
+        let mut response = MainResponseBuffer::default();
+        response
+            .push(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-disabled","function":{"name":"File_ApplyPatch","arguments":"{}"}}]}}]}"#,
+            )
+            .unwrap();
+        response.push("data: [DONE]").unwrap();
+
+        let tools = response
+            .complete_tools(&ToolboxCatalog::default_terminal_for_test())
+            .unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, crate::toolbox::DISABLED_FILE_APPLY_PATCH);
         assert_eq!(tools[0].arguments, "{}");
     }
 

@@ -84,6 +84,33 @@ fn utf32_be(text: &str, bom: bool) -> Vec<u8> {
     bytes
 }
 
+fn numbered_lines(text: &str, first_line: usize) -> Value {
+    let bytes = text.as_bytes();
+    let mut lines = serde_json::Map::new();
+    let mut start = 0;
+    let mut number = first_line;
+    let mut index = 0;
+    while index < bytes.len() {
+        let end = match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => Some(index + 2),
+            b'\r' | b'\n' => Some(index + 1),
+            _ => None,
+        };
+        if let Some(end) = end {
+            lines.insert(number.to_string(), json!(&text[start..end]));
+            number += 1;
+            start = end;
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    if start < bytes.len() {
+        lines.insert(number.to_string(), json!(&text[start..]));
+    }
+    Value::Object(lines)
+}
+
 struct ToolboxProcess {
     child: Child,
     stdin: ChildStdin,
@@ -206,38 +233,49 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
             }
         }
     }
-    assert!(tool_names.contains(&"ApplyPatch".to_owned()));
-    assert!(!tool_names.contains(&"Edit".to_owned()));
+    assert!(!tool_names.contains(&"ApplyPatch".to_owned()));
+    assert!(tool_names.contains(&"Edit".to_owned()));
+    let disabled = toolbox.execute("ApplyPatch", json!({}));
+    assert_eq!(disabled["type"], "error");
+    assert_eq!(disabled["error"]["code"], "tool_disabled");
+    assert!(
+        disabled["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("File.Edit")
+    );
+    let edit_schema = toolbox.query("getInputSchema", Some("Edit"));
     assert_eq!(
-        toolbox.query("getInputSchema", Some("ApplyPatch"))["output"]["properties"]["patch"]["minLength"],
+        edit_schema["output"]["properties"]["target_line_start"]["minimum"],
         1
     );
-    let patch_instructions = toolbox.query("getInstructions", Some("ApplyPatch"));
-    assert!(
-        patch_instructions["output"]
-            .as_str()
-            .unwrap()
-            .contains("standard unified diff")
+    assert_eq!(
+        edit_schema["output"]["properties"]["target_line_end"]["minimum"],
+        0
     );
-    let patch_examples = toolbox.query("getExamples", Some("ApplyPatch"));
-    let patch_examples = patch_examples["output"].as_str().unwrap();
-    assert!(patch_examples.contains("@@ -1,2 +1,2 @@"));
-    let example_objects = patch_examples
-        .lines()
-        .filter(|line| line.starts_with('{'))
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(example_objects.len(), 3);
-    assert!(
-        example_objects[2]["patch"]
-            .as_str()
-            .unwrap()
-            .contains("\\ No newline at end of file")
-    );
+    let edit_instructions = toolbox.query("getInstructions", Some("Edit"));
+    let edit_instructions = edit_instructions["output"].as_str().unwrap();
+    assert!(edit_instructions.contains("target_line_start = target_line_end + 1"));
+    assert!(edit_instructions.contains("never adds, removes, converts, or guesses a newline"));
+    let edit_examples = toolbox.query("getExamples", Some("Edit"));
+    let edit_examples = edit_examples["output"].as_str().unwrap();
+    assert!(edit_examples.contains("Delete complete lines"));
+    assert!(edit_examples.contains("Clear the text"));
+    assert!(edit_examples.contains("Insert into an empty file"));
+    assert!(edit_examples.contains("final line 4=omega with no ending"));
+    for example in edit_examples.lines().filter(|line| line.starts_with('{')) {
+        serde_json::from_str::<Value>(example).unwrap();
+    }
     assert_eq!(
         toolbox.query("getInputSchema", Some("Read"))["output"]["properties"]["encoding"]["default"],
         "auto"
     );
+    let read_output = toolbox.query("getOutputSchema", Some("Read"));
+    assert_eq!(
+        read_output["output"]["properties"]["lines"]["type"],
+        "object"
+    );
+    assert!(read_output["output"]["properties"].get("content").is_none());
     let create_encodings = toolbox.query("getInputSchema", Some("Create"))["output"]["properties"]
         ["encoding"]["enum"]
         .as_array()
@@ -297,21 +335,22 @@ fn file_mutations_chain_hashes_and_never_add_implicit_text() {
     assert_eq!(created["output"]["previous_hash"], Value::Null);
 
     let read = toolbox.execute("Read", json!({"path":"notes.txt"}));
-    assert_eq!(read["output"]["content"], "alpha\nbeta");
+    assert_eq!(read["output"]["lines"], numbered_lines("alpha\nbeta", 1));
+    assert!(read["output"].get("content").is_none());
     assert_eq!(read["output"]["hash"], hash1);
 
     let edited = toolbox.execute(
-        "ApplyPatch",
+        "Edit",
         json!({
             "path":"notes.txt",
             "expected_hash":hash1,
-            "patch":"--- a/notes.txt\n+++ b/notes.txt\n@@ -1,2 +1,2 @@\n-alpha\n-beta\n\\ No newline at end of file\n+first\n+second\n\\ No newline at end of file\n"
+            "target_line_start":1,
+            "target_line_end":2,
+            "new_text":"first\nsecond"
         }),
     );
     assert_eq!(edited["output"]["previous_hash"], read["output"]["hash"]);
-    assert_eq!(edited["output"]["hunks_applied"], 1);
-    assert_eq!(edited["output"]["lines_added"], 2);
-    assert_eq!(edited["output"]["lines_removed"], 2);
+    assert_eq!(edited["output"]["operation"], "edited");
     let hash2 = edited["output"]["hash"].as_str().unwrap().to_owned();
 
     let appended = toolbox.execute(
@@ -363,57 +402,7 @@ fn file_mutations_chain_hashes_and_never_add_implicit_text() {
 }
 
 #[test]
-fn apply_patch_supports_standard_multi_hunk_diffs_and_preserves_line_endings() {
-    let workspace = temporary_workspace();
-    let script = generated_file_toolbox(&workspace);
-    let mut toolbox = ToolboxProcess::start(&workspace, &script);
-    let created = toolbox.execute(
-        "Create",
-        json!({
-            "path":"sample.txt",
-            "content":"one\r\ntwo\r\nthree\r\nfour\r\ndrop\r\nlast"
-        }),
-    );
-
-    let patched = toolbox.execute(
-        "ApplyPatch",
-        json!({
-            "path":"sample.txt",
-            "expected_hash":created["output"]["hash"],
-            "patch":"--- a/sample.txt\n+++ b/sample.txt\n@@ -1,2 +1,3 @@\n one\n-two\n+second\n+inserted\n@@ -4,3 +5,2 @@\n-four\n+fourth\n-drop\n last\n\\ No newline at end of file\n"
-        }),
-    );
-    assert_eq!(patched["type"], "result", "patch failed: {patched}");
-    assert_eq!(patched["output"]["operation"], "patched");
-    assert_eq!(patched["output"]["hunks_applied"], 2);
-    assert_eq!(patched["output"]["lines_added"], 3);
-    assert_eq!(patched["output"]["lines_removed"], 3);
-    assert_eq!(
-        fs::read(workspace.join("sample.txt")).unwrap(),
-        b"one\r\nsecond\r\ninserted\r\nthree\r\nfourth\r\nlast"
-    );
-
-    let empty = toolbox.execute("Create", json!({"path":"empty.txt", "content":""}));
-    let inserted = toolbox.execute(
-        "ApplyPatch",
-        json!({
-            "path":"empty.txt",
-            "expected_hash":empty["output"]["hash"],
-            "patch":"--- empty.txt\n+++ empty.txt\n@@ -0,0 +1,2 @@\n+alpha\n+omega\n\\ No newline at end of file\n"
-        }),
-    );
-    assert_eq!(inserted["type"], "result", "empty patch failed: {inserted}");
-    assert_eq!(
-        fs::read_to_string(workspace.join("empty.txt")).unwrap(),
-        "alpha\nomega"
-    );
-
-    toolbox.finish();
-    fs::remove_dir_all(workspace).unwrap();
-}
-
-#[test]
-fn apply_patch_rejects_malformed_or_wrong_file_diffs_without_writing() {
+fn apply_patch_is_hidden_and_rejected_without_writing() {
     let workspace = temporary_workspace();
     let script = generated_file_toolbox(&workspace);
     let mut toolbox = ToolboxProcess::start(&workspace, &script);
@@ -421,52 +410,247 @@ fn apply_patch_rejects_malformed_or_wrong_file_diffs_without_writing() {
         "Create",
         json!({"path":"safe.txt", "content":"alpha\nbeta\n"}),
     );
-    let hash = created["output"]["hash"].as_str().unwrap();
-    let cases = [
-        (
-            "wrong path",
-            "--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-alpha\n+changed\n",
-        ),
-        (
-            "wrong counts",
-            "--- a/safe.txt\n+++ b/safe.txt\n@@ -1,2 +1,2 @@\n-alpha\n+changed\n",
-        ),
-        (
-            "markdown fence",
-            "```diff\n--- a/safe.txt\n+++ b/safe.txt\n@@ -1 +1 @@\n-alpha\n+changed\n```\n",
-        ),
-        (
-            "custom patch dialect",
-            "*** Begin Patch\n*** Update File: safe.txt\n@@\n-alpha\n+changed\n*** End Patch\n",
-        ),
-    ];
-    for (name, patch) in cases {
-        let rejected = toolbox.execute(
-            "ApplyPatch",
-            json!({"path":"safe.txt", "expected_hash":hash, "patch":patch}),
-        );
-        assert_eq!(rejected["type"], "error", "{name} unexpectedly succeeded");
-        assert_eq!(rejected["error"]["code"], "invalid_patch", "case={name}");
-        assert_eq!(
-            fs::read_to_string(workspace.join("safe.txt")).unwrap(),
-            "alpha\nbeta\n",
-            "case={name} mutated the file"
-        );
-    }
 
-    let removed_edit = toolbox.execute(
-        "Edit",
+    let rejected = toolbox.execute(
+        "ApplyPatch",
         json!({
             "path":"safe.txt",
-            "expected_hash":hash,
-            "edits":[{"find":"alpha", "replace":"changed"}]
+            "expected_hash":created["output"]["hash"],
+            "patch":"--- a/safe.txt\n+++ b/safe.txt\n@@ -1 +1 @@\n-alpha\n+changed\n"
         }),
     );
-    assert_eq!(removed_edit["error"]["code"], "unknown_tool");
+    assert_eq!(rejected["type"], "error");
+    assert_eq!(rejected["error"]["code"], "tool_disabled");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("File.Edit")
+    );
     assert_eq!(
         fs::read_to_string(workspace.join("safe.txt")).unwrap(),
         "alpha\nbeta\n"
     );
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn edit_replaces_deletes_inserts_and_preserves_exact_line_endings() {
+    let workspace = temporary_workspace();
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+    let cases = [
+        (
+            "replace-one.txt",
+            "alpha\nbeta\ngamma\nomega",
+            2,
+            2,
+            "updated\n",
+            "alpha\nupdated\ngamma\nomega",
+        ),
+        (
+            "replace-fewer.txt",
+            "alpha\nbeta\ngamma\nomega",
+            2,
+            3,
+            "combined\n",
+            "alpha\ncombined\nomega",
+        ),
+        (
+            "replace-more.txt",
+            "alpha\nbeta\ngamma",
+            2,
+            2,
+            "one\ntwo\nthree\n",
+            "alpha\none\ntwo\nthree\ngamma",
+        ),
+        (
+            "delete-lines.txt",
+            "alpha\nbeta\ngamma\nomega",
+            2,
+            3,
+            "",
+            "alpha\nomega",
+        ),
+        (
+            "clear-text.txt",
+            "alpha\nbeta\ngamma",
+            2,
+            2,
+            "\n",
+            "alpha\n\ngamma",
+        ),
+        (
+            "insert-middle.txt",
+            "alpha\nbeta\ngamma",
+            2,
+            1,
+            "inserted one\ninserted two\n",
+            "alpha\ninserted one\ninserted two\nbeta\ngamma",
+        ),
+        (
+            "insert-first.txt",
+            "alpha\nbeta",
+            1,
+            0,
+            "header\n",
+            "header\nalpha\nbeta",
+        ),
+        (
+            "append-terminated.txt",
+            "alpha\nomega\n",
+            3,
+            2,
+            "appended\n",
+            "alpha\nomega\nappended\n",
+        ),
+        (
+            "append-unterminated.txt",
+            "alpha\nomega",
+            3,
+            2,
+            "\nappended",
+            "alpha\nomega\nappended",
+        ),
+        (
+            "remove-ending.txt",
+            "alpha\nbeta\n",
+            1,
+            1,
+            "alpha",
+            "alphabeta\n",
+        ),
+        (
+            "mixed-endings.txt",
+            "unix\nwindows\r\nold-mac\rfinal",
+            2,
+            2,
+            "updated\r\n",
+            "unix\nupdated\r\nold-mac\rfinal",
+        ),
+        ("delete-all.txt", "alpha\nbeta\ngamma\nomega", 1, 4, "", ""),
+        ("empty.txt", "", 1, 0, "first line\n", "first line\n"),
+    ];
+
+    for (path, initial, start, end, new_text, expected) in cases {
+        let created = toolbox.execute("Create", json!({"path":path, "content":initial}));
+        assert_eq!(
+            created["type"], "result",
+            "create failed for {path}: {created}"
+        );
+        let edited = toolbox.execute(
+            "Edit",
+            json!({
+                "path":path,
+                "expected_hash":created["output"]["hash"],
+                "target_line_start":start,
+                "target_line_end":end,
+                "new_text":new_text
+            }),
+        );
+        assert_eq!(edited["type"], "result", "edit failed for {path}: {edited}");
+        assert_eq!(edited["output"]["operation"], "edited");
+        assert_eq!(edited["output"]["target_line_start"], start);
+        assert_eq!(edited["output"]["target_line_end"], end);
+        assert_eq!(edited["output"]["previous_size"], initial.len());
+        assert_eq!(fs::read_to_string(workspace.join(path)).unwrap(), expected);
+        assert_eq!(
+            edited["output"]["hash"],
+            toolbox.execute("Read", json!({"path":path}))["output"]["hash"]
+        );
+    }
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn edit_rejects_bad_ranges_stale_hashes_and_lossy_text_atomically() {
+    let workspace = temporary_workspace();
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+    let created = toolbox.execute(
+        "Create",
+        json!({"path":"safe.txt", "content":"alpha\nbeta\ngamma\n"}),
+    );
+    let hash = created["output"]["hash"].as_str().unwrap();
+    for (name, start, end) in [
+        ("reversed gap", 5, 2),
+        ("replacement beyond eof", 4, 4),
+        ("insertion beyond eof", 5, 4),
+        ("end without start", 1, 3 + 1),
+    ] {
+        let rejected = toolbox.execute(
+            "Edit",
+            json!({
+                "path":"safe.txt",
+                "expected_hash":hash,
+                "target_line_start":start,
+                "target_line_end":end,
+                "new_text":"changed\n"
+            }),
+        );
+        assert_eq!(rejected["type"], "error", "{name} unexpectedly succeeded");
+        assert_eq!(rejected["error"]["code"], "invalid_range", "case={name}");
+        assert_eq!(
+            fs::read_to_string(workspace.join("safe.txt")).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
+    }
+
+    let unexpected = toolbox.execute(
+        "Edit",
+        json!({
+            "path":"safe.txt",
+            "expected_hash":hash,
+            "target_line_start":2,
+            "target_line_end":2,
+            "new_text":"changed\n",
+            "find":"beta"
+        }),
+    );
+    assert_eq!(unexpected["error"]["code"], "invalid_arguments");
+
+    fs::write(workspace.join("safe.txt"), "external\n").unwrap();
+    let stale = toolbox.execute(
+        "Edit",
+        json!({
+            "path":"safe.txt",
+            "expected_hash":hash,
+            "target_line_start":1,
+            "target_line_end":1,
+            "new_text":"changed\n"
+        }),
+    );
+    assert_eq!(stale["error"]["code"], "conflict");
+    assert_eq!(
+        fs::read_to_string(workspace.join("safe.txt")).unwrap(),
+        "external\n"
+    );
+
+    let western = toolbox.execute(
+        "Create",
+        json!({
+            "path":"western.txt",
+            "content":"Café – résumé",
+            "encoding":"windows-1252"
+        }),
+    );
+    let before = fs::read(workspace.join("western.txt")).unwrap();
+    let lossy = toolbox.execute(
+        "Edit",
+        json!({
+            "path":"western.txt",
+            "expected_hash":western["output"]["hash"],
+            "target_line_start":1,
+            "target_line_end":1,
+            "new_text":"中文"
+        }),
+    );
+    assert_eq!(lossy["error"]["code"], "encoding_error");
+    assert_eq!(fs::read(workspace.join("western.txt")).unwrap(), before);
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
@@ -550,7 +734,7 @@ fn make_directory_supports_strict_and_recursive_creation_safely() {
 }
 
 #[test]
-fn stale_hash_and_invalid_patches_fail_without_mutating_the_file() {
+fn stale_hash_fails_without_mutating_the_file() {
     let workspace = temporary_workspace();
     let script = generated_file_toolbox(&workspace);
     let mut toolbox = ToolboxProcess::start(&workspace, &script);
@@ -559,35 +743,6 @@ fn stale_hash_and_invalid_patches_fail_without_mutating_the_file() {
         json!({"path":"state.txt", "content":"same\nsame\nend\n"}),
     );
     let hash = created["output"]["hash"].as_str().unwrap();
-
-    let mismatch = toolbox.execute(
-        "ApplyPatch",
-        json!({
-            "path":"state.txt",
-            "expected_hash":hash,
-            "patch":"--- a/state.txt\n+++ b/state.txt\n@@ -1 +1 @@\n-missing\n+changed\n"
-        }),
-    );
-    assert_eq!(mismatch["type"], "error");
-    assert_eq!(mismatch["error"]["code"], "patch_conflict");
-    assert_eq!(
-        fs::read_to_string(workspace.join("state.txt")).unwrap(),
-        "same\nsame\nend\n"
-    );
-
-    let late_failure = toolbox.execute(
-        "ApplyPatch",
-        json!({
-            "path":"state.txt",
-            "expected_hash":hash,
-            "patch":"--- a/state.txt\n+++ b/state.txt\n@@ -1 +1 @@\n-same\n+temporary\n@@ -3 +3 @@\n-missing\n+never\n"
-        }),
-    );
-    assert_eq!(late_failure["error"]["code"], "patch_conflict");
-    assert_eq!(
-        fs::read_to_string(workspace.join("state.txt")).unwrap(),
-        "same\nsame\nend\n"
-    );
 
     fs::write(workspace.join("state.txt"), "external\n").unwrap();
     let stale = toolbox.execute(
@@ -619,6 +774,11 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     fs::write(workspace.join("src/nested/b.txt"), "needle two\n").unwrap();
     fs::write(workspace.join("src/blob.bin"), [0, 1, 2, 255]).unwrap();
     fs::write(workspace.join("src/.hidden.txt"), "Needle hidden\n").unwrap();
+    fs::write(
+        workspace.join("src/line-endings.txt"),
+        "first\r\n\rthird\u{2028}same\nlast",
+    )
+    .unwrap();
     let script = generated_file_toolbox(&workspace);
     let mut toolbox = ToolboxProcess::start(&workspace, &script);
 
@@ -626,10 +786,16 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
         "Read",
         json!({"path":"src/a.txt", "start_line":2, "max_lines":1}),
     );
-    assert_eq!(read["output"]["content"], "Needle one\n");
+    assert_eq!(read["output"]["lines"], numbered_lines("Needle one\n", 2));
     assert_eq!(read["output"]["start_line"], 2);
     assert_eq!(read["output"]["end_line"], 2);
     assert_eq!(read["output"]["truncated"], true);
+
+    let line_endings = toolbox.execute("Read", json!({"path":"src/line-endings.txt"}));
+    assert_eq!(
+        line_endings["output"]["lines"],
+        json!({"1":"first\r\n", "2":"\r", "3":"third\u{2028}same\n", "4":"last"})
+    );
 
     let bytes = toolbox.execute(
         "ReadBytes",
@@ -654,6 +820,7 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
         vec![
             "src/a.txt",
             "src/blob.bin",
+            "src/line-endings.txt",
             "src/nested",
             "src/nested/b.txt"
         ]
@@ -665,7 +832,7 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     );
     assert_eq!(
         find["output"]["results"],
-        json!(["src/a.txt", "src/nested/b.txt"])
+        json!(["src/a.txt", "src/line-endings.txt", "src/nested/b.txt"])
     );
 
     let search = toolbox.execute(
@@ -698,6 +865,25 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     );
     assert_eq!(status["output"]["entries"][1]["type"], "directory");
     assert_eq!(status["output"]["entries"][2]["exists"], false);
+
+    let twelve_lines = (1..=12)
+        .map(|number| format!("line {number}\n"))
+        .collect::<String>();
+    fs::write(workspace.join("twelve.txt"), twelve_lines).unwrap();
+    let numbered = toolbox.execute("Read", json!({"path":"twelve.txt"}));
+    assert_eq!(numbered["output"]["lines"]["01"], "line 1\n");
+    assert_eq!(numbered["output"]["lines"]["12"], "line 12\n");
+    assert_eq!(
+        numbered["output"]["lines"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        (1..=12)
+            .map(|number| format!("{number:02}"))
+            .collect::<Vec<_>>()
+    );
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
@@ -858,7 +1044,7 @@ fn detects_common_text_encodings_and_reports_bom_and_confidence() {
         let read = toolbox.execute("Read", json!({"path":path}));
         assert_eq!(read["type"], "result", "failed to read {path}: {read}");
         assert_eq!(read["output"]["encoding"], encoding);
-        assert_eq!(read["output"]["content"], content);
+        assert_eq!(read["output"]["lines"], numbered_lines(content, 1));
         assert_eq!(read["output"]["bom"], bom);
         assert!(read["output"]["encoding_confidence"].as_f64().unwrap() >= 0.78);
     }
@@ -883,11 +1069,13 @@ fn text_mutations_preserve_detected_encoding_bom_and_original_line_endings() {
     let legacy = toolbox.execute("Read", json!({"path":"legacy.txt"}));
     assert_eq!(legacy["output"]["encoding"], "gb18030");
     let edited = toolbox.execute(
-        "ApplyPatch",
+        "Edit",
         json!({
             "path":"legacy.txt",
             "expected_hash":legacy["output"]["hash"],
-            "patch":"--- a/legacy.txt\n+++ b/legacy.txt\n@@ -1 +1 @@\n-中文\n+内容\n"
+            "target_line_start":1,
+            "target_line_end":1,
+            "new_text":"内容\r\n"
         }),
     );
     assert_eq!(edited["output"]["encoding"], "gb18030");
@@ -928,11 +1116,13 @@ fn text_mutations_preserve_detected_encoding_bom_and_original_line_endings() {
 
     let unicode = toolbox.execute("Read", json!({"path":"unicode.txt"}));
     let unicode_edited = toolbox.execute(
-        "ApplyPatch",
+        "Edit",
         json!({
             "path":"unicode.txt",
             "expected_hash":unicode["output"]["hash"],
-            "patch":"--- a/unicode.txt\n+++ b/unicode.txt\n@@ -1 +1 @@\n-alpha\n+beta\n"
+            "target_line_start":1,
+            "target_line_end":1,
+            "new_text":"beta\r\n"
         }),
     );
     let unicode_appended = toolbox.execute(
@@ -968,7 +1158,7 @@ fn explicit_encoding_handles_ambiguity_and_unrepresentable_text_never_mutates() 
         "Read",
         json!({"path":"ambiguous.txt", "encoding":"gb18030"}),
     );
-    assert_eq!(explicit["output"]["content"], "丂");
+    assert_eq!(explicit["output"]["lines"], numbered_lines("丂", 1));
     assert_eq!(explicit["output"]["encoding_confidence"], 1.0);
     let uncertain_write = toolbox.execute(
         "Append",
@@ -994,16 +1184,18 @@ fn explicit_encoding_handles_ambiguity_and_unrepresentable_text_never_mutates() 
     );
     assert_eq!(created["type"], "result");
     let before = fs::read(workspace.join("western.txt")).unwrap();
-    let rejected_patch = toolbox.execute(
-        "ApplyPatch",
+    let rejected_replace = toolbox.execute(
+        "Edit",
         json!({
             "path":"western.txt",
             "expected_hash":created["output"]["hash"],
-            "patch":"--- a/western.txt\n+++ b/western.txt\n@@ -1 +1 @@\n-Café – résumé\n\\ No newline at end of file\n+Café – 中文\n\\ No newline at end of file\n"
+            "target_line_start":1,
+            "target_line_end":1,
+            "new_text":"Café – 中文"
         }),
     );
-    assert_eq!(rejected_patch["type"], "error");
-    assert_eq!(rejected_patch["error"]["code"], "encoding_error");
+    assert_eq!(rejected_replace["type"], "error");
+    assert_eq!(rejected_replace["error"]["code"], "encoding_error");
     assert_eq!(fs::read(workspace.join("western.txt")).unwrap(), before);
 
     let rejected = toolbox.execute(

@@ -33,6 +33,8 @@ pub const TOOLBOX_DIRECTORY: &str = ".me/tools";
 pub const WORKSPACE_TEMP_DIRECTORY: &str = ".me/tmp";
 pub const DEFAULT_PYTHON_MAJOR: u8 = 3;
 pub const DEFAULT_PYTHON_MINOR: u8 = 12;
+pub(crate) const DISABLED_FILE_APPLY_PATCH: &str = "File.ApplyPatch";
+const DISABLED_FILE_APPLY_PATCH_API: &str = "File_ApplyPatch";
 const DEFAULT_TERMINAL_FILE: &str = "Terminal.py";
 const DEFAULT_TERMINAL_SOURCE: &str = include_str!("default_terminal_toolbox.py");
 const DEFAULT_FILE_FILE: &str = "File.py";
@@ -231,6 +233,14 @@ pub struct ToolboxRuntime {
     programs: BTreeMap<String, ToolboxClient>,
 }
 
+pub(crate) fn disabled_tool_full_name(name: &str) -> Option<&'static str> {
+    matches!(
+        name,
+        DISABLED_FILE_APPLY_PATCH | DISABLED_FILE_APPLY_PATCH_API
+    )
+    .then_some(DISABLED_FILE_APPLY_PATCH)
+}
+
 impl Default for ToolboxRuntime {
     fn default() -> Self {
         Self::empty()
@@ -387,6 +397,13 @@ impl ToolboxRuntime {
         mut on_update: impl FnMut(ToolboxUpdate) -> Result<()>,
         mut should_cancel: impl FnMut() -> bool,
     ) -> std::result::Result<Value, ToolboxExecutionError> {
+        if full_name == DISABLED_FILE_APPLY_PATCH {
+            return Err(ToolboxExecutionError::Tool {
+                code: "tool_disabled".into(),
+                message: "File.ApplyPatch is disabled. Use File.Edit instead.".into(),
+                retryable: false,
+            });
+        }
         let tool = self
             .catalog
             .tools
@@ -1508,7 +1525,7 @@ fn render_catalog_prompt(
 
 Every tool response is a JSON object with a top-level `truncate` boolean. `truncate:false` means the complete tool result is present. `truncate:true` means ME-RUST safely reduced only the tool's potentially large content before adding it to model context; read `truncate_info` for the retained and omitted original ranges. Existing tool-specific `truncated` fields have their documented collection-time meaning and are independent of this envelope.
 
-Safe truncation never cuts serialized JSON or leaves dangling references. Ordered logs and result lists omit their oldest complete items. Documents and long text retain exact beginning and ending fragments. When a normal string cannot remain contiguous, it is represented as a `text_fragments` object whose fragments carry exact original byte offsets; never treat separated fragments as adjacent original text. A cropped browser accessibility tree uses `aria_fragments`, whose fragments carry exact original line ranges and remain separated by omitted source ranges."#.into()];
+Safe truncation never cuts serialized JSON or leaves dangling references. Ordered logs and result lists omit their oldest complete items. `File.Read` keeps its first and last numbered line entries; missing numeric keys are omitted source lines, while an oversized individual line may use `text_fragments`. Other documents and long text retain exact beginning and ending fragments. When a normal string cannot remain contiguous, it is represented as a `text_fragments` object whose fragments carry exact original byte offsets; never treat separated fragments as adjacent original text. A cropped browser accessibility tree uses `aria_fragments`, whose fragments carry exact source line ranges and remain separated by omitted source ranges."#.into()];
     for (toolbox, brief) in briefs {
         if excluded_toolbox == Some(toolbox.as_str()) {
             continue;
@@ -2438,6 +2455,17 @@ for line in sys.stdin:
             runtime.catalog().resolve_api_name("WorkMap_Read"),
             Some("WorkMap.Read")
         );
+        let disabled_patch = runtime
+            .execute("File.ApplyPatch", "{}", |_| Ok(()))
+            .unwrap_err();
+        assert!(matches!(
+            disabled_patch,
+            ToolboxExecutionError::Tool {
+                ref code,
+                ref message,
+                retryable: false,
+            } if code == "tool_disabled" && message.contains("File.Edit")
+        ));
 
         let first_runtime = Arc::clone(&runtime);
         let first = thread::spawn(move || {

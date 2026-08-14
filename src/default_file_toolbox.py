@@ -102,7 +102,7 @@ TOOLS = [
     "Stat",
     "MakeDirectory",
     "Create",
-    "ApplyPatch",
+    "Edit",
     "Append",
     "Replace",
     "Move",
@@ -291,19 +291,36 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         ["path", "content"],
     ),
-    "ApplyPatch": object_schema(
+    "Edit": object_schema(
         {
             "path": PATH_SCHEMA,
             "expected_hash": HASH_SCHEMA,
             "encoding": {**ENCODING_SCHEMA, "default": "auto"},
-            "patch": {
+            "target_line_start": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2**31 - 1,
+                "description": "First 1-based source line to replace. For insertion, this must equal target_line_end + 1.",
+            },
+            "target_line_end": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2**31 - 1,
+                "description": "Last inclusive 1-based source line to replace. For insertion, this is one less than target_line_start.",
+            },
+            "new_text": {
                 "type": "string",
-                "minLength": 1,
                 "maxLength": MAX_TEXT_BYTES,
-                "description": "One standard single-file unified diff, including ---/+++ headers and one or more @@ hunks.",
+                "description": "Exact replacement text. Line endings are part of the value and are never added automatically.",
             },
         },
-        ["path", "expected_hash", "patch"],
+        [
+            "path",
+            "expected_hash",
+            "target_line_start",
+            "target_line_end",
+            "new_text",
+        ],
     ),
     "Append": object_schema(
         {
@@ -342,18 +359,10 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "Read": object_schema(
         {
             "path": PATH_SCHEMA,
-            "content": {"type": ["string", "object", "null"]},
-            "content_segments": {
-                "type": "array",
-                "items": object_schema(
-                    {
-                        "start_line": {"type": "integer"},
-                        "end_line": {"type": "integer"},
-                        "content": {"type": ["string", "object"]},
-                    },
-                    ["start_line", "end_line", "content"],
-                ),
-                "description": "Exact non-contiguous source ranges present only after model-context safety truncation.",
+            "lines": {
+                "type": "object",
+                "additionalProperties": {"type": ["string", "object"]},
+                "description": "Text keyed by its 1-based file line number, minimally zero-padded to the width of total_lines so serialized keys stay in numeric order. Normal values are exact strings including their original line ending; an oversized value may become a safe text_fragments object only in model context.",
             },
             "start_line": {"type": "integer"},
             "end_line": {"type": "integer"},
@@ -368,7 +377,12 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         [
             "path",
-            "content",
+            "lines",
+            "start_line",
+            "end_line",
+            "total_lines",
+            "eof",
+            "truncated",
             "hash",
             "size",
             "encoding",
@@ -440,7 +454,7 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
 }
 
-for _tool in ("Create", "ApplyPatch", "Append", "Replace"):
+for _tool in ("Create", "Edit", "Append", "Replace"):
     OUTPUT_SCHEMAS[_tool] = object_schema(
         {
             "path": PATH_SCHEMA,
@@ -462,16 +476,23 @@ for _tool in ("Create", "ApplyPatch", "Append", "Replace"):
             "bom",
         ],
     )
-OUTPUT_SCHEMAS["ApplyPatch"]["properties"].update(
+OUTPUT_SCHEMAS["Edit"]["properties"].update(
     {
-        "hunks_applied": {"type": "integer"},
-        "lines_added": {"type": "integer"},
-        "lines_removed": {"type": "integer"},
+        "target_line_start": {"type": "integer"},
+        "target_line_end": {"type": "integer"},
+        "selected_lines": {"type": "integer"},
+        "new_text_bytes": {"type": "integer"},
         "previous_size": {"type": "integer"},
     }
 )
-OUTPUT_SCHEMAS["ApplyPatch"]["required"].extend(
-    ["hunks_applied", "lines_added", "lines_removed", "previous_size"]
+OUTPUT_SCHEMAS["Edit"]["required"].extend(
+    [
+        "target_line_start",
+        "target_line_end",
+        "selected_lines",
+        "new_text_bytes",
+        "previous_size",
+    ]
 )
 OUTPUT_SCHEMAS["Append"]["properties"]["appended_bytes"] = {"type": "integer"}
 OUTPUT_SCHEMAS["Move"] = object_schema(
@@ -505,7 +526,7 @@ ROUTES = {
     "Stat": "Inspect existence, type, metadata, and current content hashes.",
     "MakeDirectory": "Create one explicit directory, optionally including its missing parent chain.",
     "Create": "Create a new text file in an explicit encoding, defaulting to UTF-8; never overwrite an existing file.",
-    "ApplyPatch": "Apply one standard single-file unified diff atomically to known text when a precise local edit is needed.",
+    "Edit": "Replace, delete, or insert one exact contiguous line range in a known text file.",
     "Append": "Append exact text using the existing file's detected encoding without adding a newline.",
     "Replace": "Replace an entire known text file while preserving its detected encoding and BOM.",
     "Move": "Move one known regular file to a destination that does not exist.",
@@ -513,7 +534,7 @@ ROUTES = {
 }
 
 INSTRUCTIONS = {
-    "Read": "Line numbers are 1-based. Auto detection checks BOM, Unicode encodings, strict UTF-8, then common legacy encodings conservatively. The result preserves original line endings and reports encoding, confidence, BOM presence, and the file's current 8-character concurrency fingerprint. If auto detection is uncertain, retry only when the encoding is known by setting encoding explicitly; otherwise use ReadBytes.",
+    "Read": "Line numbers are 1-based. The lines object maps each actual file line number to its exact text, including that line's original LF, CRLF, CR, or absent final line ending. Keys are minimally zero-padded to the digit width of total_lines solely to preserve numeric order in serialized JSON; interpret them as decimal line numbers. Missing numeric keys in a safely truncated model-visible result are omitted lines, not empty lines. Auto detection checks BOM, Unicode encodings, strict UTF-8, then common legacy encodings conservatively. The result reports encoding, confidence, BOM presence, and the file's current 8-character concurrency fingerprint. If auto detection is uncertain, retry only when the encoding is known by setting encoding explicitly; otherwise use ReadBytes.",
     "ReadBytes": "The result is base64 and includes the 8-character concurrency fingerprint of the complete file, not only the returned range.",
     "List": "Depth counts levels below path. Results are stable and symbolic-link directories are never traversed.",
     "Find": "Patterns and exclusions match workspace-relative POSIX paths. Results are stable and symbolic-link directories are never traversed.",
@@ -521,15 +542,10 @@ INSTRUCTIONS = {
     "Stat": "A missing path is a normal result. Content hashes are returned only for ordinary files, not directories or symbolic links.",
     "MakeDirectory": "parents defaults to false, requiring the immediate parent to exist. Set parents=true to create every missing directory in the path. The target itself must not already exist; existing files, directories, and symbolic links return already_exists.",
     "Create": "The parent directory must already exist. encoding defaults to utf-8 because a new file has no bytes to inspect; bom defaults to false and is allowed only for UTF encodings. Creation fails if the destination exists.",
-    "ApplyPatch": (
-        "Apply a standard unified diff to exactly one existing text file.\n"
-        "Required procedure:\n"
-        "1. Read the current file and use its returned hash as expected_hash.\n"
-        "2. Begin patch with --- and +++ headers. Use the exact workspace-relative path, or a/path for --- and b/path for +++.\n"
-        "3. Add one or more @@ -old_start,old_count +new_start,new_count @@ hunks. A missing count means 1; count 0 is valid for a pure insertion or deletion.\n"
-        "4. Prefix every hunk body line with exactly one marker: space for unchanged context, - for removal, or + for addition. Counts must equal the body lines on each side.\n"
-        "5. Immediately follow a final hunk line with \\ No newline at end of file when that old or new file line has no terminating newline.\n"
-        "The patch string contains only unified diff text. Do not add Markdown fences, *** Begin Patch syntax, diff --git/index metadata, binary patches, /dev/null, renames, or another file. Paths, line numbers, context, and counts are exact; ApplyPatch never guesses, fuzz-matches, or shifts hunks. All hunks validate before one atomic write, so every error leaves the file unchanged. The existing encoding and BOM are preserved; untouched line endings remain byte-for-byte unchanged, and added lines use the file's prevailing line ending."
+    "Edit": (
+        "Edit performs exactly one operation on a contiguous range of complete file lines. Line numbers are 1-based and replacement endpoints are inclusive. Read the current range first and pass the returned hash as expected_hash. For replacement or deletion, require 1 <= target_line_start <= target_line_end <= total_lines. For insertion, use the only empty-range form target_line_start = target_line_end + 1; it inserts before target_line_start. Thus 1/0 inserts at the beginning, N/N-1 inserts before line N, total_lines+1/total_lines inserts at the end, and 1/0 is also how an empty file receives its first content. Any larger reversed gap is invalid.\n"
+        "new_text is inserted verbatim. It replaces the complete selected lines, including the line endings contained in those lines. Edit never adds, removes, converts, or guesses a newline. To replace a non-final line while keeping the following line separate, include the intended LF, CRLF, or CR in new_text. To delete selected lines and their line endings, use an empty string. To clear line text while retaining blank lines, provide only the corresponding line-ending strings. To remove a line ending while keeping its text, provide the full line text without that ending; this intentionally joins it to the following line. When appending after a final line without an ending, new_text needs a leading line ending; when the final source line already has an ending, it does not. Read reports exact line endings, including a missing final ending, so copy the required convention deliberately.\n"
+        "Edit does not search inside a line and does not accept a partial line fragment as a location. To change part of a line, provide that entire line as new_text with the unchanged surrounding characters and the intended ending. The existing encoding, BOM, permissions, and all bytes represented by unselected text are preserved through one atomic commit. Unrepresentable text, invalid ranges, stale hashes, uncertain encodings, oversized results, and all other failures leave the file unchanged. A successful result returns a new hash; use that new hash for the next mutation."
     ),
     "Append": "The file must exist and match expected_hash. Existing encoding and BOM are preserved. Content is appended exactly and no newline is added. Unrepresentable text returns encoding_error without modifying the file.",
     "Replace": "The file must exist and match expected_hash. Its detected encoding and BOM are preserved while the complete content is replaced atomically. Unrepresentable text returns encoding_error without modifying the file.",
@@ -546,14 +562,45 @@ EXAMPLES = {
     "Stat": '{"paths":["Cargo.toml","src/main.rs","missing.txt"]}',
     "MakeDirectory": '{"path":"build/generated/assets","parents":true}',
     "Create": '{"path":"notes.txt","content":"first line\\n","encoding":"utf-8"}',
-    "ApplyPatch": (
-        "Replace one line:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","patch":"--- a/notes.txt\\n+++ b/notes.txt\\n@@ -1,2 +1,2 @@\\n-first line\\n+updated line\\n second line\\n"}'
-        "\n\nInsert and delete in separate hunks:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","patch":"--- a/notes.txt\\n+++ b/notes.txt\\n@@ -1,2 +1,3 @@\\n first line\\n+inserted line\\n second line\\n@@ -8,2 +9 @@\\n-remove this\\n keep this\\n"}'
-        "\n\nChange a final line that has no newline:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","patch":"--- a/notes.txt\\n+++ b/notes.txt\\n@@ -2 +2 @@\\n-old ending\\n\\\\ No newline at end of file\\n+new ending\\n\\\\ No newline at end of file\\n"}'
-        "\n\nCommon errors: use literal diff prefixes on every hunk line; keep @@ counts exact; do not wrap patch in ```; do not use *** Begin Patch / *** End Patch."
+    "Edit": (
+        "Assume File.Read returned lines 1=alpha\\n, 2=beta\\n, 3=gamma\\n, 4=omega with hash 0123abcd unless an example says otherwise. Every new_text value is exact.\n\n"
+        "Replace line 2 and retain its LF:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"updated\\n"}'
+        "\n\nReplace lines 2-3 with fewer lines:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":3,"new_text":"combined\\n"}'
+        "\n\nReplace one line with three lines:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"one\\ntwo\\nthree\\n"}'
+        "\n\nDelete complete lines 2-3, including their endings:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":3,"new_text":""}'
+        "\n\nClear the text of line 2 but retain one LF blank line:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"\\n"}'
+        "\n\nClear two CRLF lines but retain two blank CRLF lines:\n"
+        '{"path":"windows.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":3,"new_text":"\\r\\n\\r\\n"}'
+        "\n\nInsert before line 2 using the empty range 2/1:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":1,"new_text":"inserted\\n"}'
+        "\n\nInsert at the beginning using 1/0:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":1,"target_line_end":0,"new_text":"header\\n"}'
+        "\n\nInsert two lines before line 3:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":3,"target_line_end":2,"new_text":"inserted one\\ninserted two\\n"}'
+        "\n\nInsert into an empty file using 1/0:\n"
+        '{"path":"empty.txt","expected_hash":"e3b0c442","target_line_start":1,"target_line_end":0,"new_text":"first line\\n"}'
+        "\n\nAppend after a newline-terminated 4-line file using 5/4; no leading ending is needed:\n"
+        '{"path":"terminated.txt","expected_hash":"0123abcd","target_line_start":5,"target_line_end":4,"new_text":"appended\\n"}'
+        "\n\nAppend a new line after final line 4=omega with no ending; add the leading LF explicitly:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":5,"target_line_end":4,"new_text":"\\nappended"}'
+        "\n\nReplace final line 4 without adding an ending:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":4,"target_line_end":4,"new_text":"final"}'
+        "\n\nReplace final line 4 and add an ending:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":4,"target_line_end":4,"new_text":"final\\n"}'
+        "\n\nRemove line 1's ending while keeping its text; this intentionally produces alphabeta on one logical line:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":1,"target_line_end":1,"new_text":"alpha"}'
+        "\n\nDelete the entire four-line file:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":1,"target_line_end":4,"new_text":""}'
+        "\n\nPreserve a mixed file's CRLF on line 2:\n"
+        '{"path":"mixed.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"updated\\r\\n"}'
+        "\n\nJSON escaping for quotes, backslashes, and a tab:\n"
+        '{"path":"config.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"path = \\"C:\\\\Program Files\\\\ME\\"\\nvalue\\t42\\n"}'
+        "\n\nInvalid forms: start=5/end=2 is not an insertion because the gap is larger than one; replacing line 999 is outside the file; and a partial phrase replaces the entire selected line rather than searching inside it. After success, never reuse 0123abcd: use the new hash returned by Edit."
     ),
     "Append": '{"path":"notes.txt","expected_hash":"0123abcd","content":"next line\\n"}',
     "Replace": '{"path":"notes.txt","expected_hash":"0123abcd","content":"complete new content\\n"}',
@@ -593,7 +640,7 @@ def validate_object(value: Any) -> dict[str, Any]:
 
 def string_arg(data: dict[str, Any], name: str, default: str | None = None) -> str:
     value = data.get(name, default)
-    if not isinstance(value, str) or (name != "content" and not value):
+    if not isinstance(value, str) or (name not in ("content", "new_text") and not value):
         raise ToolError("invalid_arguments", f"{name} must be a non-empty string")
     if "\x00" in value:
         raise ToolError("invalid_arguments", f"{name} contains NUL")
@@ -1113,6 +1160,26 @@ def walk_entries(start: Path, include_hidden: bool) -> Iterator[Path]:
                 yield Path(directory) / name
 
 
+def split_text_file_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    start = 0
+    index = 0
+    while index < len(text):
+        if text[index] == "\r":
+            index += 2 if index + 1 < len(text) and text[index + 1] == "\n" else 1
+            lines.append(text[start:index])
+            start = index
+        elif text[index] == "\n":
+            index += 1
+            lines.append(text[start:index])
+            start = index
+        else:
+            index += 1
+    if start < len(text):
+        lines.append(text[start:])
+    return lines
+
+
 def execute_read(data: dict[str, Any]) -> dict[str, Any]:
     logical = string_arg(data, "path")
     start_line = int_arg(data, "start_line", 1, 1, 2**31 - 1)
@@ -1121,14 +1188,18 @@ def execute_read(data: dict[str, Any]) -> dict[str, Any]:
     path = existing_path(logical)
     require_regular_file(path, logical)
     document = read_text_file(path, logical, encoding)
-    lines = document.text.splitlines(keepends=True)
+    lines = split_text_file_lines(document.text)
     start_index = min(start_line - 1, len(lines))
     selected = lines[start_index : start_index + max_lines]
     end_line = start_index + len(selected)
     eof = end_line >= len(lines)
+    line_number_width = max(1, len(str(len(lines))))
     return {
         "path": relative_path(path),
-        "content": "".join(selected),
+        "lines": {
+            str(start_index + offset + 1).zfill(line_number_width): line
+            for offset, line in enumerate(selected)
+        },
         "start_line": start_line,
         "end_line": end_line,
         "total_lines": len(lines),
@@ -1609,6 +1680,67 @@ def execute_apply_patch(data: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
+def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
+    logical = string_arg(data, "path")
+    expected = validate_expected_hash(data.get("expected_hash"))
+    encoding = encoding_arg(data)
+    target_start = int_arg(data, "target_line_start", 0, 1, 2**31 - 1)
+    target_end = int_arg(data, "target_line_end", -1, 0, 2**31 - 1)
+    new_text = string_arg(data, "new_text", "")
+    with mutation_lock():
+        path = existing_path(logical)
+        require_regular_file(path, logical, True)
+        document = read_text_file(path, logical, encoding)
+        previous = verify_content_hash(document.raw, expected)
+        lines = split_text_file_lines(document.text)
+        total_lines = len(lines)
+        inserting = target_start == target_end + 1
+        replacing = 1 <= target_start <= target_end <= total_lines
+        insertion_in_bounds = inserting and target_start <= total_lines + 1
+        if not replacing and not insertion_in_bounds:
+            raise ToolError(
+                "invalid_range",
+                "target range must satisfy 1 <= start <= end <= total_lines for replacement, "
+                "or start = end + 1 with start <= total_lines + 1 for insertion; "
+                f"received start={target_start}, end={target_end}, total_lines={total_lines}",
+            )
+        source_start = target_start - 1
+        source_end = target_end
+        updated_text = (
+            "".join(lines[:source_start])
+            + new_text
+            + "".join(lines[source_end:])
+        )
+        replacement = encode_text(new_text, document.encoding, b"", logical)
+        updated = encode_text(
+            updated_text, document.encoding, document.bom, logical
+        )
+        if len(updated) > MAX_TEXT_BYTES:
+            raise ToolError("content_too_large", f"edited file exceeds {MAX_TEXT_BYTES} bytes")
+        mode = path.stat().st_mode
+        verify_hash(path, expected)
+        atomic_replace(path, updated, mode)
+    output = mutation_result(
+        path,
+        "edited",
+        previous,
+        updated,
+        document.encoding,
+        document.confidence,
+        document.bom,
+    )
+    output.update(
+        {
+            "target_line_start": target_start,
+            "target_line_end": target_end,
+            "selected_lines": 0 if inserting else target_end - target_start + 1,
+            "new_text_bytes": len(replacement),
+            "previous_size": len(document.raw),
+        }
+    )
+    return output
+
+
 def execute_append(data: dict[str, Any]) -> dict[str, Any]:
     logical = string_arg(data, "path")
     expected = validate_expected_hash(data.get("expected_hash"))
@@ -1719,7 +1851,7 @@ EXECUTORS = {
     "Stat": execute_stat,
     "MakeDirectory": execute_make_directory,
     "Create": execute_create,
-    "ApplyPatch": execute_apply_patch,
+    "Edit": execute_edit,
     "Append": execute_append,
     "Replace": execute_replace,
     "Move": execute_move,
@@ -1742,6 +1874,11 @@ def handle(request: Any) -> None:
         )
         return
     tool = request.get("tool")
+    if tool == "ApplyPatch":
+        raise ToolError(
+            "tool_disabled",
+            "File.ApplyPatch is disabled. Use File.Edit instead.",
+        )
     if tool not in TOOLS:
         raise ToolError("unknown_tool", f"unknown File tool: {tool}")
     if command == "getInputSchema":

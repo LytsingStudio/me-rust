@@ -13,7 +13,8 @@ pub fn truncate_for_model(tool_name: &str, value: Value) -> Value {
     truncate_for_model_with_limit(tool_name, value, DEFAULT_TOOL_RESULT_TOKEN_LIMIT)
 }
 
-fn truncate_for_model_with_limit(tool_name: &str, value: Value, limit: usize) -> Value {
+fn truncate_for_model_with_limit(tool_name: &str, mut value: Value, limit: usize) -> Value {
+    normalize_legacy_tool_result(tool_name, &mut value);
     let original = with_truncate_flag(value.clone(), false, None);
     if estimate_tokens(&original) <= limit {
         return original;
@@ -161,67 +162,37 @@ impl TruncationState {
         let Some(detail) = detail_object_mut(root) else {
             return false;
         };
-        if let Some(segments) = detail
-            .get_mut("content_segments")
-            .and_then(Value::as_array_mut)
-            && shrink_line_segments(segments)
-        {
-            self.removed_units += 1;
-            self.details
-                .insert("content".into(), line_segment_range(segments));
-            return true;
-        }
-        if let Some(content) = detail.get_mut("content")
-            && content.is_object()
-            && crop_text_value(content)
-        {
-            self.removed_units += 1;
-            self.details
-                .insert("content".into(), text_fragment_range(content));
-            return true;
-        }
-        let Some(content) = detail.get("content").and_then(Value::as_str) else {
+        let Some(lines) = detail.get_mut("lines").and_then(Value::as_object_mut) else {
             return false;
         };
-        let start_line = detail
-            .get("start_line")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
-        let lines = split_lines(content);
-        if lines.len() >= 3 {
-            let Some((left, right)) = middle_gap_keep_ends(lines.len()) else {
-                return false;
-            };
-            let mut segments = Vec::new();
-            if left > 0 {
-                segments.push(json!({
-                    "start_line": start_line,
-                    "end_line": start_line + left as u64 - 1,
-                    "content": lines[..left].concat(),
-                }));
+        let numbered = numbered_line_keys(lines);
+        if let Some((left, right)) = middle_gap_keep_ends(numbered.len()) {
+            let keys = numbered[left..right]
+                .iter()
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>();
+            for key in &keys {
+                lines.remove(key);
             }
-            if right < lines.len() {
-                segments.push(json!({
-                    "start_line": start_line + right as u64,
-                    "end_line": start_line + lines.len() as u64 - 1,
-                    "content": lines[right..].concat(),
-                }));
-            }
-            detail.insert("content".into(), Value::Null);
-            detail.insert("content_segments".into(), Value::Array(segments));
-            self.removed_units += right - left;
-            self.details.insert(
-                "content".into(),
-                json!({"removed_line_start": start_line + left as u64, "removed_line_end": start_line + right as u64 - 1}),
-            );
+            self.removed_units += keys.len();
+            self.details
+                .insert("lines".into(), numbered_lines_range(lines));
             return true;
         }
-        if let Some(content) = detail.get_mut("content")
-            && crop_text_value(content)
+        let candidate = numbered
+            .iter()
+            .filter_map(|(_, key)| {
+                let value = lines.get(key)?;
+                text_value_is_croppable(value).then(|| (key.clone(), json_size(value)))
+            })
+            .max_by_key(|(_, size)| *size)
+            .map(|(key, _)| key);
+        if let Some(key) = candidate
+            && lines.get_mut(&key).is_some_and(crop_text_value)
         {
             self.removed_units += 1;
             self.details
-                .insert("content".into(), text_fragment_range(content));
+                .insert("lines".into(), numbered_lines_range(lines));
             return true;
         }
         false
@@ -659,6 +630,48 @@ fn detail_object_mut(root: &mut Value) -> Option<&mut Map<String, Value>> {
     detail_mut(root)?.as_object_mut()
 }
 
+fn normalize_legacy_tool_result(tool_name: &str, root: &mut Value) {
+    if tool_name != "File.Read" {
+        return;
+    }
+    let Some(detail) = detail_object_mut(root) else {
+        return;
+    };
+    if detail.get("lines").is_some() {
+        return;
+    }
+    let Some(content) = detail
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let start_line = detail
+        .get("start_line")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let split = split_file_lines(&content);
+    let last_line = start_line.saturating_add(split.len().saturating_sub(1) as u64);
+    let total_lines = detail
+        .get("total_lines")
+        .and_then(Value::as_u64)
+        .unwrap_or(last_line)
+        .max(last_line);
+    let width = total_lines.to_string().len().max(1);
+    let lines = split
+        .into_iter()
+        .enumerate()
+        .map(|(offset, line)| {
+            let number = start_line.saturating_add(offset as u64);
+            (format!("{number:0width$}"), Value::String(line))
+        })
+        .collect::<Map<_, _>>();
+    detail.remove("content");
+    detail.remove("content_segments");
+    detail.insert("lines".into(), Value::Object(lines));
+}
+
 fn batch_size(length: usize) -> usize {
     (length / 4).max(1).min(length)
 }
@@ -710,6 +723,31 @@ fn split_lines(text: &str) -> Vec<String> {
         return Vec::new();
     }
     text.split_inclusive('\n').map(str::to_owned).collect()
+}
+
+fn split_file_lines(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let end = match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => Some(index + 2),
+            b'\r' | b'\n' => Some(index + 1),
+            _ => None,
+        };
+        if let Some(end) = end {
+            lines.push(text[start..end].to_owned());
+            start = end;
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    if start < bytes.len() {
+        lines.push(text[start..].to_owned());
+    }
+    lines
 }
 
 fn json_size(value: &Value) -> usize {
@@ -925,86 +963,42 @@ fn text_fragment_range(value: &Value) -> Value {
     json!({"removed_byte_start": first_end, "removed_byte_end": last_start})
 }
 
-fn shrink_line_segments(segments: &mut [Value]) -> bool {
-    if segments.is_empty() {
-        return false;
-    }
-    let total = segments
-        .iter()
-        .filter_map(|segment| segment.get("content").and_then(Value::as_str))
-        .map(|content| split_lines(content).len())
-        .sum::<usize>();
-    if total >= 2 {
-        let before = total;
-        let mut remove = batch_size(total).min(total.saturating_sub(segments.len()));
-        if remove > 0 {
-            if let Some(first) = segments.first_mut().and_then(Value::as_object_mut) {
-                let amount = remove.div_ceil(2);
-                remove -= shrink_line_segment(first, amount, false);
-            }
-            if remove > 0
-                && let Some(last) = segments.last_mut().and_then(Value::as_object_mut)
-            {
-                shrink_line_segment(last, remove, true);
-            }
-            let after = segments
-                .iter()
-                .filter_map(|segment| segment.get("content").and_then(Value::as_str))
-                .map(|content| split_lines(content).len())
-                .sum::<usize>();
-            if after < before {
-                return true;
-            }
-        }
-    }
-    let candidate = segments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, segment)| {
-            let content = segment.get("content")?;
-            text_value_is_croppable(content).then(|| (index, json_size(content)))
+fn numbered_line_keys(lines: &Map<String, Value>) -> Vec<(u64, String)> {
+    let mut numbered = lines
+        .keys()
+        .filter_map(|key| key.parse::<u64>().ok().map(|number| (number, key.clone())))
+        .collect::<Vec<_>>();
+    numbered.sort_by_key(|(number, _)| *number);
+    numbered
+}
+
+fn numbered_lines_range(lines: &Map<String, Value>) -> Value {
+    let numbered = numbered_line_keys(lines);
+    let removed_line_ranges = numbered
+        .windows(2)
+        .filter_map(|pair| {
+            let start = pair[0].0.checked_add(1)?;
+            let end = pair[1].0.checked_sub(1)?;
+            (start <= end).then(|| json!({"start_line": start, "end_line": end}))
         })
-        .max_by_key(|(_, size)| *size)
-        .map(|(index, _)| index);
-    candidate
-        .and_then(|index| segments[index].get_mut("content"))
-        .is_some_and(crop_text_value)
-}
-
-fn shrink_line_segment(segment: &mut Map<String, Value>, amount: usize, from_start: bool) -> usize {
-    let Some(content) = segment.get("content").and_then(Value::as_str) else {
-        return 0;
-    };
-    let lines = split_lines(content);
-    let remove = amount.min(lines.len().saturating_sub(1));
-    if remove == 0 {
-        return 0;
-    }
-    if from_start {
-        let start = segment
-            .get("start_line")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
-        segment.insert("start_line".into(), json!(start + remove as u64));
-        segment.insert("content".into(), Value::String(lines[remove..].concat()));
-    } else {
-        let end = segment
-            .get("end_line")
-            .and_then(Value::as_u64)
-            .unwrap_or(lines.len() as u64);
-        segment.insert("end_line".into(), json!(end.saturating_sub(remove as u64)));
-        segment.insert(
-            "content".into(),
-            Value::String(lines[..lines.len() - remove].concat()),
-        );
-    }
-    remove
-}
-
-fn line_segment_range(segments: &[Value]) -> Value {
+        .collect::<Vec<_>>();
+    let cropped_lines = numbered
+        .iter()
+        .filter_map(|(number, key)| {
+            let value = lines.get(key)?;
+            value.is_object().then(|| {
+                json!({
+                    "line": number,
+                    "removed_bytes": text_fragment_range(value),
+                })
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
-        "retained_head_end_line": segments.first().and_then(|segment| segment.get("end_line")),
-        "retained_tail_start_line": segments.last().and_then(|segment| segment.get("start_line")),
+        "retained_first_line": numbered.first().map(|(number, _)| number),
+        "retained_last_line": numbered.last().map(|(number, _)| number),
+        "removed_line_ranges": removed_line_ranges,
+        "cropped_lines": cropped_lines,
     })
 }
 
@@ -1627,6 +1621,16 @@ mod tests {
         json!({"result":{"state":"succeeded","exit_code":null,"detail":detail}})
     }
 
+    fn numbered_lines(lines: impl IntoIterator<Item = String>, first_line: u64) -> Value {
+        Value::Object(
+            lines
+                .into_iter()
+                .enumerate()
+                .map(|(offset, line)| ((first_line + offset as u64).to_string(), json!(line)))
+                .collect(),
+        )
+    }
+
     #[test]
     fn small_result_is_explicitly_not_truncated() {
         let result =
@@ -1636,24 +1640,49 @@ mod tests {
     }
 
     #[test]
-    fn file_read_keeps_both_ends_as_numbered_segments() {
-        let content = (1..=200)
+    fn legacy_file_read_is_projected_as_numbered_lines_without_changing_the_source() {
+        let original = wrapper(json!({
+            "path":"old.txt",
+            "content":"first\r\n\rthird",
+            "start_line":1,
+            "end_line":3,
+            "total_lines":12,
+            "hash":"1234abcd"
+        }));
+        let result = truncate_for_model_with_limit("File.Read", original.clone(), 1_000);
+        assert_eq!(result["truncate"], false);
+        assert!(result["result"]["detail"].get("content").is_none());
+        assert_eq!(
+            result["result"]["detail"]["lines"],
+            json!({"01":"first\r\n", "02":"\r", "03":"third"})
+        );
+        assert_eq!(original["result"]["detail"]["content"], "first\r\n\rthird");
+        assert!(original["result"]["detail"].get("lines").is_none());
+    }
+
+    #[test]
+    fn file_read_keeps_both_ends_as_numbered_lines() {
+        let lines = (1..=200)
             .map(|line| format!("line-{line:04} {}\n", "x".repeat(40)))
-            .collect::<String>();
+            .collect::<Vec<_>>();
         let result = truncate_for_model_with_limit(
             "File.Read",
             wrapper(
-                json!({"path":"a.txt","content":content,"start_line":1,"end_line":200,"total_lines":200}),
+                json!({"path":"a.txt","lines":numbered_lines(lines, 1),"start_line":1,"end_line":200,"total_lines":200}),
             ),
             500,
         );
         assert_eq!(result["truncate"], true);
-        let segments = result["result"]["detail"]["content_segments"]
-            .as_array()
-            .unwrap();
-        assert!(!segments.is_empty());
-        assert_eq!(segments.first().unwrap()["start_line"], 1);
-        assert_eq!(segments.last().unwrap()["end_line"], 200);
+        let retained = result["result"]["detail"]["lines"].as_object().unwrap();
+        assert!(retained.contains_key("1"));
+        assert!(retained.contains_key("200"));
+        assert!(retained.len() < 200);
+        assert!(!retained.contains_key("100"));
+        assert!(
+            result["truncate_info"]["ranges"]["lines"]["removed_line_ranges"]
+                .as_array()
+                .is_some_and(|ranges| !ranges.is_empty())
+        );
     }
 
     #[test]
@@ -1685,13 +1714,13 @@ mod tests {
     fn single_line_unicode_read_keeps_exact_byte_fragments_and_original_is_unchanged() {
         let content = format!("开头{}结尾", "中间🙂".repeat(8_000));
         let original = wrapper(json!({
-            "path":"unicode.txt","content":content,"start_line":1,"end_line":1,
+            "path":"unicode.txt","lines":{"1":content},"start_line":1,"end_line":1,
             "total_lines":1,"hash":"1234abcd","encoding":"utf-8"
         }));
         let result = truncate_for_model_with_limit("File.Read", original.clone(), 1_500);
         assert_eq!(result["truncate"], true);
-        assert_eq!(original["result"]["detail"]["content"], content);
-        let value = &result["result"]["detail"]["content"];
+        assert_eq!(original["result"]["detail"]["lines"]["1"], content);
+        let value = &result["result"]["detail"]["lines"]["1"];
         assert_eq!(value["kind"], "text_fragments");
         let fragments = value["fragments"].as_array().unwrap();
         assert!(
@@ -1715,28 +1744,30 @@ mod tests {
 
     #[test]
     fn file_read_continues_cropping_when_both_boundary_lines_are_huge() {
-        let content = format!(
-            "FIRST{}\nLAST{}\n",
-            "甲".repeat(12_000),
-            "乙".repeat(12_000)
-        );
+        let first = format!("FIRST{}\n", "甲".repeat(12_000));
+        let last = format!("LAST{}\n", "乙".repeat(12_000));
         let result = truncate_for_model_with_limit(
             "File.Read",
-            wrapper(json!({"content":content,"start_line":1,"end_line":2,"total_lines":2})),
+            wrapper(
+                json!({"lines":{"1":first,"2":last},"start_line":1,"end_line":2,"total_lines":2}),
+            ),
             1_500,
         );
         assert_eq!(result["truncate"], true);
-        let fragments = result["result"]["detail"]["content"]["fragments"]
+        let first_fragments = result["result"]["detail"]["lines"]["1"]["fragments"]
             .as_array()
             .unwrap();
         assert!(
-            fragments.first().unwrap()["text"]
+            first_fragments.first().unwrap()["text"]
                 .as_str()
                 .unwrap()
                 .starts_with("FIRST")
         );
+        let last_fragments = result["result"]["detail"]["lines"]["2"]["fragments"]
+            .as_array()
+            .unwrap();
         assert!(
-            fragments.last().unwrap()["text"]
+            last_fragments.last().unwrap()["text"]
                 .as_str()
                 .unwrap()
                 .ends_with('\n')
@@ -1849,7 +1880,7 @@ mod tests {
     fn token_estimation_treats_model_special_markers_as_ordinary_tool_text() {
         let marker_text = "<|endoftext|>".repeat(2_000);
         let value = wrapper(json!({
-            "content": marker_text,
+            "lines": {"1": marker_text},
             "start_line": 1,
             "end_line": 1,
             "total_lines": 1
@@ -2423,13 +2454,13 @@ mod tests {
 
     #[test]
     fn default_limit_includes_final_truncation_metadata() {
-        let content = (0..50_000)
+        let lines = (0..50_000)
             .map(|index| format!("line {index} {}\n", "数据".repeat(8)))
-            .collect::<String>();
+            .collect::<Vec<_>>();
         let result = truncate_for_model(
             "File.Read",
             wrapper(
-                json!({"content":content,"start_line":1,"end_line":50_000,"total_lines":50_000}),
+                json!({"lines":numbered_lines(lines, 1),"start_line":1,"end_line":50_000,"total_lines":50_000}),
             ),
         );
         assert_eq!(result["truncate"], true);
