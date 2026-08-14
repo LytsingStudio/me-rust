@@ -176,6 +176,13 @@ pub fn metadata_value(image: &LoadedImage) -> Value {
     serde_json::to_value(&image.metadata).expect("ImageMetadata serialization cannot fail")
 }
 
+pub fn model_context_png(data: &[u8]) -> std::result::Result<Vec<u8>, image::ImageError> {
+    let image = image::load_from_memory(data)?;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut encoded, ImageFormat::Png)?;
+    Ok(encoded.into_inner())
+}
+
 fn read_source(source: &str, workspace: &Path) -> Result<Vec<u8>, ToolboxExecutionError> {
     if source.starts_with("data:") {
         return decode_data_url(source);
@@ -346,6 +353,35 @@ mod tests {
         assert_eq!(loaded.metadata.mime_type, "image/png");
         assert_eq!(loaded.metadata.sha256, image_content_sha256(&loaded.data));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_context_projection_decodes_source_formats_and_always_encodes_png() {
+        let image = image::DynamicImage::ImageRgb8(ImageBuffer::from_pixel(
+            3,
+            2,
+            image::Rgb([10_u8, 20, 30]),
+        ));
+        for source_format in [
+            ImageFormat::Png,
+            ImageFormat::Jpeg,
+            ImageFormat::Gif,
+            ImageFormat::WebP,
+            ImageFormat::Bmp,
+            ImageFormat::Tiff,
+            ImageFormat::Pnm,
+        ] {
+            let mut source = Cursor::new(Vec::new());
+            image.write_to(&mut source, source_format).unwrap();
+            let source = source.into_inner();
+
+            let projected = model_context_png(&source).unwrap();
+            assert_eq!(image::guess_format(&projected).unwrap(), ImageFormat::Png);
+            assert_eq!(
+                image::load_from_memory(&projected).unwrap().dimensions(),
+                (3, 2)
+            );
+        }
     }
 
     #[test]

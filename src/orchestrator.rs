@@ -5255,7 +5255,7 @@ fn main_model_context_with_toolboxes_and_environment(
                             )
                         });
                         if succeeded && let Some(image) = images.remove(&batch_call.id) {
-                            context.push_value(image_context_message(image));
+                            context.push_value(image_context_message(image)?);
                         }
                     }
                 }
@@ -5596,13 +5596,15 @@ fn push_provider_context_item(
     Ok(())
 }
 
-fn image_context_message(image: &crate::event::ImageContentEvent) -> Value {
-    let data_url = format!(
-        "data:{};base64,{}",
-        image.mime_type,
-        STANDARD.encode(image.data.as_ref())
-    );
-    json!({
+fn image_context_message(image: &crate::event::ImageContentEvent) -> Result<Value> {
+    let png = image_toolbox::model_context_png(image.data.as_ref()).map_err(|error| {
+        format!(
+            "cannot project ImageContentEvent {} from {} as PNG: {error}",
+            image.id, image.source
+        )
+    })?;
+    let data_url = format!("data:image/png;base64,{}", STANDARD.encode(png));
+    Ok(json!({
         "role": "user",
         "content": [
             {
@@ -5621,7 +5623,7 @@ fn image_context_message(image: &crate::event::ImageContentEvent) -> Value {
                 "image_url": {"url": data_url}
             }
         ]
-    })
+    }))
 }
 
 fn push_assistant(context: &mut ModelContext, assistant: &mut String) {
@@ -5632,6 +5634,7 @@ fn push_assistant(context: &mut ModelContext, assistant: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    use image::GenericImageView;
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
@@ -10317,8 +10320,17 @@ for line in sys.stdin:
             .unwrap();
         edb.append_api_state(api, prompt, ApiState::Completed, "")
             .unwrap();
-        let data = vec![1_u8, 2, 3, 4, 5, 6];
-        edb.append_image_content(call, "./sample.png", "image/png", "png", 2, 3, data.clone())
+        let image = image::DynamicImage::ImageRgb8(image::ImageBuffer::from_pixel(
+            2,
+            3,
+            image::Rgb([11_u8, 22, 33]),
+        ));
+        let mut source = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut source, image::ImageFormat::Bmp)
+            .unwrap();
+        let data = source.into_inner();
+        edb.append_image_content(call, "./sample.bmp", "image/bmp", "bmp", 2, 3, data.clone())
             .unwrap();
         edb.append_tool_result(
             call,
@@ -10351,12 +10363,28 @@ for line in sys.stdin:
             })
             .unwrap();
         assert!(image_url.starts_with("data:image/png;base64,"));
+        let projected = STANDARD
+            .decode(image_url.split_once(',').unwrap().1)
+            .unwrap();
         assert_eq!(
-            STANDARD
-                .decode(image_url.split_once(',').unwrap().1)
-                .unwrap(),
-            data
+            image::guess_format(&projected).unwrap(),
+            image::ImageFormat::Png
         );
+        assert_eq!(
+            image::load_from_memory(&projected).unwrap().dimensions(),
+            (2, 3)
+        );
+        let stored = edb.events().iter().find_map(|event| match event {
+            Event::ImageContent(image) => Some(image),
+            _ => None,
+        });
+        assert!(matches!(
+            stored,
+            Some(image)
+                if image.mime_type == "image/bmp"
+                    && image.format == "bmp"
+                    && image.data.as_ref() == data.as_slice()
+        ));
 
         let unsupported_model = test_model_config("text-only", &[]);
         let unsupported_catalog = agent.visible_catalog(&unsupported_model).unwrap();
@@ -10394,6 +10422,26 @@ for line in sys.stdin:
                 .iter()
                 .any(|message| { message.pointer("/content/1/image_url/url").is_some() })
         );
+    }
+
+    #[test]
+    fn invalid_stored_image_fails_during_projection_before_a_model_request() {
+        let image = crate::event::ImageContentEvent {
+            id: 41,
+            timestamp_ms: 1,
+            tool_call_id: 40,
+            source: "./broken.bmp".into(),
+            mime_type: "image/bmp".into(),
+            format: "bmp".into(),
+            width: 1,
+            height: 1,
+            content_sha256: crate::event::image_content_sha256(&[1, 2, 3]),
+            data: Arc::from([1_u8, 2, 3]),
+        };
+        let error = image_context_message(&image).unwrap_err().to_string();
+        assert!(error.contains("ImageContentEvent 41"));
+        assert!(error.contains("./broken.bmp"));
+        assert!(error.contains("as PNG"));
     }
 
     #[test]
