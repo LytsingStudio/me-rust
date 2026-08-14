@@ -56,7 +56,7 @@ pub struct ModelCapabilities {
 pub struct ModelConfig {
     pub name: String,
     pub provider: ProviderType,
-    #[serde(default = "default_reserve_output_context")]
+    #[serde(default)]
     pub reserve_output_context: bool,
     pub base_url: String,
     pub endpoint: String,
@@ -76,10 +76,6 @@ pub struct ModelConfig {
 
 fn default_timeout() -> u64 {
     120
-}
-
-fn default_reserve_output_context() -> bool {
-    true
 }
 
 impl ModelConfig {
@@ -497,11 +493,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_model_without_reservation_policy_keeps_output_reservation() {
+    fn model_without_reservation_policy_does_not_reserve_output_context() {
         let serialized = toml::to_string(&model()).unwrap();
         let legacy = serialized.replace("reserve_output_context = true\n", "");
         let loaded: ModelConfig = toml::from_str(&legacy).unwrap();
-        assert!(loaded.reserve_output_context);
+        assert!(!loaded.reserve_output_context);
     }
 
     #[test]

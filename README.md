@@ -230,7 +230,7 @@ reasoning_effort = "low"
 reasoning_effort = "high"
 ```
 
-请根据模型服务商的文档准确填写上下文长度、最大输出、输入类型和推理强度。`reserve_output_context = true` 表示在上下文窗口中为请求的最大输出量预留空间；不需要预留时设为 `false`。保存后可以执行：
+请根据模型服务商的文档准确填写上下文长度、最大输出、输入类型和推理强度。`reserve_output_context = true` 表示在上下文窗口中为请求的最大输出量预留空间；设为 `false` 或省略时不预留。保存后可以执行：
 
 ```bash
 me model list
