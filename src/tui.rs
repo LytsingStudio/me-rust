@@ -662,10 +662,7 @@ impl ChatProjection {
 }
 
 fn compact_stage_count(kind: CompactKind) -> usize {
-    match kind {
-        CompactKind::SingleTurn => 1,
-        CompactKind::Segmented => 6,
-    }
+    kind.stage_count()
 }
 
 fn compact_progress_text(
@@ -2094,10 +2091,8 @@ pub fn run(
                                 }
                                 SlashCommand::Context => {
                                     ui.overlay = if current_agent.is_some() {
-                                        let events = current_events(
-                                            &snapshot,
-                                            current_agent.as_ref(),
-                                        )?;
+                                        let events =
+                                            current_events(&snapshot, current_agent.as_ref())?;
                                         Some(OverlayState::Context {
                                             breakdown: Box::new(
                                                 ui.context_usage_breakdown(events)?,
@@ -8710,7 +8705,7 @@ mod tests {
                 compact_id: 1,
                 tool_call_id: 0,
                 prompt_id: 0,
-                kind: CompactKind::Segmented,
+                kind: CompactKind::MainAgentMultiTurn,
                 state,
                 stage,
                 content: if state == CompactState::StageCompleted {
@@ -8785,8 +8780,12 @@ mod tests {
             assert_eq!(replayed.messages[0].content, expected);
         }
         assert_eq!(
-            compact_progress_text(CompactKind::SingleTurn, 1, Some(100)),
+            compact_progress_text(CompactKind::WorkerSingleTurn, 1, Some(100)),
             "正在压缩 (1/1) ... ↓ 100"
+        );
+        assert_eq!(
+            compact_progress_text(CompactKind::ManagerMultiTurn, 1, None),
+            "正在压缩 (1/6) ..."
         );
     }
 
@@ -8819,7 +8818,7 @@ mod tests {
         edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
             .unwrap();
         let compact = edb
-            .append_compact_started(tool, prompt, crate::event::CompactKind::SingleTurn)
+            .append_compact_started(tool, prompt, crate::event::CompactKind::WorkerSingleTurn)
             .unwrap();
         let summary_api = edb.append_api_requesting(prompt).unwrap();
         edb.append_api_state(summary_api, prompt, ApiState::Streaming, "")
@@ -9449,7 +9448,7 @@ mod tests {
         edb.append_tool_result(compact_call, ToolResultState::Succeeded, None, "ok")
             .unwrap();
         let compact = edb
-            .append_compact_started(compact_call, first, CompactKind::SingleTurn)
+            .append_compact_started(compact_call, first, CompactKind::WorkerSingleTurn)
             .unwrap();
         edb.append_compact_terminal(
             compact,

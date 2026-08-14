@@ -376,6 +376,9 @@ fn generated_web_browser_describes_the_raw_snapshot_protocol_without_installing(
             .contains("only currently open page identifiers")
     );
 
+    let (_, active_pages) = toolbox.execute("__activePages", json!({}));
+    assert_eq!(output(&active_pages), &json!({"pages": []}));
+
     assert!(!config.join("runtimes").exists());
     assert!(!config.join("browsers").exists());
     toolbox.finish();
@@ -675,6 +678,8 @@ fn real_camoufox_uses_raw_aria_snapshots_and_action_only_commands() {
     );
     let (_, pages) = toolbox.execute("Pages", json!({}));
     assert_eq!(output(&pages)["pages"].as_array().unwrap().len(), 2);
+    let (_, observed_pages) = toolbox.execute("__activePages", json!({}));
+    assert_eq!(output(&observed_pages)["pages"], output(&pages)["pages"]);
 
     let (_, screen) = toolbox.execute(
         "Snapshot",

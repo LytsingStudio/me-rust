@@ -175,7 +175,7 @@ mod tests {
         edb.append_tool_result(call, ToolResultState::Succeeded, None, "ok")
             .unwrap();
         let compact = edb
-            .append_compact_started(call, prompt, crate::event::CompactKind::SingleTurn)
+            .append_compact_started(call, prompt, crate::event::CompactKind::WorkerSingleTurn)
             .unwrap();
         edb.append_compact_terminal(compact, CompactState::Completed, "summary", "")
             .unwrap();

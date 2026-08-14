@@ -185,7 +185,7 @@ The Worker may collect image evidence without inspecting it. For browser evidenc
 - If the Worker made an unrequested design choice or changed scope, do not silently accept it; inspect the effect and issue a precise correction when needed.
 - Reuse the same dedicated Worker runtime throughout the conversation. Worker.Wait observes progress and obtains the result. Worker.Ask begins the first operation or starts a new operation after any preceding operation has reached a terminal state. A completed, stopped, externally interrupted, host-restarted, model-API-interrupted, or failed Worker always remains available for another Ask; only an operation that is still active prevents Ask. The new Ask preserves conversation context but does not restore lost processes or undo earlier external effects. After any abnormal termination, inspect the returned progress and error, then issue an appropriate self-contained Ask that restates every applicable rule and requirement.
 - If the actual user submits a follow-up while Worker.Wait is active, only that wait ends early: the Worker keeps running, Wait reports state=wait_interrupted and reason=follow_up, and the actual follow-up appears immediately after the Wait result in the same context. Address the follow-up before deciding whether to wait again, stop the Worker, or issue a later instruction.
-- Every Worker.Wait result reports the Worker's latest known context usage and successful context-compaction count. Use these values only while one bounded, independently closable piece of work remains active. Keep context during related steps, corrections, verification, and follow-up operations for that piece. As soon as that small independent piece is finished, all of its required evidence has been received, and no related Worker operation remains, you must call Worker.ClearContext before starting the next independent piece—even when the user's larger objective is still in progress. Do not wait for the whole user task or project to finish. Do not clear between steps that still belong to the same piece or while work is active. The Worker must be idle before clearing; wait for completion or stop active work first if necessary. ClearContext also removes the Worker's WorkMap and closes its live external tool sessions, so never retain or reuse their identifiers. Because every later Worker.Ask is independently self-contained, never depend on cleared conversation history to preserve rules or requirements.
+- Every Worker.Wait result reports the Worker's latest known context usage and successful context-compaction count.
 - For substantive operations, normally wait 1 to 10 minutes at a time. A temporarily quiet Worker is not a reason to submit the same work again.
 - Use Worker.Stop only when the active operation has materially departed from your instruction and allowing it to continue would be harmful. Afterward, use the evidence already obtained to issue a corrected instruction.
 
@@ -278,6 +278,8 @@ For a long multi-stage operation, use your WorkMap only to preserve faithful exe
 After reporting, remain ready for the Manager's next instruction."#;
 const AGENT_OPERATING_PROMPT: &str = r#"# Working principles
 
+This section is shared by multiple Agent roles. When your role is Worker, references here to the user's request, scope, language, input, or communication counterpart apply to the Manager's concrete instruction and to your reply to the Manager. The dedicated Worker role and execution boundaries take precedence over any general wording in this section.
+
 - Understand before acting. Inspect relevant existing material before changing or making precise claims about it. Search available local or external sources before saying that a referenced item is missing, unknown, or unavailable.
 - Match the user's scope. Do not add unrelated features, refactors, compatibility shims, configurability, files, or dependencies. Prefer the smallest complete solution; minimalism does not justify leaving requested behavior unfinished.
 - Follow the existing project's structure and style. Do not create one-use abstractions or speculative validation for impossible internal states. Validate real boundaries such as user input, external data, and external APIs.
@@ -297,7 +299,7 @@ const AGENT_OPERATING_PROMPT: &str = r#"# Working principles
 
 # Communication
 
-- Use the user's language unless they request another. Be direct, precise, and proportional to the task.
+- Use the actual user's language unless they request another. When your role is Worker, use the Manager's language because the Manager, not the actual user, is your conversation counterpart. Be direct, precise, and proportional to the task.
 - Before a non-trivial sequence of actions, briefly state the immediate intent. During long work, give concise updates at meaningful milestones, when an assumption changes, or when user input becomes necessary; do not narrate every routine tool call.
 - Lead the final answer with the outcome. Include the most relevant verification and any remaining limitation. Do not dump raw logs when a short accurate summary is enough.
 - Do not expose hidden reasoning or internal implementation terminology that the user does not need. Explain conclusions and material trade-offs instead.
@@ -1406,11 +1408,13 @@ enum MainAgentProfile {
     Worker,
 }
 
-fn compact_kind_for_profile(profile: MainAgentProfile) -> CompactKind {
-    if profile == MainAgentProfile::Worker {
-        CompactKind::SingleTurn
-    } else {
-        CompactKind::Segmented
+impl MainAgentProfile {
+    fn compact_kind(self) -> CompactKind {
+        match self {
+            Self::Standard => CompactKind::MainAgentMultiTurn,
+            Self::Manager => CompactKind::ManagerMultiTurn,
+            Self::Worker => CompactKind::WorkerSingleTurn,
+        }
     }
 }
 
@@ -1430,6 +1434,7 @@ pub struct MainAgent {
     input_queue: OrchestratorInputQueue,
     api_activity: ApiActivity,
     profile: MainAgentProfile,
+    compact_kind: CompactKind,
     manager_family: bool,
     environment_prompt: OnceLock<String>,
     workspace: PathBuf,
@@ -1453,6 +1458,7 @@ impl MainAgent {
         profile: MainAgentProfile,
         manager_family: bool,
     ) -> Self {
+        let compact_kind = profile.compact_kind();
         Self {
             cursor: 0,
             effort: Some(effort.unwrap_or_else(|| UNSET_EFFORT.to_owned())),
@@ -1463,6 +1469,7 @@ impl MainAgent {
             input_queue: OrchestratorInputQueue::default(),
             api_activity: ApiActivity::default(),
             profile,
+            compact_kind,
             manager_family,
             environment_prompt: OnceLock::new(),
             workspace: PathBuf::from("."),
@@ -1495,12 +1502,14 @@ impl MainAgent {
                 .catalog()
                 .with_image_support(image_toolbox::model_supports_images(model))?
                 .excluding(agent_toolbox::AGENT_TOOLBOX_NAME)?
-                .excluding(image_toolbox::TOOLBOX_NAME),
+                .excluding(image_toolbox::TOOLBOX_NAME)?
+                .excluding(agent_title::TOOLBOX_NAME),
             MainAgentProfile::Standard if self.definition.kind == AgentKind::SubAgent => self
                 .toolboxes
                 .catalog()
                 .with_image_support(image_toolbox::model_supports_images(model))?
-                .excluding(agent_toolbox::AGENT_TOOLBOX_NAME),
+                .excluding(agent_toolbox::AGENT_TOOLBOX_NAME)?
+                .excluding(agent_title::TOOLBOX_NAME),
             MainAgentProfile::Standard => Ok(catalog),
         }
     }
@@ -1553,6 +1562,7 @@ impl Orchestrator for MainAgent {
             } else {
                 MainAgentProfile::Manager
             };
+            self.compact_kind = self.profile.compact_kind();
         }
         self.parent_system_prompt = definition.system_prompt.clone();
         self.definition = definition;
@@ -2113,21 +2123,30 @@ impl MainAgent {
         models: &ModelRuntime,
         on_event: &mut dyn FnMut(&EventDataBase) -> Result<()>,
     ) -> Result<CompactOutcome> {
-        let kind = compact_kind_for_profile(self.profile);
+        let kind = self.compact_kind;
+        let worker_active_sessions = (kind == CompactKind::WorkerSingleTurn)
+            .then(|| self.worker_compact_active_sessions())
+            .transpose()?;
         let compact_id = edb.append_compact_started(tool_call_id, prompt_id, kind)?;
         on_event(edb)?;
 
         let visible_catalog = self.visible_catalog(models.active_model())?;
-        let stages = if kind == CompactKind::SingleTurn {
-            vec![(None, compact::WORKER_COMPACT_PROMPT)]
-        } else {
-            CompactStage::SEGMENTED
-                .into_iter()
-                .map(|stage| (Some(stage), compact::segmented_prompt(stage)))
-                .collect()
-        };
         let mut completed_stages = Vec::new();
-        for (stage, prompt) in stages {
+        for stage in compact::stages(kind).iter().copied() {
+            let prompt = match kind {
+                CompactKind::WorkerSingleTurn => compact::worker_prompt(
+                    worker_active_sessions
+                        .as_deref()
+                        .expect("Worker compact sessions were captured"),
+                ),
+                CompactKind::MainAgentMultiTurn | CompactKind::ManagerMultiTurn => {
+                    compact::prompt(kind, stage)
+                        .ok_or_else(|| {
+                            format!("Compact kind {kind} has no prompt for stage {stage:?}")
+                        })?
+                        .to_owned()
+                }
+            };
             let mut context = main_model_context_with_toolboxes_and_environment(
                 edb,
                 &visible_catalog,
@@ -2138,16 +2157,19 @@ impl MainAgent {
             )?;
             context.tools.clear();
             for (previous_stage, content) in &completed_stages {
+                let previous_prompt =
+                    compact::prompt(kind, Some(*previous_stage)).ok_or_else(|| {
+                        format!(
+                            "Compact kind {kind} has no prompt for completed stage {previous_stage}"
+                        )
+                    })?;
                 context.push(
                     "user",
-                    system_prompt_injection_envelope(
-                        "compact",
-                        compact::segmented_prompt(*previous_stage),
-                    ),
+                    system_prompt_injection_envelope("compact", previous_prompt),
                 );
                 context.push("assistant", content);
             }
-            context.push("user", system_prompt_injection_envelope("compact", prompt));
+            context.push("user", system_prompt_injection_envelope("compact", &prompt));
             let response =
                 match self.request_compact_stage(prompt_id, edb, models, &context, on_event)? {
                     CompactStageRequestOutcome::Completed(content) => content,
@@ -2182,7 +2204,7 @@ impl MainAgent {
                 return Ok(CompactOutcome::Completed);
             }
         }
-        let summary = compact::merge_segmented_summary(
+        let summary = compact::merge_multi_turn_summary(
             completed_stages
                 .iter()
                 .skip(1)
@@ -2191,6 +2213,50 @@ impl MainAgent {
         edb.append_compact_terminal(compact_id, CompactState::Completed, summary, "")?;
         on_event(edb)?;
         Ok(CompactOutcome::Completed)
+    }
+
+    fn worker_compact_active_sessions(&self) -> Result<String> {
+        let observer = self.toolboxes.observer();
+        let mut errors = Vec::new();
+        let terminal_sessions = match observer.active_terminal_sessions() {
+            Ok(sessions) => sessions
+                .into_iter()
+                .map(|session| {
+                    json!({
+                        "session_id": session.session_id,
+                        "state": "live",
+                        "width": session.width,
+                        "height": session.height,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                errors.push(format!("Terminal inventory unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        let web_browser_pages = match observer.active_web_browser_pages() {
+            Ok(pages) => pages
+                .into_iter()
+                .map(|page| {
+                    json!({
+                        "page_id": page.page_id,
+                        "state": page.state,
+                        "title": page.title,
+                        "url": page.url,
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                errors.push(format!("WebBrowser inventory unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        Ok(serde_json::to_string(&json!({
+            "terminal_sessions": terminal_sessions,
+            "web_browser_pages": web_browser_pages,
+            "observation_errors": errors,
+        }))?)
     }
 
     fn request_compact_stage(
@@ -4547,8 +4613,8 @@ fn compact_states(
                 let Some(Event::CompactStateUpdate(started)) = edb.get(*compact_id) else {
                     return Err(format!("Compact {} start is missing", update.compact_id));
                 };
-                let expected = CompactStage::SEGMENTED.get(stages.len()).copied();
-                if started.kind != CompactKind::Segmented
+                let expected = CompactStage::MULTI_TURN.get(stages.len()).copied();
+                if !started.kind.is_multi_turn()
                     || update.kind != started.kind
                     || update.tool_call_id != started.tool_call_id
                     || update.prompt_id != started.prompt_id
@@ -4617,7 +4683,7 @@ fn compact_states(
                     _ => {}
                 }
                 if terminal == CompactState::Completed {
-                    if started.kind == CompactKind::SingleTurn {
+                    if !started.kind.is_multi_turn() {
                         if !stages.is_empty()
                             || !successful_compact_request_between(
                                 edb.events(),
@@ -4632,18 +4698,18 @@ fn compact_states(
                             ));
                         }
                     } else {
-                        if stages.len() != CompactStage::SEGMENTED.len()
+                        if stages.len() != CompactStage::MULTI_TURN.len()
                             || stages
                                 .iter()
-                                .zip(CompactStage::SEGMENTED)
+                                .zip(CompactStage::MULTI_TURN)
                                 .any(|((actual, _), expected)| *actual != expected)
                         {
                             return Err(format!(
-                                "Compact {} completed before all segmented stages",
+                                "Compact {} completed before all multi-turn stages",
                                 update.compact_id
                             ));
                         }
-                        let merged = compact::merge_segmented_summary(
+                        let merged = compact::merge_multi_turn_summary(
                             stages.iter().skip(1).map(|(_, content)| content.as_str()),
                         );
                         if update.content != merged {
@@ -4994,20 +5060,19 @@ fn main_model_context_with_toolboxes_and_environment(
         }
         _ => None,
     });
-    let exclude_agent_tools =
+    let restrict_sub_agent_tools =
         agent_kind == AgentKind::SubAgent && profile != Some(MainAgentProfile::Worker);
-    let toolbox_prompt = if exclude_agent_tools {
-        catalog.prompt_excluding(agent_toolbox::AGENT_TOOLBOX_NAME)?
+    let context_catalog = if restrict_sub_agent_tools {
+        catalog
+            .excluding(agent_toolbox::AGENT_TOOLBOX_NAME)?
+            .excluding(agent_title::TOOLBOX_NAME)?
     } else {
-        catalog.prompt().to_owned()
+        catalog.clone()
     };
+    let toolbox_prompt = context_catalog.prompt().to_owned();
     let mut context = ModelContext {
         messages: Vec::new(),
-        tools: if exclude_agent_tools {
-            catalog.model_definitions_excluding(agent_toolbox::AGENT_TOOLBOX_NAME)
-        } else {
-            catalog.model_definitions()
-        },
+        tools: context_catalog.model_definitions(),
     };
     let mut system_prompts = Vec::new();
     let title_prompt = agent_title::system_prompt();
@@ -5204,7 +5269,26 @@ fn main_model_context_with_toolboxes_and_environment(
                                 &compact::continuation_message(&update.content),
                             ),
                         );
-                        if profile != Some(MainAgentProfile::Worker) {
+                        if profile == Some(MainAgentProfile::Worker)
+                            && update.kind == CompactKind::WorkerSingleTurn
+                        {
+                            let Some(Event::ManagerPrompt(prompt)) = edb.get(update.prompt_id)
+                            else {
+                                return Err(format!(
+                                    "Worker Compact {} references non-Manager prompt {}",
+                                    update.compact_id, update.prompt_id
+                                )
+                                .into());
+                            };
+                            context.push(
+                                "user",
+                                system_prompt_injection_envelope(
+                                    "worker_manager_prompt_restored",
+                                    "The exact Manager instruction for the compacted Worker turn follows. It is retained so its wording and boundaries remain available. Use the compact summary to determine what has already completed and the precise continuation point; do not repeat completed operations merely because the instruction appears again.",
+                                ),
+                            );
+                            context.push("user", manager_prompt_envelope(&prompt.content));
+                        } else if profile != Some(MainAgentProfile::Worker) {
                             context.push(
                                 "user",
                                 system_prompt_injection_envelope(
@@ -5374,7 +5458,7 @@ fn resolve_main_system_prompt(
                 MainAgentProfile::Manager | MainAgentProfile::Standard => CONTEXT_PROTOCOL_PROMPT,
             };
             Ok(format!(
-                "{}\n\n{AGENT_OPERATING_PROMPT}\n\n{environment_prompt}\n\n{context_protocol}\n\n{title_prompt}",
+                "{}\n\n{AGENT_OPERATING_PROMPT}\n\n{environment_prompt}\n\n{context_protocol}{}",
                 match profile {
                     MainAgentProfile::Manager => MANAGER_BASE_SYSTEM_PROMPT,
                     MainAgentProfile::Worker => WORKER_BASE_SYSTEM_PROMPT,
@@ -5382,7 +5466,12 @@ fn resolve_main_system_prompt(
                         SUB_AGENT_SYSTEM_PROMPT
                     }
                     MainAgentProfile::Standard => BASE_SYSTEM_PROMPT,
-                }
+                },
+                match (profile, agent_kind) {
+                    (MainAgentProfile::Worker, _)
+                    | (MainAgentProfile::Standard, AgentKind::SubAgent) => String::new(),
+                    _ => format!("\n\n{title_prompt}"),
+                },
             ))
         }
         POLICY_SYSTEM_PROMPT_NAME => Ok(SAFETY_POLICY_PROMPT.to_owned()),
@@ -8064,7 +8153,7 @@ data: [DONE]
         edb.append_tool_result(compact_call, ToolResultState::Succeeded, None, "{}")
             .unwrap();
         let compact_id = edb
-            .append_compact_started(compact_call, prompt_id, CompactKind::SingleTurn)
+            .append_compact_started(compact_call, prompt_id, CompactKind::WorkerSingleTurn)
             .unwrap();
         let compact_api = edb.append_api_requesting(prompt_id).unwrap();
         edb.append_api_state(compact_api, prompt_id, ApiState::Streaming, "")
@@ -8231,8 +8320,11 @@ data: [DONE]
         assert!(system.contains("Return only verified facts."));
         assert!(system.contains("must never call Agent.Create"));
         assert!(system.contains("Agent.Stop"));
+        assert!(!system.contains("# Conversation title"));
         assert!(!system.contains("# Toolbox Agent"));
         assert!(!system.contains("## Agent.Create"));
+        assert!(!system.contains("# Toolbox SetTitle"));
+        assert!(!system.contains("## SetTitle"));
         let agent_api_names = agent_toolbox::catalog_parts()
             .0
             .into_iter()
@@ -8242,6 +8334,12 @@ data: [DONE]
             context.tools.iter().all(|tool| {
                 !agent_api_names.contains(tool["function"]["name"].as_str().unwrap())
             })
+        );
+        assert!(
+            context
+                .tools
+                .iter()
+                .all(|tool| { tool["function"]["name"].as_str() != Some(agent_title::TOOL_NAME) })
         );
         assert_eq!(
             context
@@ -8426,22 +8524,16 @@ data: [DONE]
         assert!(!manager_system.contains("routing boundary"));
         assert!(!manager_system.contains("Formulate exact code, patches, commands"));
         assert!(!manager_system.contains("Supply the Worker with the exact files, content, patch"));
-        assert!(manager_system.contains("small independent piece is finished"));
-        assert!(manager_system.contains("you must call Worker.ClearContext"));
-        assert!(
-            manager_system.contains("even when the user's larger objective is still in progress")
-        );
-        assert!(
-            manager_system.contains("Do not wait for the whole user task or project to finish")
-        );
-        assert!(manager_system.contains("Do not clear between steps that still belong"));
+        assert!(!manager_system.contains("small independent piece is finished"));
+        assert!(!manager_system.contains("you must call Worker.ClearContext"));
+        assert!(!manager_system.contains("larger objective is still in progress"));
         assert!(!manager_system.contains("current task is completely finished"));
         assert!(!manager_system.contains("task has changed completely"));
         assert!(!manager_system.contains("deliberately a low-frequency reset"));
         assert!(!manager_system.contains("do not clear routinely"));
         assert!(manager_system.contains("state=wait_interrupted and reason=follow_up"));
         assert!(manager_system.contains("the Worker keeps running"));
-        assert!(manager_system.contains("never depend on cleared conversation history"));
+        assert!(!manager_system.contains("never depend on cleared conversation history"));
         assert!(!manager_system.contains("Let the Worker independently handle"));
         assert!(
             !manager_system.contains(
@@ -8561,6 +8653,8 @@ data: [DONE]
         assert!(worker_system.contains("Refer to the sender of <manager_prompt> as the Manager"));
         assert!(worker_system.contains("monitors your work while it is in progress"));
         assert!(worker_system.contains("API role does not identify the actual end user"));
+        assert!(worker_system.contains("use the Manager's language"));
+        assert!(!worker_system.contains("# Conversation title"));
         assert!(worker_context.messages.iter().any(|message| {
             message["content"]
                 == "<manager_prompt>\ninspect the workspace and report evidence\n</manager_prompt>"
@@ -8570,23 +8664,31 @@ data: [DONE]
         assert!(!worker_system.contains("Only create or organize simple content independently"));
         assert!(worker_system.contains("# Worker authority reminder"));
         assert!(worker_system.ends_with("results you transmit without judgment."));
+        assert_eq!(worker.compact_kind, CompactKind::WorkerSingleTurn);
+        let active_sessions: Value =
+            serde_json::from_str(&worker.worker_compact_active_sessions().unwrap()).unwrap();
+        assert_eq!(active_sessions["terminal_sessions"], json!([]));
+        assert_eq!(active_sessions["web_browser_pages"], json!([]));
+        assert_eq!(active_sessions["observation_errors"], json!([]));
         assert_eq!(
-            compact_kind_for_profile(MainAgentProfile::Worker),
-            CompactKind::SingleTurn
+            MainAgent::new_manager(None).compact_kind,
+            CompactKind::ManagerMultiTurn
         );
         assert_eq!(
-            compact_kind_for_profile(MainAgentProfile::Manager),
-            CompactKind::Segmented
-        );
-        assert_eq!(
-            compact_kind_for_profile(MainAgentProfile::Standard),
-            CompactKind::Segmented
+            MainAgent::new(None).compact_kind,
+            CompactKind::MainAgentMultiTurn
         );
         assert!(worker_catalog.tools().iter().all(|tool| {
             tool.toolbox != agent_toolbox::AGENT_TOOLBOX_NAME
                 && tool.toolbox != agent_toolbox::WORKER_TOOLBOX_NAME
                 && tool.toolbox != image_toolbox::TOOLBOX_NAME
+                && tool.toolbox != agent_title::TOOLBOX_NAME
         }));
+        assert!(
+            worker_catalog
+                .resolve_api_name(agent_title::TOOL_NAME)
+                .is_none()
+        );
         assert!(worker_catalog.resolve_api_name("Image_Info").is_none());
         assert!(worker_catalog.resolve_api_name("Image_View").is_none());
 
@@ -8613,7 +8715,7 @@ data: [DONE]
             .append_tool_result(compact_call, ToolResultState::Succeeded, None, "{}")
             .unwrap();
         let compact_id = worker_edb
-            .append_compact_started(compact_call, worker_prompt, CompactKind::SingleTurn)
+            .append_compact_started(compact_call, worker_prompt, CompactKind::WorkerSingleTurn)
             .unwrap();
         let summary_api = worker_edb.append_api_requesting(worker_prompt).unwrap();
         worker_edb
@@ -8635,6 +8737,135 @@ data: [DONE]
         let compacted_worker_json = serde_json::to_string(&compacted_worker.messages).unwrap();
         assert!(compacted_worker_json.contains("compact_summary"));
         assert!(!compacted_worker_json.contains("turn_history"));
+        assert!(compacted_worker_json.contains("worker_manager_prompt_restored"));
+        assert!(compacted_worker_json.contains("inspect the workspace and report evidence"));
+        assert!(compacted_worker_json.contains("do not repeat completed operations"));
+    }
+
+    #[test]
+    fn worker_single_turn_compact_receives_live_sessions_and_restores_manager_prompt() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_json_request(&mut stream);
+            let encoded = request.to_string();
+            assert!(encoded.contains("RUNTIME-PROVIDED ACTIVE TOOL SESSIONS"));
+            assert!(encoded.contains("pty-live-7"));
+            assert!(encoded.contains("p0000042"));
+            assert!(encoded.contains("Worker compact page"));
+            assert!(encoded.contains("1. Effective Instructions and Boundaries"));
+            assert!(encoded.contains("6. Current State and Continuation"));
+            assert!(!encoded.contains("2. Key Technical Concepts"));
+            assert!(
+                request
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+            );
+            write_sse_content(
+                &mut stream,
+                "<analysis>covered</analysis><summary>\n1. Effective Instructions and Boundaries\nKeep scope.\n\n2. Completed Work and Evidence\nObserved state.\n\n3. Files and Artifacts\nNone.\n\n4. Problems and Unresolved Issues\nNone.\n\n5. Active Tool Sessions\nTerminal pty-live-7 and WebBrowser p0000042 remain active.\n\n6. Current State and Continuation\nContinue the pending operation.\n</summary>",
+            );
+        });
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "me-worker-compact-sessions-{}-{nonce}",
+            std::process::id()
+        ));
+        let tools_directory = directory.join(".me/tools");
+        std::fs::create_dir_all(&tools_directory).unwrap();
+        for (name, internal_tool, output) in [
+            (
+                "Terminal.py",
+                "__activeSessions",
+                r#"[{"session_id":"pty-live-7","creation_order":7,"width":120,"height":40,"revision":9}]"#,
+            ),
+            (
+                "WebBrowser.py",
+                "__activePages",
+                r#"{"pages":[{"page_id":"p0000042","url":"https://example.test/","title":"Worker compact page","state":"open"}]}"#,
+            ),
+        ] {
+            std::fs::write(
+                tools_directory.join(name),
+                format!(
+                    r#"import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    command = request["cmd"]
+    if command == "getTools":
+        output = []
+    elif command == "getBrief":
+        output = "Compact observer fixture."
+    elif command == "execute" and request.get("tool") == {internal_tool:?}:
+        output = json.loads({output:?})
+    else:
+        print(json.dumps({{"id": request["id"], "type": "error", "error": {{"code": "unexpected", "message": "unexpected request", "retryable": False}}}}), flush=True)
+        continue
+    print(json.dumps({{"id": request["id"], "type": "result", "output": output}}), flush=True)
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut model = test_model_config("worker-compact", &["unset"]);
+        model.base_url = format!("http://{address}");
+        model.timeout_seconds = 3;
+        let models = ModelRuntime::new(vec![model], "worker-compact").unwrap();
+        let mut worker = MainAgent::new_worker(None);
+        worker
+            .configure_agent(AgentDefinition::sub_agent("manager", None))
+            .unwrap();
+        worker.configure_workspace(&directory).unwrap();
+        let mut edb = EventDataBase::new();
+        worker.initialize(&mut edb, &models).unwrap();
+        let prompt = edb
+            .append_manager_prompt("Inspect only the requested target and report exact evidence.")
+            .unwrap();
+        edb.append_agent_turn(prompt, prompt, AgentTurnState::Started, "")
+            .unwrap();
+        let api = edb.append_api_requesting(prompt).unwrap();
+        edb.append_api_state(api, prompt, ApiState::Streaming, "")
+            .unwrap();
+        let call = edb
+            .append_tool_call(api, prompt, "worker-compact-call", compact::TOOL_NAME, "{}")
+            .unwrap();
+        edb.append_api_state(api, prompt, ApiState::Completed, "")
+            .unwrap();
+        edb.append_tool_result(call, ToolResultState::Succeeded, None, "{}")
+            .unwrap();
+
+        assert!(matches!(
+            worker
+                .run_compact(prompt, call, &mut edb, &models, &mut |_| Ok(()))
+                .unwrap(),
+            CompactOutcome::Completed
+        ));
+        server.join().unwrap();
+        let catalog = worker.visible_catalog(models.active_model()).unwrap();
+        let context = main_model_context_with_toolboxes_and_environment(
+            &edb,
+            &catalog,
+            None,
+            "# Runtime environment\n\n- Test snapshot",
+            false,
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&context.messages).unwrap();
+        assert!(encoded.contains("compact_summary"));
+        assert!(encoded.contains("worker_manager_prompt_restored"));
+        assert!(encoded.contains("Inspect only the requested target and report exact evidence."));
+        assert!(!encoded.contains("RUNTIME-PROVIDED ACTIVE TOOL SESSIONS"));
+        drop(worker);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -10661,7 +10892,7 @@ for line in sys.stdin:
         edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
             .unwrap();
         let compact_id = edb
-            .append_compact_started(tool, prompt, CompactKind::SingleTurn)
+            .append_compact_started(tool, prompt, CompactKind::WorkerSingleTurn)
             .unwrap();
         let compact_api = edb.append_api_requesting(prompt).unwrap();
         edb.append_api_state(compact_api, prompt, ApiState::Streaming, "")
@@ -10713,7 +10944,7 @@ for line in sys.stdin:
         edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
             .unwrap();
         let compact_id = edb
-            .append_compact_started(tool, prompt, CompactKind::SingleTurn)
+            .append_compact_started(tool, prompt, CompactKind::WorkerSingleTurn)
             .unwrap();
         edb.append_compact_terminal(
             compact_id,
@@ -10731,7 +10962,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn startup_discards_partial_segmented_compact_without_changing_context_boundary() {
+    fn startup_discards_partial_multi_turn_compact_without_changing_context_boundary() {
         let mut edb = EventDataBase::new();
         initialize_main_for_test(&MainAgent::new(None), &mut edb);
         let prompt = edb.append_user_prompt("keep request").unwrap();
@@ -10749,7 +10980,7 @@ for line in sys.stdin:
         edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
             .unwrap();
         let compact_id = edb
-            .append_compact_started(tool, prompt, CompactKind::Segmented)
+            .append_compact_started(tool, prompt, CompactKind::MainAgentMultiTurn)
             .unwrap();
         let stage_api = edb.append_api_requesting(prompt).unwrap();
         edb.append_api_state(stage_api, prompt, ApiState::Streaming, "")

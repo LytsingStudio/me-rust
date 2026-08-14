@@ -50,6 +50,7 @@ const STDERR_HISTORY_LINES: usize = 32;
 const TERMINAL_OBSERVE_ACTIVE_SESSIONS: &str = "__activeSessions";
 const TERMINAL_OBSERVE_FRAME: &str = "__terminalFrame";
 const TERMINAL_OBSERVE_BACKEND: &str = "__terminalBackend";
+const WEB_BROWSER_OBSERVE_ACTIVE_PAGES: &str = "__activePages";
 const TERMINAL_OBSERVER_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
@@ -358,6 +359,7 @@ impl ToolboxRuntime {
     pub fn observer(&self) -> ToolboxObserver {
         ToolboxObserver {
             terminal: self.programs.get("Terminal").cloned(),
+            web_browser: self.programs.get("WebBrowser").cloned(),
             programs: self.programs.values().cloned().collect(),
         }
     }
@@ -445,7 +447,21 @@ fn native_catalog_parts() -> (Vec<ToolboxTool>, Vec<(String, String)>) {
 #[derive(Clone)]
 pub struct ToolboxObserver {
     terminal: Option<ToolboxClient>,
+    web_browser: Option<ToolboxClient>,
     programs: Vec<ToolboxClient>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct WebBrowserPagePreview {
+    pub page_id: String,
+    pub url: String,
+    pub title: String,
+    pub state: String,
+}
+
+#[derive(Deserialize)]
+struct WebBrowserPagesPreview {
+    pages: Vec<WebBrowserPagePreview>,
 }
 
 impl ToolboxObserver {
@@ -469,6 +485,18 @@ impl ToolboxObserver {
             Err(error) => return Err(error.to_string().into()),
         };
         Ok(serde_json::from_value(output)?)
+    }
+
+    pub fn active_web_browser_pages(&self) -> Result<Vec<WebBrowserPagePreview>> {
+        let Some(web_browser) = &self.web_browser else {
+            return Ok(Vec::new());
+        };
+        let output = match web_browser.internal_execute(WEB_BROWSER_OBSERVE_ACTIVE_PAGES, json!({}))
+        {
+            Ok(output) => output,
+            Err(error) => return Err(error.to_string().into()),
+        };
+        Ok(serde_json::from_value::<WebBrowserPagesPreview>(output)?.pages)
     }
 
     pub fn terminal_frame(&self, session_id: &str) -> Result<Option<TerminalFrame>> {

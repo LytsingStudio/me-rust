@@ -290,23 +290,38 @@ impl std::fmt::Display for CompactState {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum CompactKind {
-    SingleTurn,
-    Segmented,
+    MainAgentMultiTurn,
+    ManagerMultiTurn,
+    WorkerSingleTurn,
 }
 
 impl CompactKind {
     fn code(self) -> u8 {
         match self {
-            Self::SingleTurn => 0,
-            Self::Segmented => 1,
+            Self::MainAgentMultiTurn => 0,
+            Self::ManagerMultiTurn => 1,
+            Self::WorkerSingleTurn => 2,
         }
     }
 
     fn from_code(code: u8) -> Result<Self> {
         match code {
-            0 => Ok(Self::SingleTurn),
-            1 => Ok(Self::Segmented),
+            0 => Ok(Self::MainAgentMultiTurn),
+            1 => Ok(Self::ManagerMultiTurn),
+            2 => Ok(Self::WorkerSingleTurn),
             _ => Err(format!("unsupported Compact kind {code}").into()),
+        }
+    }
+
+    pub fn is_multi_turn(self) -> bool {
+        matches!(self, Self::MainAgentMultiTurn | Self::ManagerMultiTurn)
+    }
+
+    pub fn stage_count(self) -> usize {
+        if self.is_multi_turn() {
+            CompactStage::MULTI_TURN.len()
+        } else {
+            1
         }
     }
 }
@@ -314,8 +329,9 @@ impl CompactKind {
 impl std::fmt::Display for CompactKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::SingleTurn => "single-turn",
-            Self::Segmented => "segmented",
+            Self::MainAgentMultiTurn => "main-agent-multi-turn",
+            Self::ManagerMultiTurn => "manager-multi-turn",
+            Self::WorkerSingleTurn => "worker-single-turn",
         })
     }
 }
@@ -331,7 +347,7 @@ pub enum CompactStage {
 }
 
 impl CompactStage {
-    pub const SEGMENTED: [Self; 6] = [
+    pub const MULTI_TURN: [Self; 6] = [
         Self::Analysis,
         Self::PrimaryRequestAndIntent,
         Self::KeyTechnicalContextAndDecisions,
@@ -352,7 +368,7 @@ impl CompactStage {
     }
 
     fn from_code(code: u8) -> Result<Self> {
-        Self::SEGMENTED
+        Self::MULTI_TURN
             .get(usize::from(code))
             .copied()
             .ok_or_else(|| format!("unsupported Compact stage {code}").into())
@@ -3123,9 +3139,9 @@ impl EventDataBase {
         };
         if started.state != CompactState::Started
             || started.compact_id != compact_id
-            || started.kind != CompactKind::Segmented
+            || !started.kind.is_multi_turn()
         {
-            return Err(format!("event {compact_id} is not a segmented Compact start").into());
+            return Err(format!("event {compact_id} is not a multi-turn Compact start").into());
         }
         let mut completed = Vec::new();
         for event in &self.events {
@@ -3144,10 +3160,10 @@ impl EventDataBase {
                 completed.push(update.stage.ok_or("Compact stage event has no stage")?);
             }
         }
-        let expected = CompactStage::SEGMENTED
+        let expected = CompactStage::MULTI_TURN
             .get(completed.len())
             .copied()
-            .ok_or("all segmented Compact stages are already complete")?;
+            .ok_or("all multi-turn Compact stages are already complete")?;
         if stage != expected {
             return Err(
                 format!("Compact {compact_id} expected stage {expected}, found {stage}").into(),
@@ -3212,7 +3228,7 @@ impl EventDataBase {
             }
             _ => {}
         }
-        if state == CompactState::Completed && started.kind == CompactKind::Segmented {
+        if state == CompactState::Completed && started.kind.is_multi_turn() {
             let stages = self
                 .events
                 .iter()
@@ -3226,19 +3242,19 @@ impl EventDataBase {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            if stages.len() != CompactStage::SEGMENTED.len()
+            if stages.len() != CompactStage::MULTI_TURN.len()
                 || stages
                     .iter()
-                    .zip(CompactStage::SEGMENTED)
+                    .zip(CompactStage::MULTI_TURN)
                     .any(|((actual, _), expected)| *actual != Some(expected))
             {
-                return Err("segmented Compact cannot complete before all stages".into());
+                return Err("multi-turn Compact cannot complete before all stages".into());
             }
-            let merged = crate::compact::merge_segmented_summary(
+            let merged = crate::compact::merge_multi_turn_summary(
                 stages.iter().skip(1).map(|(_, content)| *content),
             );
             if content != merged {
-                return Err("segmented Compact final summary does not match its sections".into());
+                return Err("multi-turn Compact final summary does not match its sections".into());
             }
         }
         let id = self.next_event_id;
@@ -3839,6 +3855,30 @@ fn encode_v35_record(event: &Event) -> Result<Vec<u8>> {
     encode_raw_record(&encode_event_v35(event))
 }
 
+fn encode_v36_record(event: &Event) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    encode_varint(event.id(), &mut raw);
+    if let Event::CompactStateUpdate(event) = event {
+        raw.push(19);
+        encode_varint(event.timestamp_ms, &mut raw);
+        encode_varint(event.compact_id, &mut raw);
+        encode_varint(event.tool_call_id, &mut raw);
+        encode_varint(event.prompt_id, &mut raw);
+        raw.push(event.state.code());
+        raw.push(if event.kind == CompactKind::WorkerSingleTurn {
+            0
+        } else {
+            1
+        });
+        raw.push(event.stage.map_or(u8::MAX, CompactStage::code));
+        encode_sized_string(&event.content, &mut raw);
+        raw.extend_from_slice(event.detail.as_bytes());
+    } else {
+        raw.extend(encode_event_body(event));
+    }
+    encode_raw_record(&raw)
+}
+
 fn encode_event_v35(event: &Event) -> Vec<u8> {
     let mut raw = Vec::new();
     encode_varint(event.id(), &mut raw);
@@ -4355,7 +4395,14 @@ fn decode_file(bytes: &[u8]) -> Result<(Vec<Event>, usize, EventId)> {
     if bytes.get(..FILE_MAGIC.len()) != Some(FILE_MAGIC) || bytes.len() < FILE_HEADER_SIZE {
         return Err("unsupported or corrupt EDB header".into());
     }
-    decode_file_records(bytes, false, false)
+    decode_file_records(bytes, false, CompactRecordFormat::Current)
+}
+
+#[derive(Clone, Copy)]
+enum CompactRecordFormat {
+    LegacySingleTurn,
+    GenericV36,
+    Current,
 }
 
 fn decode_legacy_agent_definition_file(
@@ -4369,7 +4416,7 @@ fn decode_legacy_agent_definition_file(
     {
         return Err(format!("invalid EDB v{version} file").into());
     }
-    decode_file_records(bytes, true, true)
+    decode_file_records(bytes, true, CompactRecordFormat::LegacySingleTurn)
 }
 
 fn decode_v35_file(bytes: &[u8]) -> Result<(Vec<Event>, usize, EventId)> {
@@ -4380,13 +4427,24 @@ fn decode_v35_file(bytes: &[u8]) -> Result<(Vec<Event>, usize, EventId)> {
     {
         return Err("invalid EDB v35 file".into());
     }
-    decode_file_records(bytes, false, true)
+    decode_file_records(bytes, false, CompactRecordFormat::LegacySingleTurn)
+}
+
+fn decode_v36_file(bytes: &[u8]) -> Result<(Vec<Event>, usize, EventId)> {
+    if bytes.len() < FILE_HEADER_SIZE
+        || bytes.get(..4) != Some(b"MEDB")
+        || bytes[4] != 36
+        || bytes[5..8] != [0, 0, 0]
+    {
+        return Err("invalid EDB v36 file".into());
+    }
+    decode_file_records(bytes, false, CompactRecordFormat::GenericV36)
 }
 
 fn decode_file_records(
     bytes: &[u8],
     legacy_agent_definition: bool,
-    legacy_compact: bool,
+    compact_format: CompactRecordFormat,
 ) -> Result<(Vec<Event>, usize, EventId)> {
     let persisted_next_event_id =
         EventId::from_le_bytes(bytes[FILE_MAGIC.len()..FILE_HEADER_SIZE].try_into()?);
@@ -4426,7 +4484,7 @@ fn decode_file_records(
         events.push(decode_event_with_format(
             &raw,
             legacy_agent_definition,
-            legacy_compact,
+            compact_format,
         )?);
         offset = record_end;
     }
@@ -4517,6 +4575,44 @@ pub(crate) fn migrate_compact_kind_v35_to_v36(bytes: Vec<u8>) -> Result<Vec<u8>>
     let mut migrated = encode_file_header(next_event_id).to_vec();
     migrated[4] = 36;
     for event in &events {
+        migrated.extend(encode_v36_record(event)?);
+    }
+    Ok(migrated)
+}
+
+pub(crate) fn migrate_compact_strategy_v36_to_v37(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    if bytes.len() < FILE_HEADER_SIZE || bytes.get(..4) != Some(b"MEDB") || bytes[4] != 36 {
+        return Err("Compact strategy migration requires an EDB v36 file".into());
+    }
+    let (mut events, _, next_event_id) = decode_v36_file(&bytes)?;
+    let manager_owned = events.iter().any(|event| {
+        matches!(
+            event,
+            Event::AgentKindDef(definition) if definition.orchestrator == "manager-agent"
+        )
+    });
+    for event in &mut events {
+        let Event::CompactStateUpdate(update) = event else {
+            continue;
+        };
+        update.kind = match update.kind {
+            // Every pre-v36 Compact was a single-turn lifecycle. Keep that
+            // historical execution fact even when it belongs to a Main or
+            // Manager EDB.
+            CompactKind::WorkerSingleTurn => CompactKind::WorkerSingleTurn,
+            // Generic v36 multi-turn lifecycles used the owning orchestrator's
+            // shared strategy. Make that strategy explicit in v37.
+            CompactKind::MainAgentMultiTurn if manager_owned => CompactKind::ManagerMultiTurn,
+            CompactKind::MainAgentMultiTurn => CompactKind::MainAgentMultiTurn,
+            CompactKind::ManagerMultiTurn => {
+                return Err("EDB v36 contains an impossible Compact kind".into());
+            }
+        };
+    }
+
+    let mut migrated = encode_file_header(next_event_id).to_vec();
+    migrated[4] = 37;
+    for event in &events {
         migrated.extend(encode_record(event)?);
     }
     Ok(migrated)
@@ -4524,13 +4620,13 @@ pub(crate) fn migrate_compact_kind_v35_to_v36(bytes: Vec<u8>) -> Result<Vec<u8>>
 
 #[cfg(test)]
 fn decode_event(raw: &[u8]) -> Result<Event> {
-    decode_event_with_format(raw, false, false)
+    decode_event_with_format(raw, false, CompactRecordFormat::Current)
 }
 
 fn decode_event_with_format(
     raw: &[u8],
     legacy_agent_definition: bool,
-    legacy_compact: bool,
+    compact_format: CompactRecordFormat,
 ) -> Result<Event> {
     let (id, consumed) = decode_varint(raw)?;
     let raw = &raw[consumed..];
@@ -4933,21 +5029,34 @@ fn decode_event_with_format(
                 .split_first()
                 .ok_or("missing CompactStateUpdateEvent state")?;
             let state = CompactState::from_code(state)?;
-            let (kind, stage, body) = if legacy_compact {
-                (CompactKind::SingleTurn, None, body)
-            } else {
-                let (&kind, body) = body
-                    .split_first()
-                    .ok_or("missing CompactStateUpdateEvent kind")?;
-                let kind = CompactKind::from_code(kind)?;
-                let (&stage, body) = body
-                    .split_first()
-                    .ok_or("missing CompactStateUpdateEvent stage")?;
-                let stage = (stage != u8::MAX)
-                    .then(|| CompactStage::from_code(stage))
-                    .transpose()?;
-                (kind, stage, body)
-            };
+            let (kind, stage, body) =
+                if matches!(compact_format, CompactRecordFormat::LegacySingleTurn) {
+                    (CompactKind::WorkerSingleTurn, None, body)
+                } else {
+                    let (&kind, body) = body
+                        .split_first()
+                        .ok_or("missing CompactStateUpdateEvent kind")?;
+                    let kind = match compact_format {
+                        CompactRecordFormat::GenericV36 => match kind {
+                            0 => CompactKind::WorkerSingleTurn,
+                            1 => CompactKind::MainAgentMultiTurn,
+                            _ => {
+                                return Err(
+                                    format!("unsupported EDB v36 Compact kind {kind}").into()
+                                );
+                            }
+                        },
+                        CompactRecordFormat::Current => CompactKind::from_code(kind)?,
+                        CompactRecordFormat::LegacySingleTurn => unreachable!(),
+                    };
+                    let (&stage, body) = body
+                        .split_first()
+                        .ok_or("missing CompactStateUpdateEvent stage")?;
+                    let stage = (stage != u8::MAX)
+                        .then(|| CompactStage::from_code(stage))
+                        .transpose()?;
+                    (kind, stage, body)
+                };
             let (content, detail) = decode_sized_string(body)?;
             let detail = String::from_utf8(detail.to_vec())?;
             match state {
@@ -4960,7 +5069,7 @@ fn decode_event_with_format(
                     return Err("invalid Compact started payload".into());
                 }
                 CompactState::StageCompleted
-                    if kind != CompactKind::Segmented
+                    if !kind.is_multi_turn()
                         || stage.is_none()
                         || content.is_empty()
                         || !detail.is_empty() =>
@@ -6339,7 +6448,7 @@ mod tests {
         )
         .unwrap();
         let compact = edb
-            .append_compact_started(tool, prompt, CompactKind::SingleTurn)
+            .append_compact_started(tool, prompt, CompactKind::WorkerSingleTurn)
             .unwrap();
         let summary_api = edb.append_api_requesting(prompt).unwrap();
         edb.append_api_state(summary_api, prompt, ApiState::Streaming, "")
@@ -6395,7 +6504,7 @@ mod tests {
         edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
             .unwrap();
         let compact = edb
-            .append_compact_started(tool, prompt, CompactKind::SingleTurn)
+            .append_compact_started(tool, prompt, CompactKind::WorkerSingleTurn)
             .unwrap();
         edb.append_compact_terminal(compact, CompactState::Failed, "", "network error")
             .unwrap();
@@ -6429,7 +6538,7 @@ mod tests {
             edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
                 .unwrap();
             let compact = edb
-                .append_compact_started(tool, prompt, CompactKind::SingleTurn)
+                .append_compact_started(tool, prompt, CompactKind::WorkerSingleTurn)
                 .unwrap();
             let summary_api = edb.append_api_requesting(prompt).unwrap();
             edb.append_api_state(summary_api, prompt, ApiState::Streaming, "")
@@ -6461,7 +6570,7 @@ mod tests {
     }
 
     #[test]
-    fn segmented_compact_stages_are_ordered_persisted_and_rewind_as_one_lifecycle() {
+    fn multi_turn_compact_stages_are_ordered_persisted_and_rewind_as_one_lifecycle() {
         let directory = temporary_path("segmented-compact-round-trip");
         let path = directory.join("main.edb");
         let completed;
@@ -6484,7 +6593,7 @@ mod tests {
             edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
                 .unwrap();
             let compact = edb
-                .append_compact_started(tool, prompt, CompactKind::Segmented)
+                .append_compact_started(tool, prompt, CompactKind::MainAgentMultiTurn)
                 .unwrap();
             let contents = [
                 "analysis",
@@ -6494,7 +6603,7 @@ mod tests {
                 "4. Problems, Investigations, and Resolutions\nproblems",
                 "5. Current State and Continuation Plan\nnext",
             ];
-            for (stage, content) in CompactStage::SEGMENTED.into_iter().zip(contents) {
+            for (stage, content) in CompactStage::MULTI_TURN.into_iter().zip(contents) {
                 let api = edb.append_api_requesting(prompt).unwrap();
                 edb.append_api_state(api, prompt, ApiState::Streaming, "")
                     .unwrap();
@@ -6502,7 +6611,7 @@ mod tests {
                     .unwrap();
                 edb.append_compact_stage(compact, stage, content).unwrap();
             }
-            let summary = crate::compact::merge_segmented_summary(contents.into_iter().skip(1));
+            let summary = crate::compact::merge_multi_turn_summary(contents.into_iter().skip(1));
             completed = edb
                 .append_compact_terminal(compact, CompactState::Completed, summary, "")
                 .unwrap();
@@ -6521,18 +6630,18 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(stages.len(), CompactStage::SEGMENTED.len());
+        assert_eq!(stages.len(), CompactStage::MULTI_TURN.len());
         assert!(
             stages
                 .iter()
-                .all(|(kind, _, _)| *kind == CompactKind::Segmented)
+                .all(|(kind, _, _)| *kind == CompactKind::MainAgentMultiTurn)
         );
         assert_eq!(
             stages
                 .iter()
                 .filter_map(|(_, stage, _)| *stage)
                 .collect::<Vec<_>>(),
-            CompactStage::SEGMENTED
+            CompactStage::MULTI_TURN
         );
         reopened.rewind_to_event(completed).unwrap();
         assert!(reopened.get(trigger_api).is_none());
@@ -6547,7 +6656,7 @@ mod tests {
     }
 
     #[test]
-    fn v35_compact_events_migrate_as_single_turn_lifecycles() {
+    fn v35_compact_events_migrate_as_worker_single_turn_lifecycles() {
         let directory = temporary_path("compact-v35-migration");
         let path = directory.join("main.edb");
         let mut edb = EventDataBase::new();
@@ -6567,7 +6676,7 @@ mod tests {
         edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
             .unwrap();
         let compact = edb
-            .append_compact_started(tool, prompt, CompactKind::SingleTurn)
+            .append_compact_started(tool, prompt, CompactKind::WorkerSingleTurn)
             .unwrap();
         edb.append_compact_terminal(
             compact,
@@ -6595,11 +6704,71 @@ mod tests {
                     Event::CompactStateUpdate(update) => Some(update),
                     _ => None,
                 })
-                .all(|update| update.kind == CompactKind::SingleTurn && update.stage.is_none())
+                .all(
+                    |update| update.kind == CompactKind::WorkerSingleTurn && update.stage.is_none()
+                )
         );
-        assert_eq!(fs::read(&path).unwrap()[4], 36);
+        assert_eq!(fs::read(&path).unwrap()[4], 37);
         drop(migrated);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn v36_multi_turn_compacts_migrate_by_owning_orchestrator() {
+        for (orchestrator, expected) in [
+            ("main-agent", CompactKind::MainAgentMultiTurn),
+            ("manager-agent", CompactKind::ManagerMultiTurn),
+        ] {
+            let directory = temporary_path(&format!("compact-v36-{orchestrator}"));
+            let path = directory.join("main.edb");
+            let mut edb = EventDataBase::new();
+            edb.append_agent_kind_def(AgentKind::Interactive, orchestrator, None, None)
+                .unwrap();
+            let prompt = edb.append_user_prompt("legacy segmented compact").unwrap();
+            let trigger_api = edb.append_api_requesting(prompt).unwrap();
+            let tool = edb
+                .append_tool_call(
+                    trigger_api,
+                    prompt,
+                    "compact",
+                    crate::compact::TOOL_NAME,
+                    "{}",
+                )
+                .unwrap();
+            edb.append_api_state(trigger_api, prompt, ApiState::Completed, "")
+                .unwrap();
+            edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
+                .unwrap();
+            // Code 1 represented the generic Segmented kind in v36. The
+            // current Manager kind deliberately serializes as code 1 so this
+            // fixture can write the exact old wire value.
+            let compact = edb
+                .append_compact_started(tool, prompt, CompactKind::ManagerMultiTurn)
+                .unwrap();
+            let next_event_id = edb.next_event_id();
+            let event_ids = edb.events().iter().map(Event::id).collect::<Vec<_>>();
+            let mut bytes = encode_file_header(next_event_id).to_vec();
+            bytes[4] = 36;
+            for event in edb.events() {
+                bytes.extend(encode_record(event).unwrap());
+            }
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(&path, bytes).unwrap();
+
+            let migrated = EventDataBase::open(&path).unwrap();
+            assert_eq!(migrated.next_event_id(), next_event_id);
+            assert_eq!(
+                migrated.events().iter().map(Event::id).collect::<Vec<_>>(),
+                event_ids
+            );
+            assert!(matches!(
+                migrated.get(compact),
+                Some(Event::CompactStateUpdate(update)) if update.kind == expected
+            ));
+            assert_eq!(fs::read(&path).unwrap()[4], 37);
+            drop(migrated);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]

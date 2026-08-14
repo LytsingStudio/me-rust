@@ -169,7 +169,7 @@ WebUI 提供对应的会话、模型、上下文、终端和多 Agent 管理功�
 | `me --webui-passkey PASSWORD` | 为本次 WebUI 设置访问密码。 |
 | `me init` | 初始化或重置全局配置。 |
 | `me version` | 显示当前版本。 |
-| `me update` | 更新到最新 Release，不修改全局配置。 |
+| `me update` | 直接从公开 Release 更新，不需要 `gh`，且不修改全局配置。 |
 | `me create` | 在当前目录创建工作区。 |
 | `me workspace reset` | 永久删除当前目录的 me 工作区数据。 |
 | `me model list` | 列出可用模型。 |

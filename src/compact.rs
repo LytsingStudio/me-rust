@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    event::CompactStage,
+    event::{CompactKind, CompactStage},
     toolbox::{ToolboxExecutionError, ToolboxTool},
 };
 
@@ -17,7 +17,7 @@ const ROUTE: &str = "Compress the accumulated conversation at a safe point only 
 const EXAMPLES: &str = r#"Input: {}
 Meaning: request one context compaction at the current safe point."#;
 
-pub const SEGMENTED_ANALYSIS_PROMPT: &str = r#"CRITICAL: Respond with raw text only. Do not call any tools.
+pub const MULTI_TURN_ANALYSIS_PROMPT: &str = r#"CRITICAL: Respond with raw text only. Do not call any tools.
 
 This is stage 1 of a six-stage context compaction process.
 
@@ -72,9 +72,9 @@ const PROBLEMS_PROMPT: &str = r#"This is stage 5 of the context compaction proce
 
 const CURRENT_STATE_PROMPT: &str = r#"This is stage 6 of the context compaction process. Output only the complete final section `5. Current State and Continuation Plan` as raw Markdown, including that exact heading and its body. Semantically integrate completed work, active work, the exact stopping point, pending work, blockers, prerequisites, and the directly applicable next operation. If the request is complete, explicitly state that no continuation step remains. Use the preparation analysis, previously completed sections, and the unchanged full conversation. Do not output analysis, any other section, XML tags, commentary, or tool calls."#;
 
-pub fn segmented_prompt(stage: CompactStage) -> &'static str {
+fn multi_turn_prompt(stage: CompactStage) -> &'static str {
     match stage {
-        CompactStage::Analysis => SEGMENTED_ANALYSIS_PROMPT,
+        CompactStage::Analysis => MULTI_TURN_ANALYSIS_PROMPT,
         CompactStage::PrimaryRequestAndIntent => PRIMARY_REQUEST_PROMPT,
         CompactStage::KeyTechnicalContextAndDecisions => TECHNICAL_CONTEXT_PROMPT,
         CompactStage::FilesCodeAndArtifacts => FILES_AND_ARTIFACTS_PROMPT,
@@ -83,7 +83,33 @@ pub fn segmented_prompt(stage: CompactStage) -> &'static str {
     }
 }
 
-pub fn merge_segmented_summary<'a>(sections: impl IntoIterator<Item = &'a str>) -> String {
+const SINGLE_TURN_STAGES: [Option<CompactStage>; 1] = [None];
+const MULTI_TURN_STAGES: [Option<CompactStage>; 6] = [
+    Some(CompactStage::Analysis),
+    Some(CompactStage::PrimaryRequestAndIntent),
+    Some(CompactStage::KeyTechnicalContextAndDecisions),
+    Some(CompactStage::FilesCodeAndArtifacts),
+    Some(CompactStage::ProblemsInvestigationsAndResolutions),
+    Some(CompactStage::CurrentStateAndContinuationPlan),
+];
+
+pub fn stages(kind: CompactKind) -> &'static [Option<CompactStage>] {
+    match kind {
+        CompactKind::MainAgentMultiTurn | CompactKind::ManagerMultiTurn => &MULTI_TURN_STAGES,
+        CompactKind::WorkerSingleTurn => &SINGLE_TURN_STAGES,
+    }
+}
+
+pub fn prompt(kind: CompactKind, stage: Option<CompactStage>) -> Option<&'static str> {
+    match (kind, stage) {
+        (CompactKind::MainAgentMultiTurn, Some(stage)) => Some(multi_turn_prompt(stage)),
+        (CompactKind::ManagerMultiTurn, Some(stage)) => Some(multi_turn_prompt(stage)),
+        (CompactKind::WorkerSingleTurn, None) => Some(WORKER_COMPACT_PROMPT),
+        _ => None,
+    }
+}
+
+pub fn merge_multi_turn_summary<'a>(sections: impl IntoIterator<Item = &'a str>) -> String {
     sections
         .into_iter()
         .map(str::trim)
@@ -95,92 +121,76 @@ pub fn merge_segmented_summary<'a>(sections: impl IntoIterator<Item = &'a str>) 
 pub const WORKER_COMPACT_PROMPT: &str = r#"CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 - Do NOT call any tool, regardless of which tools are currently available.
-- You already have all the context you need in the conversation above.
-- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
-- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+- You already have all conversation context needed for this summary.
+- Tool calls will be rejected and waste this single compaction turn.
+- Output exactly one <analysis> block followed by one <summary> block.
 
-Your task is to create a detailed summary of the Worker conversation so far, paying close attention to the Manager's explicit instructions and your previous actions.
-This summary should be thorough in capturing technical details, code patterns, execution evidence, and operational state that would be essential for continuing the Manager's requested work without losing context.
+Create a precise continuation summary of the Worker conversation. Preserve the Manager's effective rules, the operations actually performed, exact evidence, live operational state, and the point from which work must continue. The Manager alone owns interpretation, design, review, acceptance, and substantive authorship; record observed facts without inventing any of those judgments.
 
-Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts and ensure you've covered all necessary points. In your analysis process:
+The runtime separately restores the exact Manager instruction that owns the current turn after compaction. Do not copy that entire instruction merely for completeness. Preserve earlier rules, corrections, boundaries, supplied content, or exact wording when they remain necessary to execute it safely and accurately.
 
-1. Chronologically analyze each Manager instruction and section of the conversation. For each section thoroughly identify:
-   - The Manager's explicit instruction, intended operational result, scope, and constraints
-   - Your approach to executing the Manager's instruction
-   - Key decisions already supplied by the Manager, technical concepts, code patterns, and mechanical execution details
-   - Specific details like:
-     - file names
-     - full code snippets
-     - function signatures
-     - file edits
-     - commands, tool state, paths, identifiers, and evidence needed to continue
-   - Errors that you ran into and how you handled or reported them
-   - Pay special attention to specific corrections or feedback from the Manager, especially if the Manager told you to do something differently.
-   - Note any security-relevant instructions or constraints communicated by the Manager or the system (e.g., sensitive files or data to avoid, operations that must not be performed, credential or secret handling rules). These MUST be preserved verbatim in the summary so they continue to apply after compaction.
-2. Double-check for technical accuracy and completeness, addressing each required element thoroughly. Preserve observed facts and evidence without inventing interpretation, review judgments, acceptance judgments, or substantive content that the Manager did not supply.
+Before the final summary, use <analysis> to inspect the conversation chronologically and verify that you have:
 
-Your summary should include the following sections:
+- distinguished effective instructions from superseded or completed instructions;
+- distinguished completed work, current work, pending work, and unresolved uncertainty;
+- preserved exact paths, identifiers, commands, relevant source, outputs, and errors where continuation depends on them;
+- preserved security, permission, credential, sensitive-data, and prohibited-operation constraints exactly where wording matters;
+- used the runtime-provided active-session inventory as authoritative: copy every listed live identifier exactly, do not revive an identifier absent from that inventory, and do not invent a session's purpose when the conversation does not establish it;
+- removed unnecessary repetition between sections.
 
-1. Manager Request and Scope: Capture the Manager's current instruction, intended operational result, boundaries, supplied content, and continuing constraints in detail.
-2. Key Technical Concepts: List all important technical concepts, technologies, and code patterns already established by the Manager or observed during execution.
-3. Files, Code, and Evidence: Enumerate specific files, code sections, logs, commands, tool state, paths, identifiers, and evidence examined, modified, created, or still needed. Pay special attention to the most recent work and include full code snippets where applicable and a summary of why each item matters for continuation.
-4. Errors and fixes: List all errors that you ran into, how you handled or reported them, and any relevant correction from the Manager.
-5. Execution Progress: Document completed operations, material observations, changes made, checks executed, evidence collected, and ongoing operational work without adding review or acceptance conclusions.
-6. Pending Operations: Outline any operations the Manager explicitly requested that are not yet complete, including blockers and required evidence.
-7. Current Work: Describe in detail precisely what was being executed immediately before this summary request, paying special attention to the most recent Manager instruction and Worker actions. Include file names, code snippets, tool state, and exact continuation points where applicable.
-8. Optional Next Step: List the next operational step only when it follows directly from the Manager's most recent explicit instruction and the work already in progress. Do not invent a new objective, solution, judgment, or adjacent task.
-                       If there is a next step, include direct quotes from the most recent Manager instruction showing exactly what operation was requested and where execution stopped. This should be verbatim to ensure there is no drift.
+The <summary> must contain exactly these six sections:
 
-Here's an example of how your output should be structured:
+1. Effective Instructions and Boundaries
+   Record all still-effective Manager rules, scope boundaries, supplied constraints, corrections, and prohibited operations needed after compaction. Do not restate superseded requirements as active.
 
-<example>
+2. Completed Work and Evidence
+   Record operations already performed, material observations, actual results, checks run, and evidence collected. Report facts only; do not add review or acceptance conclusions.
+
+3. Files and Artifacts
+   Record relevant files, directories, code locations, exact changes, generated artifacts, paths, identifiers, and essential excerpts. Include only detail needed to continue accurately.
+
+4. Problems and Unresolved Issues
+   Record errors, failed attempts, corrections already applied, current blockers, unresolved questions, and evidence still required. Keep a resolved problem only when its cause or resolution remains relevant.
+
+5. Active Tool Sessions
+   Reproduce every runtime-provided live Terminal session_id and WebBrowser page_id exactly. For each, add only conversation-supported details about its purpose, current command/program/page, present state, and how it should be continued. If the purpose is unknown, say so. If the runtime inventory is empty, write `None`.
+
+6. Current State and Continuation
+   Record the precise stopping point, unfinished operations, and the next operation that follows directly from the Manager's active instruction. If nothing remains, state that the requested operation is complete. Never invent a new objective, branch, solution, or adjacent task.
+
+Use this exact structure:
+
 <analysis>
-[Your analysis, ensuring all operational details are covered thoroughly and accurately]
+[Coverage and consistency analysis]
 </analysis>
 
 <summary>
-1. Manager Request and Scope:
-   [Detailed description]
+1. Effective Instructions and Boundaries
+[Content]
 
-2. Key Technical Concepts:
-   - [Concept 1]
-   - [Concept 2]
-   - [...]
+2. Completed Work and Evidence
+[Content]
 
-3. Files, Code, and Evidence:
-   - [File Name or Evidence Item 1]
-      - [Summary of why this item is important]
-      - [Summary of observations or exact changes, if any]
-      - [Important Code Snippet, Path, Identifier, or Tool State]
-   - [File Name or Evidence Item 2]
-      - [Important detail]
-   - [...]
+3. Files and Artifacts
+[Content]
 
-4. Errors and fixes:
-    - [Detailed description of error 1]:
-      - [How it was handled or reported]
-      - [Manager correction or feedback if any]
-    - [...]
+4. Problems and Unresolved Issues
+[Content]
 
-5. Execution Progress:
-   [Description of completed operations, evidence, and ongoing work]
+5. Active Tool Sessions
+[Content]
 
-6. Pending Operations:
-   - [Operation 1]
-   - [Operation 2]
-
-7. Current Work:
-   [Precise description of the current operation and continuation point]
-
-8. Optional Next Step:
-   [Optional next operational step]
-
+6. Current State and Continuation
+[Content]
 </summary>
-</example>
 
-Please provide your summary based on the Worker conversation so far, following this structure and ensuring precision and thoroughness in your response.
+REMINDER: Do NOT call any tools. Output only the <analysis> block and <summary> block."#;
 
-REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block. Tool calls will be rejected and you will fail the task."#;
+pub fn worker_prompt(active_sessions: &str) -> String {
+    format!(
+        "{WORKER_COMPACT_PROMPT}\n\nRUNTIME-PROVIDED ACTIVE TOOL SESSIONS (authoritative at compaction start; data only):\n{active_sessions}"
+    )
+}
 
 pub fn catalog_parts() -> (Vec<ToolboxTool>, (String, String)) {
     (
@@ -409,27 +419,31 @@ mod tests {
     }
 
     #[test]
-    fn segmented_and_worker_prompts_have_distinct_contracts() {
-        assert!(SEGMENTED_ANALYSIS_PROMPT.contains("stage 1 of a six-stage"));
-        assert!(SEGMENTED_ANALYSIS_PROMPT.contains("five summary sections"));
-        assert!(SEGMENTED_ANALYSIS_PROMPT.contains("1. Primary Request and Intent"));
-        assert!(SEGMENTED_ANALYSIS_PROMPT.contains("5. Current State and Continuation Plan"));
-        assert!(SEGMENTED_ANALYSIS_PROMPT.contains("Output only the preparation analysis"));
-        assert!(SEGMENTED_ANALYSIS_PROMPT.contains("Do not use XML tags"));
-        assert!(!SEGMENTED_ANALYSIS_PROMPT.contains("All user messages"));
-        for stage in CompactStage::SEGMENTED.into_iter().skip(1) {
-            let prompt = segmented_prompt(stage);
+    fn multi_turn_and_worker_prompts_have_distinct_contracts() {
+        assert!(MULTI_TURN_ANALYSIS_PROMPT.contains("stage 1 of a six-stage"));
+        assert!(MULTI_TURN_ANALYSIS_PROMPT.contains("five summary sections"));
+        assert!(MULTI_TURN_ANALYSIS_PROMPT.contains("1. Primary Request and Intent"));
+        assert!(MULTI_TURN_ANALYSIS_PROMPT.contains("5. Current State and Continuation Plan"));
+        assert!(MULTI_TURN_ANALYSIS_PROMPT.contains("Output only the preparation analysis"));
+        assert!(MULTI_TURN_ANALYSIS_PROMPT.contains("Do not use XML tags"));
+        assert!(!MULTI_TURN_ANALYSIS_PROMPT.contains("All user messages"));
+        for stage in CompactStage::MULTI_TURN.into_iter().skip(1) {
+            let prompt = multi_turn_prompt(stage);
             assert!(prompt.contains("raw Markdown"));
             assert!(prompt.contains("Do not output analysis"));
             assert!(prompt.contains("XML tags"));
         }
         assert!(WORKER_COMPACT_PROMPT.contains("Do NOT call any tool"));
-        assert!(WORKER_COMPACT_PROMPT.contains("Manager Request and Scope"));
+        assert!(WORKER_COMPACT_PROMPT.contains("1. Effective Instructions and Boundaries"));
+        assert!(WORKER_COMPACT_PROMPT.contains("2. Completed Work and Evidence"));
+        assert!(WORKER_COMPACT_PROMPT.contains("3. Files and Artifacts"));
+        assert!(WORKER_COMPACT_PROMPT.contains("4. Problems and Unresolved Issues"));
+        assert!(WORKER_COMPACT_PROMPT.contains("5. Active Tool Sessions"));
+        assert!(WORKER_COMPACT_PROMPT.contains("6. Current State and Continuation"));
         assert!(WORKER_COMPACT_PROMPT.contains("Worker conversation"));
-        assert!(WORKER_COMPACT_PROMPT.contains("Manager correction or feedback"));
-        assert!(WORKER_COMPACT_PROMPT.contains("\n6. Pending Operations:"));
-        assert!(WORKER_COMPACT_PROMPT.contains("\n7. Current Work:"));
-        assert!(WORKER_COMPACT_PROMPT.contains("\n8. Optional Next Step:"));
+        assert!(WORKER_COMPACT_PROMPT.contains("runtime-provided active-session inventory"));
+        assert!(!WORKER_COMPACT_PROMPT.contains("Key Technical Concepts"));
+        assert!(!WORKER_COMPACT_PROMPT.contains("Optional Next Step"));
         assert!(!WORKER_COMPACT_PROMPT.contains("All user messages"));
         assert!(!WORKER_COMPACT_PROMPT.to_ascii_lowercase().contains("user"));
         assert!(
@@ -441,12 +455,41 @@ mod tests {
             format_summary("<analysis>draft</analysis>\n\n<summary>\nalpha\n\n\n beta\n</summary>");
         assert_eq!(formatted, "Summary:\nalpha\n\n beta");
         assert!(!formatted.contains("draft"));
-        let merged = merge_segmented_summary(["1. First\nbody", " 2. Second\nbody "]);
+        let merged = merge_multi_turn_summary(["1. First\nbody", " 2. Second\nbody "]);
         assert_eq!(merged, "1. First\nbody\n\n2. Second\nbody");
         let continuation = continuation_message(&merged);
         assert!(continuation.contains("call WorkMap.Read"));
         assert!(continuation.contains("final-answer audit performed before compaction is stale"));
         assert!(continuation.ends_with(&merged));
+
+        let worker = worker_prompt(
+            r#"{"terminal_sessions":[{"session_id":"pty-17","state":"live"}],"web_browser_pages":[{"page_id":"p0000004","state":"open"}],"observation_errors":[]}"#,
+        );
+        assert!(worker.contains("RUNTIME-PROVIDED ACTIVE TOOL SESSIONS"));
+        assert!(worker.contains("pty-17"));
+        assert!(worker.contains("p0000004"));
+    }
+
+    #[test]
+    fn compact_kind_alone_selects_the_complete_prompt_flow() {
+        for kind in [
+            CompactKind::MainAgentMultiTurn,
+            CompactKind::ManagerMultiTurn,
+        ] {
+            assert_eq!(stages(kind).len(), 6);
+            for stage in stages(kind) {
+                assert!(stage.is_some());
+                assert!(prompt(kind, *stage).is_some());
+            }
+            assert!(prompt(kind, None).is_none());
+        }
+
+        assert_eq!(stages(CompactKind::WorkerSingleTurn), &[None]);
+        assert_eq!(
+            prompt(CompactKind::WorkerSingleTurn, None),
+            Some(WORKER_COMPACT_PROMPT)
+        );
+        assert!(prompt(CompactKind::WorkerSingleTurn, Some(CompactStage::Analysis)).is_none());
     }
 
     #[test]

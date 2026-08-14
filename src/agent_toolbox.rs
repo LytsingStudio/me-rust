@@ -201,7 +201,7 @@ fn worker_route(tool: &str) -> &'static str {
             "Use when the dedicated Worker's current request must stop while preserving its conversation for a corrected follow-up."
         }
         "ClearContext" => {
-            "Use as soon as a bounded, independently closable piece of work is finished and no related Worker operation remains, even while the larger user task continues. Keep context only across related steps, corrections, verification, and follow-ups within that piece; never clear while work is active."
+            "Clear the dedicated Worker's conversation context, WorkMap, and live external tool sessions while the Worker is idle."
         }
         _ => unreachable!("fixed native Worker tool"),
     }
@@ -219,7 +219,7 @@ fn worker_instructions(tool: &str) -> &'static str {
             "Stop interrupts the active Worker request but preserves the Worker's conversation. Use Ask afterward to correct, redirect, or continue it. Stop does not undo files, commands, network actions, or other external effects already produced. Use Wait, not Stop, merely to inspect progress."
         }
         "ClearContext" => {
-            "ClearContext accepts no arguments. Call it as soon as each bounded, independently closable piece of work is finished, all evidence required from that piece has been received, and no related Worker operation remains. The larger user task or project may still be in progress; do not wait for it to finish before clearing. Keep context only throughout related steps, corrections, verification, and follow-ups within the same piece; do not clear between them or while work is active. It is available only while the Worker is idle; if an operation is active, wait for it to finish or call Worker.Stop first. Clearing removes conversational requirements and conventions, the entire WorkMap, and every live external tool session such as Terminal and WebBrowser; previous session and page identifiers become invalid. System instructions and model settings remain active. The operation returns only after the clear has been recorded, and every later Worker.Ask must restate its complete applicable rules and requirements."
+            "ClearContext accepts no arguments and is available only while the Worker is idle; if an operation is active, wait for it to finish or call Worker.Stop first. Clearing removes the Worker's conversation, the entire WorkMap, and every live external tool session such as Terminal and WebBrowser; previous session and page identifiers become invalid. System instructions and model settings remain active. The operation returns only after the clear has been recorded."
         }
         _ => unreachable!("fixed native Worker tool"),
     }
@@ -1589,6 +1589,37 @@ mod tests {
         workflow::{AgentId, Workflow},
     };
 
+    fn read_complete_http_request(stream: &mut std::net::TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        let (body_start, content_length) = loop {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "HTTP request ended before its headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .expect("model request must have Content-Length");
+            break (header_end + 4, content_length);
+        };
+        while bytes.len() < body_start + content_length {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0, "HTTP request ended before its body");
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+    }
+
     #[test]
     fn catalog_exposes_agent_control_tools_without_automatic_lifecycle_language() {
         let (tools, (_, brief)) = catalog_parts();
@@ -1760,10 +1791,9 @@ mod tests {
         assert!(text.contains("System instructions and model settings remain active"));
         assert!(!text.contains("reply_id"));
         assert!(!text.contains("Recall"));
-        assert!(text.contains("bounded, independently closable piece of work is finished"));
-        assert!(text.contains("larger user task or project may still be in progress"));
-        assert!(text.contains("Keep context only throughout related steps"));
-        assert!(text.contains("every later Worker.Ask must restate"));
+        assert!(!text.contains("bounded, independently closable piece of work is finished"));
+        assert!(!text.contains("larger user task or project may still be in progress"));
+        assert!(!text.contains("Keep context only throughout related steps"));
         assert!(text.contains("Never assume the Worker remembers"));
         assert!(text.contains("all applicable rules, prohibitions, scope boundaries"));
         assert!(text.contains("'as before'"));
@@ -1830,8 +1860,7 @@ mod tests {
             let release_response = Arc::clone(&release_response);
             thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0_u8; 16_384];
-                let _ = stream.read(&mut request).unwrap();
+                read_complete_http_request(&mut stream);
                 while !release_response.load(Ordering::Acquire) {
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -1928,7 +1957,7 @@ mod tests {
             .execute_worker_cancellable(WORKER_WAIT, r#"{"max_wait_ms":2000}"#, &mut || false)
             .unwrap();
         assert_eq!(waited["worker"], "worker");
-        assert_eq!(waited["state"], "completed");
+        assert_eq!(waited["state"], "completed", "{waited}");
         assert_eq!(waited["final_answer"], "worker result");
         assert_eq!(
             waited["progress"],
@@ -1989,8 +2018,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 16_384];
-            let _ = first.read(&mut request).unwrap();
+            read_complete_http_request(&mut first);
             first
                 .write_all(
                     b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 19\r\nConnection: close\r\n\r\n{\"error\":\"offline\"}",
@@ -1998,7 +2026,7 @@ mod tests {
                 .unwrap();
 
             let (mut second, _) = listener.accept().unwrap();
-            let _ = second.read(&mut request).unwrap();
+            read_complete_http_request(&mut second);
             second
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n")
                 .unwrap();
@@ -2073,7 +2101,7 @@ mod tests {
         let recovered = toolbox
             .execute_worker_cancellable(WORKER_WAIT, r#"{"max_wait_ms":2000}"#, &mut || false)
             .unwrap();
-        assert_eq!(recovered["state"], "completed");
+        assert_eq!(recovered["state"], "completed", "{recovered}");
         assert_eq!(recovered["final_answer"], "recovered");
         assert_eq!(
             recovered["progress"],
@@ -2406,8 +2434,7 @@ mod tests {
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    let mut request = [0_u8; 16_384];
-                    let _ = stream.read(&mut request).unwrap();
+                    read_complete_http_request(&mut stream);
                     if attempt == 0 {
                         first_request_received.store(true, Ordering::Release);
                         while !release_first_response.load(Ordering::Acquire) {

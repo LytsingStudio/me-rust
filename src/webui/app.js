@@ -945,7 +945,7 @@ function addNotice(projection, changes, content, event) {
 }
 
 function compactStageCount(kind) {
-  return kind === "Segmented" ? 6 : 1;
+  return kind === "MainAgentMultiTurn" || kind === "ManagerMultiTurn" ? 6 : 1;
 }
 
 function compactProgressText(kind, stage, receivedSseEvents = null) {

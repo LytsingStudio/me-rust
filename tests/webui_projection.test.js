@@ -122,7 +122,7 @@ describe("WebUI incremental event projections", () => {
     const events = [
       event("CompactStateUpdate", 1, {
         compact_id: 1, tool_call_id: 0, prompt_id: 0,
-        kind: "Segmented", state: "Started", stage: null,
+        kind: "MainAgentMultiTurn", state: "Started", stage: null,
       }),
       event("ApiStateUpdate", 2, {
         api_call_id: 100, prompt_id: 0, state: "Completed",
@@ -130,7 +130,7 @@ describe("WebUI incremental event projections", () => {
       }),
       event("CompactStateUpdate", 3, {
         compact_id: 1, tool_call_id: 0, prompt_id: 0,
-        kind: "Segmented", state: "StageCompleted", stage: "Analysis",
+        kind: "MainAgentMultiTurn", state: "StageCompleted", stage: "Analysis",
       }),
       event("ApiStateUpdate", 4, {
         api_call_id: 101, prompt_id: 0, state: "Error", detail: "network",
@@ -141,12 +141,23 @@ describe("WebUI incremental event projections", () => {
       }),
       event("CompactStateUpdate", 6, {
         compact_id: 1, tool_call_id: 0, prompt_id: 0,
-        kind: "Segmented", state: "Failed", stage: null, detail: "failed",
+        kind: "MainAgentMultiTurn", state: "Failed", stage: null, detail: "failed",
       }),
     ];
     const projection = runtime.emptyProjection();
     runtime.consumeChatEvents(projection, events.slice(0, 1));
     expect(projection.messages[0].content).toBe("正在压缩 (1/6) ...");
+    for (const [kind, expected] of [
+      ["ManagerMultiTurn", "正在压缩 (1/6) ..."],
+      ["WorkerSingleTurn", "正在压缩 (1/1) ..."],
+    ]) {
+      const kindProjection = runtime.emptyProjection();
+      runtime.consumeChatEvents(kindProjection, [event("CompactStateUpdate", 20, {
+        compact_id: 20, tool_call_id: 19, prompt_id: 18,
+        kind, state: "Started", stage: null,
+      })]);
+      expect(kindProjection.messages[0].content).toBe(expected);
+    }
     runtime.consumeChatEvents(projection, events.slice(1, 2));
     expect(projection.messages[0].content).toBe("正在压缩 (1/6) ...");
     runtime.applyCompactApiActivity(projection, { active: true, receivedSseEvents: 37 });
@@ -167,7 +178,7 @@ describe("WebUI incremental event projections", () => {
     ]) {
       const terminal = [events[0], event("CompactStateUpdate", 2, {
         compact_id: 1, tool_call_id: 0, prompt_id: 0,
-        kind: "Segmented", state, stage: null, detail: "terminal",
+        kind: "MainAgentMultiTurn", state, stage: null, detail: "terminal",
       })];
       expect(runtime.projectChat(terminal).messages[0].content).toBe(expected);
     }

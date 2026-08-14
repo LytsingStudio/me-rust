@@ -2577,6 +2577,14 @@ def int_arg(
 
 
 def execute(tool: str, data: dict[str, Any], request_id: int) -> Any:
+    if tool == "__activePages":
+        if (
+            RUNTIME is None
+            or RUNTIME.browser is None
+            or not RUNTIME.browser.is_connected()
+        ):
+            return {"pages": []}
+        return RUNTIME.list_pages()
     runtime = browser_runtime()
     runtime.start(lambda message: update(request_id, message))
     if tool == "Create":
@@ -2659,7 +2667,8 @@ def handle(request: Any) -> None:
         )
         return
     tool = request.get("tool")
-    if tool not in TOOLS:
+    internal_tool = command == "execute" and tool == "__activePages"
+    if tool not in TOOLS and not internal_tool:
         raise ToolError("unknown_tool", f"unknown WebBrowser tool: {tool}")
     if command == "getInputSchema":
         result(request_id, INPUT_SCHEMAS[tool])
@@ -2673,7 +2682,7 @@ def handle(request: Any) -> None:
         result(request_id, EXAMPLES[tool])
     elif command == "execute":
         data = validate_object(request.get("input"))
-        allowed = set(INPUT_SCHEMAS[tool]["properties"])
+        allowed = set() if internal_tool else set(INPUT_SCHEMAS[tool]["properties"])
         unexpected = sorted(set(data) - allowed)
         if unexpected:
             raise ToolError(

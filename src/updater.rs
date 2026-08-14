@@ -1,9 +1,10 @@
 use std::{
     env, fs,
     fs::File,
-    io::{BufReader, Read},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 #[cfg(windows)]
@@ -11,12 +12,15 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::Result;
 
 pub const RELEASE_REPOSITORY: &str = "LytsingStudio/me-rust";
 const CHECKSUM_ASSET: &str = "SHA256SUMS";
+const GITHUB_API_VERSION: &str = "2022-11-28";
+const UPDATE_USER_AGENT: &str = concat!("me-rust/", env!("CARGO_PKG_VERSION"));
 
 #[cfg(any(windows, test))]
 const WINDOWS_UPDATE_POWERSHELL_ARGS: [&str; 3] = ["-NoLogo", "-NoProfile", "-NonInteractive"];
@@ -24,6 +28,18 @@ const WINDOWS_UPDATE_POWERSHELL_ARGS: [&str; 3] = ["-NoLogo", "-NoProfile", "-No
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UpdatePlatform {
     asset: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 impl UpdatePlatform {
@@ -46,7 +62,9 @@ impl UpdatePlatform {
 
 pub fn update() -> Result<()> {
     let platform = UpdatePlatform::detect()?;
-    let latest_tag = latest_release_tag()?;
+    let client = update_client()?;
+    let release = latest_release(&client)?;
+    let latest_tag = release.tag_name.as_str();
     let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     if latest_tag == current_tag {
         println!("me is already up to date: {current_tag}");
@@ -61,7 +79,7 @@ pub fn update() -> Result<()> {
 
     println!("updating me: {current_tag} -> {latest_tag}");
     let temporary = UpdateTempDirectory::create()?;
-    download_release(&latest_tag, platform.asset, temporary.path())?;
+    download_release(&client, &release, platform.asset, temporary.path())?;
 
     let executable = temporary.path().join(platform.asset);
     let checksums = temporary.path().join(CHECKSUM_ASSET);
@@ -84,66 +102,100 @@ pub fn update() -> Result<()> {
     Ok(())
 }
 
-fn latest_release_tag() -> Result<String> {
-    let output = Command::new("gh")
-        .args([
-            "release",
-            "view",
-            "--repo",
-            RELEASE_REPOSITORY,
-            "--json",
-            "tagName",
-            "--jq",
-            ".tagName",
-        ])
-        .output()
-        .map_err(|error| {
-            format!(
-                "cannot run GitHub CLI: {error}; install gh and run `gh auth login` before `me update`"
-            )
-        })?;
-    if !output.status.success() {
-        return Err(format!(
-            "cannot read the latest private release from {RELEASE_REPOSITORY}: {}; run `gh auth status` to verify access",
-            command_error(&output.stderr)
-        )
-        .into());
-    }
-    let tag = String::from_utf8(output.stdout)?.trim().to_owned();
-    if tag.is_empty() {
-        return Err("GitHub returned an empty latest release tag".into());
-    }
-    Ok(tag)
+fn update_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30 * 60))
+        .user_agent(UPDATE_USER_AGENT)
+        .build()?)
 }
 
-fn download_release(tag: &str, asset: &str, directory: &Path) -> Result<()> {
-    let output = Command::new("gh")
-        .args(["release", "download", tag, "--repo", RELEASE_REPOSITORY])
-        .arg("--pattern")
-        .arg(asset)
-        .arg("--pattern")
-        .arg(CHECKSUM_ASSET)
-        .arg("--dir")
-        .arg(directory)
-        .arg("--clobber")
-        .output()
-        .map_err(|error| format!("cannot run GitHub CLI to download {tag}: {error}"))?;
-    if !output.status.success() {
+fn latest_release(client: &reqwest::blocking::Client) -> Result<GitHubRelease> {
+    let url = format!("https://api.github.com/repos/{RELEASE_REPOSITORY}/releases/latest");
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+        .send()
+        .map_err(|error| format!("cannot query the latest public me release: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().unwrap_or_default();
         return Err(format!(
-            "cannot download {asset} from release {tag}: {}",
-            command_error(&output.stderr)
+            "cannot query the latest public me release: HTTP {status}{}",
+            response_detail(&detail)
         )
         .into());
+    }
+    let release: GitHubRelease = response
+        .json()
+        .map_err(|error| format!("cannot decode the latest public me release: {error}"))?;
+    if release.tag_name.trim().is_empty() {
+        return Err("GitHub returned an empty latest release tag".into());
+    }
+    Ok(release)
+}
+
+fn download_release(
+    client: &reqwest::blocking::Client,
+    release: &GitHubRelease,
+    asset: &str,
+    directory: &Path,
+) -> Result<()> {
+    for name in [asset, CHECKSUM_ASSET] {
+        let release_asset = release_asset(release, name)?;
+        download_asset(client, release_asset, &directory.join(name))?;
     }
     Ok(())
 }
 
-fn command_error(stderr: &[u8]) -> String {
-    let detail = String::from_utf8_lossy(stderr).trim().to_owned();
+fn release_asset<'a>(release: &'a GitHubRelease, name: &str) -> Result<&'a GitHubReleaseAsset> {
+    release
+        .assets
+        .iter()
+        .find(|candidate| candidate.name == name)
+        .ok_or_else(|| {
+            format!(
+                "release {} does not contain required asset {name}",
+                release.tag_name
+            )
+            .into()
+        })
+}
+
+fn download_asset(
+    client: &reqwest::blocking::Client,
+    asset: &GitHubReleaseAsset,
+    destination: &Path,
+) -> Result<()> {
+    let mut response = client
+        .get(&asset.browser_download_url)
+        .send()
+        .map_err(|error| format!("cannot download release asset {}: {error}", asset.name))?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().unwrap_or_default();
+        return Err(format!(
+            "cannot download release asset {}: HTTP {status}{}",
+            asset.name,
+            response_detail(&detail)
+        )
+        .into());
+    }
+    let mut file = File::create(destination)?;
+    std::io::copy(&mut response, &mut file)
+        .map_err(|error| format!("cannot save release asset {}: {error}", asset.name))?;
+    file.flush()?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn response_detail(body: &str) -> String {
+    let detail = body.trim().chars().take(512).collect::<String>();
     if detail.is_empty() {
-        "command failed without an error message".into()
+        String::new()
     } else {
-        detail
+        format!(": {detail}")
     }
 }
 
@@ -316,12 +368,7 @@ fn deploy_executable(downloaded: &Path, destination: &Path) -> Result<bool> {
 
     let source = powershell_literal(&staging);
     let target = powershell_literal(destination);
-    let script = format!(
-        "$ErrorActionPreference='Stop'; Wait-Process -Id {} -ErrorAction SilentlyContinue; \
-         $done=$false; for($i=0; $i -lt 50; $i++) {{ try {{ Move-Item -LiteralPath '{source}' -Destination '{target}' -Force; $done=$true; break }} catch {{ Start-Sleep -Milliseconds 200 }} }}; \
-         if(-not $done) {{ exit 1 }}",
-        std::process::id()
-    );
+    let script = windows_update_script(std::process::id(), &source, &target);
     let mut helper = Command::new("powershell.exe");
     helper
         .args(WINDOWS_UPDATE_POWERSHELL_ARGS)
@@ -337,6 +384,16 @@ fn deploy_executable(downloaded: &Path, destination: &Path) -> Result<bool> {
         return Err(format!("cannot start the Windows update helper: {error}").into());
     }
     Ok(true)
+}
+
+#[cfg(any(windows, test))]
+fn windows_update_script(process_id: u32, source: &str, target: &str) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; Wait-Process -Id {} -ErrorAction SilentlyContinue; \
+         $done=$false; for($i=0; $i -lt 50; $i++) {{ try {{ Move-Item -LiteralPath '{source}' -Destination '{target}' -Force; $done=$true; break }} catch {{ Start-Sleep -Milliseconds 200 }} }}; \
+         if(-not $done) {{ Remove-Item -LiteralPath '{source}' -Force -ErrorAction SilentlyContinue; exit 1 }}",
+        process_id
+    )
 }
 
 #[cfg(windows)]
@@ -422,6 +479,7 @@ impl Drop for UpdateTempDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{net::TcpListener, thread};
 
     fn temporary_directory(name: &str) -> PathBuf {
         let path = env::temp_dir().join(format!(
@@ -474,6 +532,72 @@ mod tests {
     }
 
     #[test]
+    fn public_release_metadata_selects_assets_by_exact_name() {
+        let release: GitHubRelease = serde_json::from_str(
+            r#"{
+                "tag_name":"v0.0.267",
+                "assets":[
+                    {"name":"me-linux-x86_64","browser_download_url":"https://github.com/LytsingStudio/me-rust/releases/download/v0.0.267/me-linux-x86_64"},
+                    {"name":"SHA256SUMS","browser_download_url":"https://github.com/LytsingStudio/me-rust/releases/download/v0.0.267/SHA256SUMS"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(release.tag_name, "v0.0.267");
+        assert_eq!(
+            release_asset(&release, "me-linux-x86_64").unwrap().name,
+            "me-linux-x86_64"
+        );
+        assert!(release_asset(&release, "me-linux-arm64").is_err());
+    }
+
+    #[test]
+    fn update_temporary_directory_removes_partial_downloads_on_drop() {
+        let path = {
+            let temporary = UpdateTempDirectory::create().unwrap();
+            let path = temporary.path().to_owned();
+            fs::write(path.join("partial-download"), b"partial").unwrap();
+            assert!(path.exists());
+            path
+        };
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn release_asset_download_streams_directly_to_the_target_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /asset "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nrelease-bytes!",
+                )
+                .unwrap();
+        });
+        let directory = temporary_directory("download");
+        let destination = directory.join("asset");
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let asset = GitHubReleaseAsset {
+            name: "asset".into(),
+            browser_download_url: format!("http://{address}/asset"),
+        };
+
+        download_asset(&client, &asset, &destination).unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"release-bytes!");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn windows_helper_normalizes_verbatim_paths_and_quotes_literals() {
         assert_eq!(
             WINDOWS_UPDATE_POWERSHELL_ARGS,
@@ -492,6 +616,10 @@ mod tests {
             powershell_literal_text(r"\\?\UNC\server\share\me.exe"),
             r"\\server\share\me.exe"
         );
+        let script = windows_update_script(42, "C:\\staged-me.exe", "C:\\me.exe");
+        assert!(script.contains("Wait-Process -Id 42"));
+        assert!(script.contains("Move-Item -LiteralPath 'C:\\staged-me.exe'"));
+        assert!(script.contains("Remove-Item -LiteralPath 'C:\\staged-me.exe'"));
     }
 
     #[test]
