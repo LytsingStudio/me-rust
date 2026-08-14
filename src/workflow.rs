@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     Result, agent_title,
-    config::{ModelConfig, WorkspaceConfig},
+    config::{ModelConfig, WorkspaceConfig, create_private_directory},
     event::{
         AgentKind, EdbMutation, Event, EventDataBase, EventId, agent_kind_definition,
         latest_agent_turn,
@@ -18,6 +18,7 @@ use crate::{
     model::ModelRuntime,
     orchestrator::{self, AgentRuntime, ApiActivitySnapshot, InputDraft, latest_model},
     terminal::{TerminalFrame, TerminalSessionPreview},
+    toolbox::WORKSPACE_TEMP_DIRECTORY,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -584,6 +585,17 @@ impl WorkflowHandle {
             .join(format!("{id}.edb"))
     }
 
+    pub(crate) fn workspace_path(&self) -> &Path {
+        &self.shared.workspace
+    }
+
+    pub(crate) fn temporary_directory(&self, id: &AgentId) -> PathBuf {
+        self.shared
+            .workspace
+            .join(WORKSPACE_TEMP_DIRECTORY)
+            .join(id.as_str())
+    }
+
     pub(crate) fn deletion_blocker(&self, id: &AgentId) -> Result<Option<String>> {
         let children = self.unmanaged_child_agent_ids(id)?;
         if !children.is_empty() {
@@ -661,7 +673,7 @@ impl WorkflowHandle {
             match build_agent_runtime(self, &manager, manager_path, definition, model, effort) {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    remove_incomplete_edb(manager_path, &error)?;
+                    remove_incomplete_agent(self, &manager, manager_path, &error)?;
                     return Err(error);
                 }
             };
@@ -687,7 +699,7 @@ impl WorkflowHandle {
             Ok(worker) => worker,
             Err(error) => {
                 drop(manager_runtime);
-                remove_incomplete_edb(manager_path, &error)?;
+                remove_incomplete_agent(self, &manager, manager_path, &error)?;
                 return Err(error);
             }
         };
@@ -706,8 +718,8 @@ impl WorkflowHandle {
             Ok(worker_runtime) => Ok((manager_runtime, worker, worker_runtime)),
             Err(error) => {
                 drop(manager_runtime);
-                let worker_cleanup = remove_incomplete_edb(&worker_path, &error);
-                let manager_cleanup = remove_incomplete_edb(manager_path, &error);
+                let worker_cleanup = remove_incomplete_agent(self, &worker, &worker_path, &error);
+                let manager_cleanup = remove_incomplete_agent(self, &manager, manager_path, &error);
                 worker_cleanup.and(manager_cleanup)?;
                 Err(error)
             }
@@ -747,8 +759,8 @@ impl WorkflowHandle {
                 (id.clone(), manager_runtime),
                 (worker.clone(), worker_runtime),
             ) {
-                let _ = fs::remove_file(path);
-                let _ = fs::remove_file(self.edb_path(&worker));
+                let _ = remove_incomplete_agent(self, &id, &path, &error);
+                let _ = remove_incomplete_agent(self, &worker, &self.edb_path(&worker), &error);
                 return Err(error);
             }
         } else {
@@ -795,8 +807,8 @@ impl WorkflowHandle {
                 (id.clone(), manager_runtime),
                 (worker.clone(), worker_runtime),
             ) {
-                let _ = fs::remove_file(&path);
-                let _ = fs::remove_file(self.edb_path(&worker));
+                let _ = remove_incomplete_agent(self, &id, &path, &error);
+                let _ = remove_incomplete_agent(self, &worker, &self.edb_path(&worker), &error);
                 return Err(error);
             }
             return Ok(id);
@@ -804,21 +816,14 @@ impl WorkflowHandle {
         let runtime = match build_agent_runtime(self, &id, &path, None, None, None) {
             Ok(runtime) => runtime,
             Err(error) => {
-                let cleanup = fs::remove_file(&path);
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
-                        Err(error)
-                    }
-                    Err(cleanup_error) => Err(format!(
-                        "{error}; failed to remove incomplete cloned EDB {}: {cleanup_error}",
-                        path.display()
-                    )
-                    .into()),
-                };
+                remove_incomplete_agent(self, &id, &path, &error)?;
+                return Err(error);
             }
         };
-        self.insert_runtime(id.clone(), runtime)?;
+        if let Err(error) = self.insert_runtime(id.clone(), runtime) {
+            remove_incomplete_agent(self, &id, &path, &error)?;
+            return Err(error);
+        }
         Ok(id)
     }
 
@@ -863,20 +868,15 @@ impl WorkflowHandle {
         let runtime = match build_agent_runtime(self, &id, &path, Some(definition), model, effort) {
             Ok(runtime) => runtime,
             Err(error) => {
-                return match fs::remove_file(&path) {
-                    Ok(()) => Err(error),
-                    Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {
-                        Err(error)
-                    }
-                    Err(cleanup_error) => Err(format!(
-                        "{error}; failed to remove incomplete EDB {}: {cleanup_error}",
-                        path.display()
-                    )
-                    .into()),
-                };
+                remove_incomplete_agent(self, &id, &path, &error)?;
+                return Err(error);
             }
         };
-        self.insert_runtime(id, runtime)
+        if let Err(error) = self.insert_runtime(id.clone(), runtime) {
+            remove_incomplete_agent(self, &id, &path, &error)?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn create_sub_agent(
@@ -965,7 +965,10 @@ impl WorkflowHandle {
             .ok_or_else(|| format!("Agent {id} disappeared while being deleted"))?;
         agents.remove(index);
         drop(agents);
+        drop(runtime);
+        let temporary_cleanup = remove_agent_temporary_directory(&self.temporary_directory(id));
         self.bump_revision();
+        temporary_cleanup?;
         Ok(())
     }
 
@@ -1202,7 +1205,71 @@ fn remove_incomplete_edb(path: &Path, original: &dyn std::fmt::Display) -> Resul
     }
 }
 
+fn remove_incomplete_agent(
+    workflow: &WorkflowHandle,
+    id: &AgentId,
+    edb_path: &Path,
+    original: &dyn std::fmt::Display,
+) -> Result<()> {
+    let edb_cleanup = remove_incomplete_edb(edb_path, original);
+    let temporary_cleanup = remove_agent_temporary_directory(&workflow.temporary_directory(id));
+    edb_cleanup.and(temporary_cleanup)
+}
+
+fn remove_agent_temporary_directory(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect Agent temporary directory {}: {error}",
+                path.display()
+            )
+            .into());
+        }
+    };
+    let result = if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        fs::remove_file(path)
+    } else {
+        fs::remove_dir_all(path)
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to remove Agent temporary directory {}: {error}",
+            path.display()
+        )
+        .into()),
+    }
+}
+
 fn build_agent_runtime(
+    workflow: &WorkflowHandle,
+    id: &AgentId,
+    path: &Path,
+    requested_definition: Option<AgentDefinition>,
+    requested_model: Option<String>,
+    requested_effort: Option<String>,
+) -> Result<AgentRuntime> {
+    let temporary_directory = workflow.temporary_directory(id);
+    let temporary_directory_existed = temporary_directory.exists();
+    create_private_directory(&temporary_directory)?;
+    let result = build_agent_runtime_inner(
+        workflow,
+        id,
+        path,
+        requested_definition,
+        requested_model,
+        requested_effort,
+    );
+    if result.is_err() && !temporary_directory_existed {
+        let _ = remove_agent_temporary_directory(&temporary_directory);
+    }
+    result
+}
+
+fn build_agent_runtime_inner(
     workflow: &WorkflowHandle,
     id: &AgentId,
     path: &Path,
@@ -1336,6 +1403,11 @@ mod tests {
 
         let mut workflow =
             Workflow::open(&directory, config(), vec![model()]).expect("open workflow");
+        let main_temporary = directory.join(".me/tmp/main");
+        let existing_temporary = directory.join(".me/tmp/agent-existing");
+        assert!(main_temporary.is_dir());
+        assert!(existing_temporary.is_dir());
+        assert_ne!(main_temporary, existing_temporary);
         assert_eq!(
             workflow.agent_ids(),
             vec![
@@ -1349,6 +1421,9 @@ mod tests {
         );
         assert_eq!(workflow.revision(), 0);
         let added = workflow.create_agent().unwrap();
+        let added_temporary = directory.join(".me/tmp").join(added.as_str());
+        assert!(added_temporary.is_dir());
+        fs::write(added_temporary.join("scratch.txt"), "temporary").unwrap();
         assert!(matches!(
             workflow.edb_events(&added).unwrap().first(),
             Some(Event::AgentKindDef(_))
@@ -1357,6 +1432,9 @@ mod tests {
         workflow.delete_agent(&added).unwrap();
         assert!(!workflow.contains(&added));
         assert!(!path.exists());
+        assert!(!added_temporary.exists());
+        assert!(main_temporary.is_dir());
+        assert!(existing_temporary.is_dir());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1463,6 +1541,8 @@ mod tests {
             let children = workflow.handle.child_agent_ids(&main).unwrap();
             assert_eq!(children.len(), 1);
             let worker = children[0].clone();
+            assert!(directory.join(".me/tmp/main").is_dir());
+            assert!(directory.join(".me/tmp").join(worker.as_str()).is_dir());
             assert_eq!(workflow.orchestrator_name(&worker).unwrap(), "worker-agent");
             assert!(
                 !workflow
@@ -1479,16 +1559,32 @@ mod tests {
         let main = AgentId::new("main").unwrap();
         assert_eq!(
             workflow.handle.child_agent_ids(&main).unwrap(),
-            vec![worker]
+            vec![worker.clone()]
         );
         assert_eq!(workflow.agent_ids().len(), 2);
         let added = workflow.create_agent().unwrap();
-        assert_eq!(workflow.handle.child_agent_ids(&added).unwrap().len(), 1);
+        let added_worker = workflow.handle.child_agent_ids(&added).unwrap()[0].clone();
+        assert!(directory.join(".me/tmp").join(added.as_str()).is_dir());
+        assert!(
+            directory
+                .join(".me/tmp")
+                .join(added_worker.as_str())
+                .is_dir()
+        );
         assert_eq!(workflow.agent_ids().len(), 4);
         workflow.delete_agent(&added).unwrap();
+        assert!(!directory.join(".me/tmp").join(added.as_str()).exists());
+        assert!(
+            !directory
+                .join(".me/tmp")
+                .join(added_worker.as_str())
+                .exists()
+        );
         workflow.delete_agent(&main).unwrap();
         assert!(workflow.agent_ids().is_empty());
         assert!(!directory.join(".me/edb/main.edb").exists());
+        assert!(!directory.join(".me/tmp/main").exists());
+        assert!(!directory.join(".me/tmp").join(worker.as_str()).exists());
         fs::remove_dir_all(directory).unwrap();
     }
 
