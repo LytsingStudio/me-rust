@@ -2161,27 +2161,27 @@ impl MainAgent {
         on_event: &mut dyn FnMut(&EventDataBase) -> Result<()>,
     ) -> Result<CompactOutcome> {
         let kind = self.compact_kind;
-        let worker_active_sessions = (kind == CompactKind::WorkerSingleTurn)
-            .then(|| self.worker_compact_active_sessions())
-            .transpose()?;
-        let compact_id = edb.append_compact_started(tool_call_id, prompt_id, kind)?;
+        let active_sessions = self.compact_active_sessions()?;
+        let multi_turn_active_sessions = (kind.is_multi_turn() && active_sessions.has_sessions)
+            .then_some(active_sessions.json.as_str());
+        let stages = compact::stages(kind, multi_turn_active_sessions.is_some());
+        let compact_id = edb.append_compact_started_with_stage_count(
+            tool_call_id,
+            prompt_id,
+            kind,
+            u8::try_from(stages.len())?,
+        )?;
         on_event(edb)?;
 
         let visible_catalog = self.visible_catalog(models.active_model())?;
         let mut completed_stages = Vec::new();
-        for stage in compact::stages(kind).iter().copied() {
+        for stage in stages.iter().copied() {
             let prompt = match kind {
-                CompactKind::WorkerSingleTurn => compact::worker_prompt(
-                    worker_active_sessions
-                        .as_deref()
-                        .expect("Worker compact sessions were captured"),
-                ),
+                CompactKind::WorkerSingleTurn => compact::worker_prompt(&active_sessions.json),
                 CompactKind::MainAgentMultiTurn | CompactKind::ManagerMultiTurn => {
-                    compact::prompt(kind, stage)
-                        .ok_or_else(|| {
-                            format!("Compact kind {kind} has no prompt for stage {stage:?}")
-                        })?
-                        .to_owned()
+                    compact::prompt(kind, stage, multi_turn_active_sessions).ok_or_else(|| {
+                        format!("Compact kind {kind} has no prompt for stage {stage:?}")
+                    })?
                 }
             };
             let mut context = main_model_context_with_toolboxes_and_environment(
@@ -2193,15 +2193,19 @@ impl MainAgent {
             )?;
             context.tools.clear();
             for (previous_stage, content) in &completed_stages {
-                let previous_prompt =
-                    compact::prompt(kind, Some(*previous_stage)).ok_or_else(|| {
-                        format!(
-                            "Compact kind {kind} has no prompt for completed stage {previous_stage}"
-                        )
-                    })?;
+                let previous_prompt = compact::prompt(
+                    kind,
+                    Some(*previous_stage),
+                    multi_turn_active_sessions,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "Compact kind {kind} has no prompt for completed stage {previous_stage}"
+                    )
+                })?;
                 context.push(
                     "user",
-                    system_prompt_injection_envelope("compact", previous_prompt),
+                    system_prompt_injection_envelope("compact", &previous_prompt),
                 );
                 context.push("assistant", content);
             }
@@ -2251,7 +2255,7 @@ impl MainAgent {
         Ok(CompactOutcome::Completed)
     }
 
-    fn worker_compact_active_sessions(&self) -> Result<String> {
+    fn compact_active_sessions(&self) -> Result<CompactActiveSessions> {
         let observer = self.toolboxes.observer();
         let mut errors = Vec::new();
         let terminal_sessions = match observer.active_terminal_sessions() {
@@ -2259,6 +2263,7 @@ impl MainAgent {
                 .into_iter()
                 .map(|session| {
                     json!({
+                        "tool": "Terminal",
                         "session_id": session.session_id,
                         "state": "live",
                         "width": session.width,
@@ -2276,6 +2281,7 @@ impl MainAgent {
                 .into_iter()
                 .map(|page| {
                     json!({
+                        "tool": "WebBrowser",
                         "page_id": page.page_id,
                         "state": page.state,
                         "title": page.title,
@@ -2288,11 +2294,15 @@ impl MainAgent {
                 Vec::new()
             }
         };
-        Ok(serde_json::to_string(&json!({
+        let has_sessions = !terminal_sessions.is_empty() || !web_browser_pages.is_empty();
+        Ok(CompactActiveSessions {
+            has_sessions,
+            json: serde_json::to_string(&json!({
             "terminal_sessions": terminal_sessions,
             "web_browser_pages": web_browser_pages,
             "observation_errors": errors,
-        }))?)
+            }))?,
+        })
     }
 
     fn request_compact_stage(
@@ -3027,6 +3037,11 @@ enum CompactStageRequestOutcome {
     Completed(String),
     Failed(String),
     Aborted,
+}
+
+struct CompactActiveSessions {
+    json: String,
+    has_sessions: bool,
 }
 
 fn completed_response_is_empty(has_assistant_characters: bool, has_valid_tool_call: bool) -> bool {
@@ -4577,6 +4592,7 @@ fn compact_states(
         match update.state {
             CompactState::Started => {
                 if update.id != update.compact_id
+                    || !update.kind.accepts_stage_count(update.total_stages)
                     || update.stage.is_some()
                     || !update.content.is_empty()
                     || !update.detail.is_empty()
@@ -4629,9 +4645,14 @@ fn compact_states(
                 let Some(Event::CompactStateUpdate(started)) = edb.get(*compact_id) else {
                     return Err(format!("Compact {} start is missing", update.compact_id));
                 };
-                let expected = CompactStage::MULTI_TURN.get(stages.len()).copied();
+                let completed_stage_count = stages.len();
+                let expected = started
+                    .kind
+                    .stages(started.total_stages)
+                    .and_then(|plan| plan.get(completed_stage_count).copied());
                 if !started.kind.is_multi_turn()
                     || update.kind != started.kind
+                    || update.total_stages != started.total_stages
                     || update.tool_call_id != started.tool_call_id
                     || update.prompt_id != started.prompt_id
                     || update.stage != expected
@@ -4675,6 +4696,7 @@ fn compact_states(
                 if update.tool_call_id != started.tool_call_id
                     || update.prompt_id != started.prompt_id
                     || update.kind != started.kind
+                    || update.total_stages != started.total_stages
                     || update.stage.is_some()
                 {
                     return Err(format!("Compact {} identity changed", update.compact_id));
@@ -4714,10 +4736,17 @@ fn compact_states(
                             ));
                         }
                     } else {
-                        if stages.len() != CompactStage::MULTI_TURN.len()
+                        let expected_stages =
+                            started.kind.stages(started.total_stages).ok_or_else(|| {
+                                format!(
+                                    "Compact {} has invalid stage count {}",
+                                    update.compact_id, started.total_stages
+                                )
+                            })?;
+                        if stages.len() != expected_stages.len()
                             || stages
                                 .iter()
-                                .zip(CompactStage::MULTI_TURN)
+                                .zip(expected_stages.iter().copied())
                                 .any(|((actual, _), expected)| *actual != expected)
                         {
                             return Err(format!(
@@ -8690,8 +8719,9 @@ data: [DONE]
         assert!(worker_system.contains("# Worker authority reminder"));
         assert!(worker_system.ends_with("results you transmit without judgment."));
         assert_eq!(worker.compact_kind, CompactKind::WorkerSingleTurn);
-        let active_sessions: Value =
-            serde_json::from_str(&worker.worker_compact_active_sessions().unwrap()).unwrap();
+        let inventory = worker.compact_active_sessions().unwrap();
+        assert!(!inventory.has_sessions);
+        let active_sessions: Value = serde_json::from_str(&inventory.json).unwrap();
         assert_eq!(active_sessions["terminal_sessions"], json!([]));
         assert_eq!(active_sessions["web_browser_pages"], json!([]));
         assert_eq!(active_sessions["observation_errors"], json!([]));
@@ -8891,6 +8921,166 @@ for line in sys.stdin:
         assert!(!encoded.contains("RUNTIME-PROVIDED ACTIVE TOOL SESSIONS"));
         drop(worker);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn main_and_manager_multi_turn_compact_add_live_session_stage_only_when_needed() {
+        for (label, manager) in [("main", false), ("manager", true)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let outputs = [
+                    "preparation analysis covers the live sessions",
+                    "1. Primary Request and Intent\nContinue the request.",
+                    "2. Key Technical Context and Decisions\nKeep the established design.",
+                    "3. Files, Code, and Artifacts\nNo file changes.",
+                    "4. Problems, Investigations, and Resolutions\nNo unresolved problem.",
+                    "5. Current State and Continuation Plan\nResume the pending operation.",
+                    "6. Active Tool Sessions\nTerminal pty-live-11 runs the command; WebBrowser p0000044 keeps the reference page open.",
+                ];
+                for (index, output) in outputs.into_iter().enumerate() {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_http_json_request(&mut stream);
+                    let encoded = request.to_string();
+                    assert!(encoded.contains(&format!("stage {}", index + 1)));
+                    assert!(encoded.contains("pty-live-11"));
+                    assert!(encoded.contains("p0000044"));
+                    assert!(
+                        request
+                            .get("tools")
+                            .and_then(Value::as_array)
+                            .is_none_or(Vec::is_empty)
+                    );
+                    if index == 6 {
+                        assert!(encoded.contains("`6. Active Tool Sessions`"));
+                        assert!(encoded.contains("authoritative"));
+                    }
+                    write_sse_content(&mut stream, output);
+                }
+            });
+
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "me-{label}-compact-sessions-{}-{nonce}",
+                std::process::id()
+            ));
+            let tools_directory = directory.join(".me/tools");
+            std::fs::create_dir_all(&tools_directory).unwrap();
+            for (name, internal_tool, output) in [
+                (
+                    "Terminal.py",
+                    "__activeSessions",
+                    r#"[{"session_id":"pty-live-11","creation_order":11,"width":120,"height":40,"revision":2}]"#,
+                ),
+                (
+                    "WebBrowser.py",
+                    "__activePages",
+                    r#"{"pages":[{"page_id":"p0000044","url":"https://example.test/reference","title":"Reference","state":"open"}]}"#,
+                ),
+            ] {
+                std::fs::write(
+                    tools_directory.join(name),
+                    format!(
+                        r#"import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    command = request["cmd"]
+    if command == "getTools":
+        output = []
+    elif command == "getBrief":
+        output = "Compact observer fixture."
+    elif command == "execute" and request.get("tool") == {internal_tool:?}:
+        output = json.loads({output:?})
+    else:
+        print(json.dumps({{"id": request["id"], "type": "error", "error": {{"code": "unexpected", "message": "unexpected request", "retryable": False}}}}), flush=True)
+        continue
+    print(json.dumps({{"id": request["id"], "type": "result", "output": output}}), flush=True)
+"#
+                    ),
+                )
+                .unwrap();
+            }
+
+            let mut model = test_model_config(&format!("{label}-compact"), &["unset"]);
+            model.base_url = format!("http://{address}");
+            model.timeout_seconds = 3;
+            let models = ModelRuntime::new(vec![model], &format!("{label}-compact")).unwrap();
+            let mut agent = if manager {
+                MainAgent::new_manager(None)
+            } else {
+                MainAgent::new(None)
+            };
+            agent.configure_workspace(&directory).unwrap();
+            let mut edb = EventDataBase::new();
+            agent.initialize(&mut edb, &models).unwrap();
+            let prompt = edb
+                .append_user_prompt("Continue with the active sessions.")
+                .unwrap();
+            edb.append_agent_turn(prompt, prompt, AgentTurnState::Started, "")
+                .unwrap();
+            let api = edb.append_api_requesting(prompt).unwrap();
+            edb.append_api_state(api, prompt, ApiState::Streaming, "")
+                .unwrap();
+            edb.append_assist_response(prompt, "", true).unwrap();
+            let call = edb
+                .append_tool_call(
+                    api,
+                    prompt,
+                    "compact-live-sessions",
+                    compact::TOOL_NAME,
+                    "{}",
+                )
+                .unwrap();
+            edb.append_api_state(api, prompt, ApiState::Completed, "")
+                .unwrap();
+            edb.append_tool_result(call, ToolResultState::Succeeded, None, "{}")
+                .unwrap();
+
+            assert!(matches!(
+                agent
+                    .run_compact(prompt, call, &mut edb, &models, &mut |_| Ok(()))
+                    .unwrap(),
+                CompactOutcome::Completed
+            ));
+            server.join().unwrap();
+
+            let updates = edb
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    Event::CompactStateUpdate(update) => Some(update),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(updates.first().unwrap().total_stages, 7);
+            assert_eq!(
+                updates
+                    .iter()
+                    .filter(|update| update.state == CompactState::StageCompleted)
+                    .count(),
+                7
+            );
+            assert!(updates.iter().any(|update| {
+                update.stage == Some(CompactStage::ActiveToolSessions)
+                    && update.content.contains("pty-live-11")
+                    && update.content.contains("p0000044")
+            }));
+            assert!(
+                updates
+                    .last()
+                    .unwrap()
+                    .content
+                    .contains("6. Active Tool Sessions")
+            );
+            agent.supports_edb(&edb).unwrap();
+            drop(agent);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
     }
 
     #[test]
@@ -11010,6 +11200,20 @@ for line in sys.stdin:
                 _ => None,
             })
             .expect("Compact must complete");
+        assert!(runtime.edb_events().iter().any(|event| {
+            matches!(
+                event,
+                Event::CompactStateUpdate(update)
+                    if update.state == CompactState::Started && update.total_stages == 6
+            )
+        }));
+        assert!(runtime.edb_events().iter().all(|event| {
+            !matches!(
+                event,
+                Event::CompactStateUpdate(update)
+                    if update.stage == Some(CompactStage::ActiveToolSessions)
+            )
+        }));
         assert!(runtime.edb_events().iter().any(|event| {
             matches!(event, Event::AssistResponse(response) if response.content == "continued after compact")
         }));

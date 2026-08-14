@@ -945,12 +945,14 @@ function addNotice(projection, changes, content, event) {
   });
 }
 
-function compactStageCount(kind) {
+function compactStageCount(kind, totalStages = null) {
+  const persisted = Number(totalStages);
+  if (Number.isInteger(persisted) && persisted > 0) return persisted;
   return kind === "MainAgentMultiTurn" || kind === "ManagerMultiTurn" ? 6 : 1;
 }
 
-function compactProgressText(kind, stage, receivedSseEvents = null) {
-  const total = compactStageCount(kind);
+function compactProgressText(kind, stage, receivedSseEvents = null, totalStages = null) {
+  const total = compactStageCount(kind, totalStages);
   const current = Math.min(Math.max(1, Number(stage) || 1), total);
   const progress = `正在压缩 (${current}/${total}) ...`;
   return receivedSseEvents == null
@@ -960,20 +962,24 @@ function compactProgressText(kind, stage, receivedSseEvents = null) {
 function refreshCompactActivity(projection, changes, revision) {
   const activity = projection._compactActivity;
   if (!activity) return;
-  activity.message.content = compactProgressText(activity.kind, activity.stage);
+  activity.message.content = compactProgressText(
+    activity.kind, activity.stage, null, activity.totalStages,
+  );
   activity.message.revision = revision;
   markProjectedMessageChanged(changes, activity.message);
 }
 
 function beginCompactActivity(projection, changes, event) {
+  const totalStages = compactStageCount(event.kind, event.total_stages);
   const message = appendProjectedMessage(projection, changes, {
     key: `compact:${event.compact_id}`, revision: event.id,
-    kind: "notice", content: compactProgressText(event.kind, 1),
+    kind: "notice", content: compactProgressText(event.kind, 1, null, totalStages),
     timestamp: event.timestamp_ms,
   });
   projection._compactActivity = {
     compactId: event.compact_id,
     kind: event.kind,
+    totalStages,
     stage: 1,
     message,
   };
@@ -982,7 +988,7 @@ function beginCompactActivity(projection, changes, event) {
 function advanceCompactActivity(projection, changes, event) {
   const activity = projection._compactActivity;
   if (!activity || activity.compactId !== event.compact_id) return;
-  activity.stage = Math.min(activity.stage + 1, compactStageCount(activity.kind));
+  activity.stage = Math.min(activity.stage + 1, activity.totalStages);
   refreshCompactActivity(projection, changes, event.id);
 }
 
@@ -991,7 +997,9 @@ function applyCompactApiActivity(projection, apiActivity) {
   const activity = projection._compactActivity;
   if (!activity) return changes;
   const receivedSseEvents = apiActivity.active ? apiActivity.receivedSseEvents : null;
-  const content = compactProgressText(activity.kind, activity.stage, receivedSseEvents);
+  const content = compactProgressText(
+    activity.kind, activity.stage, receivedSseEvents, activity.totalStages,
+  );
   if (activity.message.content === content) return changes;
   activity.message.content = content;
   activity.message.presentationRevision = (activity.message.presentationRevision || 0) + 1;

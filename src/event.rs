@@ -317,11 +317,39 @@ impl CompactKind {
         matches!(self, Self::MainAgentMultiTurn | Self::ManagerMultiTurn)
     }
 
-    pub fn stage_count(self) -> usize {
+    fn base_stage_count(self) -> usize {
         if self.is_multi_turn() {
             CompactStage::MULTI_TURN.len()
         } else {
             1
+        }
+    }
+
+    pub fn accepts_stage_count(self, stage_count: u8) -> bool {
+        match self {
+            Self::MainAgentMultiTurn | Self::ManagerMultiTurn => {
+                usize::from(stage_count) == CompactStage::MULTI_TURN.len()
+                    || usize::from(stage_count)
+                        == CompactStage::MULTI_TURN_WITH_ACTIVE_SESSIONS.len()
+            }
+            Self::WorkerSingleTurn => stage_count == 1,
+        }
+    }
+
+    pub fn stages(self, stage_count: u8) -> Option<&'static [CompactStage]> {
+        match self {
+            Self::MainAgentMultiTurn | Self::ManagerMultiTurn
+                if usize::from(stage_count) == CompactStage::MULTI_TURN.len() =>
+            {
+                Some(&CompactStage::MULTI_TURN)
+            }
+            Self::MainAgentMultiTurn | Self::ManagerMultiTurn
+                if usize::from(stage_count)
+                    == CompactStage::MULTI_TURN_WITH_ACTIVE_SESSIONS.len() =>
+            {
+                Some(&CompactStage::MULTI_TURN_WITH_ACTIVE_SESSIONS)
+            }
+            _ => None,
         }
     }
 }
@@ -344,6 +372,7 @@ pub enum CompactStage {
     FilesCodeAndArtifacts,
     ProblemsInvestigationsAndResolutions,
     CurrentStateAndContinuationPlan,
+    ActiveToolSessions,
 }
 
 impl CompactStage {
@@ -356,6 +385,16 @@ impl CompactStage {
         Self::CurrentStateAndContinuationPlan,
     ];
 
+    pub const MULTI_TURN_WITH_ACTIVE_SESSIONS: [Self; 7] = [
+        Self::Analysis,
+        Self::PrimaryRequestAndIntent,
+        Self::KeyTechnicalContextAndDecisions,
+        Self::FilesCodeAndArtifacts,
+        Self::ProblemsInvestigationsAndResolutions,
+        Self::CurrentStateAndContinuationPlan,
+        Self::ActiveToolSessions,
+    ];
+
     fn code(self) -> u8 {
         match self {
             Self::Analysis => 0,
@@ -364,11 +403,12 @@ impl CompactStage {
             Self::FilesCodeAndArtifacts => 3,
             Self::ProblemsInvestigationsAndResolutions => 4,
             Self::CurrentStateAndContinuationPlan => 5,
+            Self::ActiveToolSessions => 6,
         }
     }
 
     fn from_code(code: u8) -> Result<Self> {
-        Self::MULTI_TURN
+        Self::MULTI_TURN_WITH_ACTIVE_SESSIONS
             .get(usize::from(code))
             .copied()
             .ok_or_else(|| format!("unsupported Compact stage {code}").into())
@@ -384,6 +424,7 @@ impl std::fmt::Display for CompactStage {
             Self::FilesCodeAndArtifacts => "files-code-and-artifacts",
             Self::ProblemsInvestigationsAndResolutions => "problems-investigations-and-resolutions",
             Self::CurrentStateAndContinuationPlan => "current-state-and-continuation-plan",
+            Self::ActiveToolSessions => "active-tool-sessions",
         })
     }
 }
@@ -819,6 +860,7 @@ pub struct CompactStateUpdateEvent {
     pub tool_call_id: EventId,
     pub prompt_id: EventId,
     pub kind: CompactKind,
+    pub total_stages: u8,
     pub state: CompactState,
     pub stage: Option<CompactStage>,
     pub content: String,
@@ -1926,6 +1968,7 @@ impl EventBase for CompactStateUpdateEvent {
             &[self.compact_id, self.tool_call_id, self.prompt_id],
             &[
                 self.kind.code(),
+                self.total_stages,
                 self.state.code(),
                 self.stage.map_or(u8::MAX, CompactStage::code),
             ],
@@ -1935,9 +1978,10 @@ impl EventBase for CompactStateUpdateEvent {
 
     fn getBriefString(&self) -> String {
         format!(
-            "CompactStateUpdateEvent(compact_id={}, kind={}, state={}, stage={})",
+            "CompactStateUpdateEvent(compact_id={}, kind={}, total_stages={}, state={}, stage={})",
             self.compact_id,
             self.kind,
+            self.total_stages,
             self.state,
             self.stage
                 .map_or_else(|| "none".to_owned(), |stage| stage.to_string())
@@ -1946,13 +1990,14 @@ impl EventBase for CompactStateUpdateEvent {
 
     fn getDetailString(&self) -> String {
         format!(
-            "CompactStateUpdateEvent(id={}, timestamp_ms={}, compact_id={}, tool_call_id={}, prompt_id={}, kind={}, state={}, stage={}, content={}, detail={})",
+            "CompactStateUpdateEvent(id={}, timestamp_ms={}, compact_id={}, tool_call_id={}, prompt_id={}, kind={}, total_stages={}, state={}, stage={}, content={}, detail={})",
             self.id,
             self.timestamp_ms,
             self.compact_id,
             self.tool_call_id,
             self.prompt_id,
             self.kind,
+            self.total_stages,
             self.state,
             self.stage
                 .map_or_else(|| "none".to_owned(), |stage| stage.to_string()),
@@ -3082,6 +3127,26 @@ impl EventDataBase {
         prompt_id: EventId,
         kind: CompactKind,
     ) -> Result<EventId> {
+        self.append_compact_started_with_stage_count(
+            tool_call_id,
+            prompt_id,
+            kind,
+            u8::try_from(kind.base_stage_count())?,
+        )
+    }
+
+    pub fn append_compact_started_with_stage_count(
+        &mut self,
+        tool_call_id: EventId,
+        prompt_id: EventId,
+        kind: CompactKind,
+        total_stages: u8,
+    ) -> Result<EventId> {
+        if !kind.accepts_stage_count(total_stages) {
+            return Err(
+                format!("Compact kind {kind} does not support {total_stages} stages").into(),
+            );
+        }
         let Some(Event::ToolCall(call)) = self.get(tool_call_id) else {
             return Err(format!("Compact references missing tool call {tool_call_id}").into());
         };
@@ -3116,6 +3181,7 @@ impl EventDataBase {
             tool_call_id,
             prompt_id,
             kind,
+            total_stages,
             state: CompactState::Started,
             stage: None,
             content: String::new(),
@@ -3160,7 +3226,10 @@ impl EventDataBase {
                 completed.push(update.stage.ok_or("Compact stage event has no stage")?);
             }
         }
-        let expected = CompactStage::MULTI_TURN
+        let expected = started
+            .kind
+            .stages(started.total_stages)
+            .ok_or("multi-turn Compact has an invalid stage count")?
             .get(completed.len())
             .copied()
             .ok_or("all multi-turn Compact stages are already complete")?;
@@ -3178,6 +3247,7 @@ impl EventDataBase {
             tool_call_id: started.tool_call_id,
             prompt_id: started.prompt_id,
             kind: started.kind,
+            total_stages: started.total_stages,
             state: CompactState::StageCompleted,
             stage: Some(stage),
             content,
@@ -3242,10 +3312,14 @@ impl EventDataBase {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            if stages.len() != CompactStage::MULTI_TURN.len()
+            let expected_stages = started
+                .kind
+                .stages(started.total_stages)
+                .ok_or("multi-turn Compact has an invalid stage count")?;
+            if stages.len() != expected_stages.len()
                 || stages
                     .iter()
-                    .zip(CompactStage::MULTI_TURN)
+                    .zip(expected_stages.iter().copied())
                     .any(|((actual, _), expected)| *actual != Some(expected))
             {
                 return Err("multi-turn Compact cannot complete before all stages".into());
@@ -3266,6 +3340,7 @@ impl EventDataBase {
             tool_call_id: started.tool_call_id,
             prompt_id: started.prompt_id,
             kind: started.kind,
+            total_stages: started.total_stages,
             state,
             stage: None,
             content,
@@ -3879,6 +3954,26 @@ fn encode_v36_record(event: &Event) -> Result<Vec<u8>> {
     encode_raw_record(&raw)
 }
 
+fn encode_v37_record(event: &Event) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    encode_varint(event.id(), &mut raw);
+    if let Event::CompactStateUpdate(event) = event {
+        raw.push(19);
+        encode_varint(event.timestamp_ms, &mut raw);
+        encode_varint(event.compact_id, &mut raw);
+        encode_varint(event.tool_call_id, &mut raw);
+        encode_varint(event.prompt_id, &mut raw);
+        raw.push(event.state.code());
+        raw.push(event.kind.code());
+        raw.push(event.stage.map_or(u8::MAX, CompactStage::code));
+        encode_sized_string(&event.content, &mut raw);
+        raw.extend_from_slice(event.detail.as_bytes());
+    } else {
+        raw.extend(encode_event_body(event));
+    }
+    encode_raw_record(&raw)
+}
+
 fn encode_event_v35(event: &Event) -> Vec<u8> {
     let mut raw = Vec::new();
     encode_varint(event.id(), &mut raw);
@@ -4263,6 +4358,7 @@ fn encode_event_body(event: &Event) -> Vec<u8> {
             raw.push(event.state.code());
             raw.push(event.kind.code());
             raw.push(event.stage.map_or(u8::MAX, CompactStage::code));
+            raw.push(event.total_stages);
             encode_sized_string(&event.content, &mut raw);
             raw.extend_from_slice(event.detail.as_bytes());
             raw
@@ -4402,6 +4498,7 @@ fn decode_file(bytes: &[u8]) -> Result<(Vec<Event>, usize, EventId)> {
 enum CompactRecordFormat {
     LegacySingleTurn,
     GenericV36,
+    StrategyV37,
     Current,
 }
 
@@ -4439,6 +4536,17 @@ fn decode_v36_file(bytes: &[u8]) -> Result<(Vec<Event>, usize, EventId)> {
         return Err("invalid EDB v36 file".into());
     }
     decode_file_records(bytes, false, CompactRecordFormat::GenericV36)
+}
+
+fn decode_v37_file(bytes: &[u8]) -> Result<(Vec<Event>, usize, EventId)> {
+    if bytes.len() < FILE_HEADER_SIZE
+        || bytes.get(..4) != Some(b"MEDB")
+        || bytes[4] != 37
+        || bytes[5..8] != [0, 0, 0]
+    {
+        return Err("invalid EDB v37 file".into());
+    }
+    decode_file_records(bytes, false, CompactRecordFormat::StrategyV37)
 }
 
 fn decode_file_records(
@@ -4612,6 +4720,19 @@ pub(crate) fn migrate_compact_strategy_v36_to_v37(bytes: Vec<u8>) -> Result<Vec<
 
     let mut migrated = encode_file_header(next_event_id).to_vec();
     migrated[4] = 37;
+    for event in &events {
+        migrated.extend(encode_v37_record(event)?);
+    }
+    Ok(migrated)
+}
+
+pub(crate) fn migrate_compact_stage_count_v37_to_v38(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    if bytes.len() < FILE_HEADER_SIZE || bytes.get(..4) != Some(b"MEDB") || bytes[4] != 37 {
+        return Err("Compact stage-count migration requires an EDB v37 file".into());
+    }
+    let (events, _, next_event_id) = decode_v37_file(&bytes)?;
+    let mut migrated = encode_file_header(next_event_id).to_vec();
+    migrated[4] = 38;
     for event in &events {
         migrated.extend(encode_record(event)?);
     }
@@ -5029,9 +5150,9 @@ fn decode_event_with_format(
                 .split_first()
                 .ok_or("missing CompactStateUpdateEvent state")?;
             let state = CompactState::from_code(state)?;
-            let (kind, stage, body) =
+            let (kind, stage, total_stages, body) =
                 if matches!(compact_format, CompactRecordFormat::LegacySingleTurn) {
-                    (CompactKind::WorkerSingleTurn, None, body)
+                    (CompactKind::WorkerSingleTurn, None, 1, body)
                 } else {
                     let (&kind, body) = body
                         .split_first()
@@ -5046,7 +5167,9 @@ fn decode_event_with_format(
                                 );
                             }
                         },
-                        CompactRecordFormat::Current => CompactKind::from_code(kind)?,
+                        CompactRecordFormat::StrategyV37 | CompactRecordFormat::Current => {
+                            CompactKind::from_code(kind)?
+                        }
                         CompactRecordFormat::LegacySingleTurn => unreachable!(),
                     };
                     let (&stage, body) = body
@@ -5055,10 +5178,37 @@ fn decode_event_with_format(
                     let stage = (stage != u8::MAX)
                         .then(|| CompactStage::from_code(stage))
                         .transpose()?;
-                    (kind, stage, body)
+                    let (total_stages, body) = match compact_format {
+                        CompactRecordFormat::Current => {
+                            let (&total_stages, body) = body
+                                .split_first()
+                                .ok_or("missing CompactStateUpdateEvent total stages")?;
+                            (total_stages, body)
+                        }
+                        CompactRecordFormat::GenericV36 | CompactRecordFormat::StrategyV37 => {
+                            (u8::try_from(kind.base_stage_count())?, body)
+                        }
+                        CompactRecordFormat::LegacySingleTurn => unreachable!(),
+                    };
+                    (kind, stage, total_stages, body)
                 };
             let (content, detail) = decode_sized_string(body)?;
             let detail = String::from_utf8(detail.to_vec())?;
+            if !kind.accepts_stage_count(total_stages) {
+                return Err(
+                    format!("Compact kind {kind} does not support {total_stages} stages").into(),
+                );
+            }
+            if let Some(stage) = stage
+                && kind
+                    .stages(total_stages)
+                    .is_none_or(|stages| !stages.contains(&stage))
+            {
+                return Err(format!(
+                    "Compact stage {stage} is not part of the {kind} {total_stages}-stage plan"
+                )
+                .into());
+            }
             match state {
                 CompactState::Started
                     if compact_id != id
@@ -5095,6 +5245,7 @@ fn decode_event_with_format(
                 tool_call_id,
                 prompt_id,
                 kind,
+                total_stages,
                 state,
                 stage,
                 content,
@@ -6656,6 +6807,65 @@ mod tests {
     }
 
     #[test]
+    fn multi_turn_compact_with_active_sessions_requires_and_merges_the_seventh_stage() {
+        let directory = temporary_path("active-session-compact-round-trip");
+        let path = directory.join("main.edb");
+        let mut edb = EventDataBase::open(&path).unwrap();
+        let prompt = edb.append_user_prompt("compact live sessions").unwrap();
+        let api = edb.append_api_requesting(prompt).unwrap();
+        let tool = edb
+            .append_tool_call(api, prompt, "compact-live", crate::compact::TOOL_NAME, "{}")
+            .unwrap();
+        edb.append_api_state(api, prompt, ApiState::Completed, "")
+            .unwrap();
+        edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
+            .unwrap();
+        let compact = edb
+            .append_compact_started_with_stage_count(tool, prompt, CompactKind::ManagerMultiTurn, 7)
+            .unwrap();
+        let contents = [
+            "analysis",
+            "1. Primary Request and Intent\nintent",
+            "2. Key Technical Context and Decisions\ndecisions",
+            "3. Files, Code, and Artifacts\nfiles",
+            "4. Problems, Investigations, and Resolutions\nproblems",
+            "5. Current State and Continuation Plan\nnext",
+            "6. Active Tool Sessions\nTerminal pty-9 is running the build.",
+        ];
+        for (stage, content) in CompactStage::MULTI_TURN_WITH_ACTIVE_SESSIONS
+            .into_iter()
+            .zip(contents)
+        {
+            let stage_api = edb.append_api_requesting(prompt).unwrap();
+            edb.append_api_state(stage_api, prompt, ApiState::Streaming, "")
+                .unwrap();
+            edb.append_api_state(stage_api, prompt, ApiState::Completed, "")
+                .unwrap();
+            edb.append_compact_stage(compact, stage, content).unwrap();
+        }
+        let summary = crate::compact::merge_multi_turn_summary(contents.into_iter().skip(1));
+        edb.append_compact_terminal(compact, CompactState::Completed, summary.clone(), "")
+            .unwrap();
+        drop(edb);
+
+        let edb = EventDataBase::open(&path).unwrap();
+
+        assert!(summary.contains("6. Active Tool Sessions"));
+        assert!(matches!(
+            edb.get(compact),
+            Some(Event::CompactStateUpdate(update)) if update.total_stages == 7
+        ));
+        assert!(matches!(
+            edb.events().last(),
+            Some(Event::CompactStateUpdate(update))
+                if update.state == CompactState::Completed
+                    && update.content.contains("Terminal pty-9")
+        ));
+        drop(edb);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn v35_compact_events_migrate_as_worker_single_turn_lifecycles() {
         let directory = temporary_path("compact-v35-migration");
         let path = directory.join("main.edb");
@@ -6708,7 +6918,7 @@ mod tests {
                     |update| update.kind == CompactKind::WorkerSingleTurn && update.stage.is_none()
                 )
         );
-        assert_eq!(fs::read(&path).unwrap()[4], 37);
+        assert_eq!(fs::read(&path).unwrap()[4], 38);
         drop(migrated);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -6750,7 +6960,7 @@ mod tests {
             let mut bytes = encode_file_header(next_event_id).to_vec();
             bytes[4] = 36;
             for event in edb.events() {
-                bytes.extend(encode_record(event).unwrap());
+                bytes.extend(encode_v36_record(event).unwrap());
             }
             fs::create_dir_all(&directory).unwrap();
             fs::write(&path, bytes).unwrap();
@@ -6763,12 +6973,49 @@ mod tests {
             );
             assert!(matches!(
                 migrated.get(compact),
-                Some(Event::CompactStateUpdate(update)) if update.kind == expected
+                Some(Event::CompactStateUpdate(update))
+                    if update.kind == expected && update.total_stages == 6
             ));
-            assert_eq!(fs::read(&path).unwrap()[4], 37);
+            assert_eq!(fs::read(&path).unwrap()[4], 38);
             drop(migrated);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    #[test]
+    fn v37_compacts_migrate_with_their_original_stage_count() {
+        let directory = temporary_path("compact-v37-stage-count");
+        let path = directory.join("main.edb");
+        let mut edb = EventDataBase::new();
+        let prompt = edb.append_user_prompt("legacy compact").unwrap();
+        let api = edb.append_api_requesting(prompt).unwrap();
+        let tool = edb
+            .append_tool_call(api, prompt, "compact", crate::compact::TOOL_NAME, "{}")
+            .unwrap();
+        edb.append_api_state(api, prompt, ApiState::Completed, "")
+            .unwrap();
+        edb.append_tool_result(tool, ToolResultState::Succeeded, None, "{}")
+            .unwrap();
+        let compact = edb
+            .append_compact_started(tool, prompt, CompactKind::MainAgentMultiTurn)
+            .unwrap();
+        let next_event_id = edb.next_event_id();
+        let mut bytes = encode_file_header(next_event_id).to_vec();
+        bytes[4] = 37;
+        for event in edb.events() {
+            bytes.extend(encode_v37_record(event).unwrap());
+        }
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&path, bytes).unwrap();
+
+        let migrated = EventDataBase::open(&path).unwrap();
+        assert!(matches!(
+            migrated.get(compact),
+            Some(Event::CompactStateUpdate(update)) if update.total_stages == 6
+        ));
+        assert_eq!(fs::read(&path).unwrap()[4], 38);
+        drop(migrated);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

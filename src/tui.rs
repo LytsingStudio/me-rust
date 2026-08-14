@@ -18,10 +18,10 @@ use crate::{
         TextStyle as MarkdownTextStyle,
     },
     event::{
-        AgentKind, AgentTurnState, ApiState, ApiUsage, CompactKind, CompactState, EdbMutation,
-        Event, EventDataBase, EventId, ModelChangeCause, ReasoningEffortChangeCause,
-        ToolInfoContent, ToolOutputStream, ToolResultState, effective_conversation_events,
-        effective_ui_events, latest_agent_turn, latest_context_usage,
+        AgentKind, AgentTurnState, ApiState, ApiUsage, CompactState, EdbMutation, Event,
+        EventDataBase, EventId, ModelChangeCause, ReasoningEffortChangeCause, ToolInfoContent,
+        ToolOutputStream, ToolResultState, effective_conversation_events, effective_ui_events,
+        latest_agent_turn, latest_context_usage,
     },
     orchestrator::{UserTurnState, current_user_turn_state},
     terminal::{TerminalColor, TerminalFrame, TerminalSessionPreview, TerminalStyle},
@@ -36,6 +36,9 @@ use crate::{
         WorkMapObjectiveSnapshot, WorkMapPlanSnapshot, WorkMapProjection, WorkMapSnapshot,
     },
 };
+
+#[cfg(test)]
+use crate::event::CompactKind;
 use chrono::{DateTime, Local, Utc};
 use crossterm::{
     cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, RestorePosition, SavePosition, Show},
@@ -109,7 +112,7 @@ struct WorkerActivity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CompactUiActivity {
     compact_id: EventId,
-    kind: CompactKind,
+    total_stages: usize,
     stage: usize,
     message_index: usize,
 }
@@ -585,13 +588,13 @@ impl ChatProjection {
         let message_index = self.messages.len();
         self.messages.push(ChatMessage {
             kind: ChatBlockKind::StateNotice,
-            content: compact_progress_text(update.kind, 1, None),
+            content: compact_progress_text(usize::from(update.total_stages), 1, None),
             timestamp_ms: update.timestamp_ms,
             tool: None,
         });
         self.compact_activity = Some(CompactUiActivity {
             compact_id: update.compact_id,
-            kind: update.kind,
+            total_stages: usize::from(update.total_stages),
             stage: 1,
             message_index,
         });
@@ -605,7 +608,7 @@ impl ChatProjection {
         else {
             return;
         };
-        activity.stage = (activity.stage + 1).min(compact_stage_count(activity.kind));
+        activity.stage = (activity.stage + 1).min(activity.total_stages);
         self.refresh_compact_activity();
     }
 
@@ -614,7 +617,7 @@ impl ChatProjection {
             return;
         };
         if let Some(message) = self.messages.get_mut(activity.message_index) {
-            message.content = compact_progress_text(activity.kind, activity.stage, None);
+            message.content = compact_progress_text(activity.total_stages, activity.stage, None);
         }
     }
 
@@ -625,7 +628,8 @@ impl ChatProjection {
         let received_sse_events = api_activity
             .active
             .then_some(api_activity.received_sse_events);
-        let content = compact_progress_text(activity.kind, activity.stage, received_sse_events);
+        let content =
+            compact_progress_text(activity.total_stages, activity.stage, received_sse_events);
         let Some(message) = self.messages.get_mut(activity.message_index) else {
             return false;
         };
@@ -661,19 +665,15 @@ impl ChatProjection {
     }
 }
 
-fn compact_stage_count(kind: CompactKind) -> usize {
-    kind.stage_count()
-}
-
 fn compact_progress_text(
-    kind: CompactKind,
+    total_stages: usize,
     stage: usize,
     received_sse_events: Option<u64>,
 ) -> String {
     let progress = format!(
         "正在压缩 ({}/{}) ...",
-        stage.min(compact_stage_count(kind)),
-        compact_stage_count(kind),
+        stage.min(total_stages),
+        total_stages,
     );
     received_sse_events.map_or(progress.clone(), |events| format!("{progress} ↓ {events}"))
 }
@@ -9004,6 +9004,7 @@ mod tests {
                 tool_call_id: 0,
                 prompt_id: 0,
                 kind: CompactKind::MainAgentMultiTurn,
+                total_stages: 6,
                 state,
                 stage,
                 content: if state == CompactState::StageCompleted {
@@ -9078,12 +9079,13 @@ mod tests {
             assert_eq!(replayed.messages[0].content, expected);
         }
         assert_eq!(
-            compact_progress_text(CompactKind::WorkerSingleTurn, 1, Some(100)),
+            compact_progress_text(1, 1, Some(100)),
             "正在压缩 (1/1) ... ↓ 100"
         );
+        assert_eq!(compact_progress_text(6, 1, None), "正在压缩 (1/6) ...");
         assert_eq!(
-            compact_progress_text(CompactKind::ManagerMultiTurn, 1, None),
-            "正在压缩 (1/6) ..."
+            compact_progress_text(7, 7, Some(321)),
+            "正在压缩 (7/7) ... ↓ 321"
         );
     }
 
