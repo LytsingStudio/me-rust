@@ -12,14 +12,12 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::Result;
 
 pub const RELEASE_REPOSITORY: &str = "LytsingStudio/me-rust";
 const CHECKSUM_ASSET: &str = "SHA256SUMS";
-const GITHUB_API_VERSION: &str = "2022-11-28";
 const UPDATE_USER_AGENT: &str = concat!("me-rust/", env!("CARGO_PKG_VERSION"));
 
 #[cfg(any(windows, test))]
@@ -30,16 +28,9 @@ struct UpdatePlatform {
     asset: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct GitHubRelease {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublicRelease {
     tag_name: String,
-    assets: Vec<GitHubReleaseAsset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GitHubReleaseAsset {
-    name: String,
-    browser_download_url: String,
 }
 
 impl UpdatePlatform {
@@ -110,12 +101,14 @@ fn update_client() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
-fn latest_release(client: &reqwest::blocking::Client) -> Result<GitHubRelease> {
-    let url = format!("https://api.github.com/repos/{RELEASE_REPOSITORY}/releases/latest");
+fn latest_release(client: &reqwest::blocking::Client) -> Result<PublicRelease> {
+    let url = format!("https://github.com/{RELEASE_REPOSITORY}/releases/latest");
+    latest_release_from_url(client, &url)
+}
+
+fn latest_release_from_url(client: &reqwest::blocking::Client, url: &str) -> Result<PublicRelease> {
     let response = client
         .get(url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
         .send()
         .map_err(|error| format!("cannot query the latest public me release: {error}"))?;
     let status = response.status();
@@ -127,64 +120,72 @@ fn latest_release(client: &reqwest::blocking::Client) -> Result<GitHubRelease> {
         )
         .into());
     }
-    let release: GitHubRelease = response
-        .json()
-        .map_err(|error| format!("cannot decode the latest public me release: {error}"))?;
-    if release.tag_name.trim().is_empty() {
-        return Err("GitHub returned an empty latest release tag".into());
-    }
-    Ok(release)
+    let tag_name = release_tag_from_url(response.url())?;
+    Ok(PublicRelease { tag_name })
 }
 
 fn download_release(
     client: &reqwest::blocking::Client,
-    release: &GitHubRelease,
+    release: &PublicRelease,
     asset: &str,
     directory: &Path,
 ) -> Result<()> {
     for name in [asset, CHECKSUM_ASSET] {
-        let release_asset = release_asset(release, name)?;
-        download_asset(client, release_asset, &directory.join(name))?;
+        let url = release_asset_url(release, name)?;
+        download_asset(client, name, url.as_str(), &directory.join(name))?;
     }
     Ok(())
 }
 
-fn release_asset<'a>(release: &'a GitHubRelease, name: &str) -> Result<&'a GitHubReleaseAsset> {
-    release
-        .assets
-        .iter()
-        .find(|candidate| candidate.name == name)
-        .ok_or_else(|| {
-            format!(
-                "release {} does not contain required asset {name}",
-                release.tag_name
-            )
-            .into()
-        })
+fn release_tag_from_url(url: &reqwest::Url) -> Result<String> {
+    let segments = url
+        .path_segments()
+        .ok_or_else(|| format!("latest release redirected to an invalid URL: {url}"))?
+        .collect::<Vec<_>>();
+    let tag = segments
+        .windows(3)
+        .find(|parts| parts[0] == "releases" && parts[1] == "tag")
+        .map(|parts| parts[2])
+        .filter(|tag| !tag.is_empty())
+        .ok_or_else(|| format!("latest release did not redirect to a versioned release: {url}"))?;
+    release_version(tag)?;
+    Ok(tag.to_owned())
+}
+
+fn release_asset_url(release: &PublicRelease, name: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!(
+        "https://github.com/{RELEASE_REPOSITORY}/releases/download/"
+    ))?;
+    url.path_segments_mut()
+        .map_err(|_| "cannot construct the public release download URL")?
+        .pop_if_empty()
+        .push(&release.tag_name)
+        .push(name);
+    Ok(url)
 }
 
 fn download_asset(
     client: &reqwest::blocking::Client,
-    asset: &GitHubReleaseAsset,
+    name: &str,
+    url: &str,
     destination: &Path,
 ) -> Result<()> {
     let mut response = client
-        .get(&asset.browser_download_url)
+        .get(url)
         .send()
-        .map_err(|error| format!("cannot download release asset {}: {error}", asset.name))?;
+        .map_err(|error| format!("cannot download release asset {name}: {error}"))?;
     let status = response.status();
     if !status.is_success() {
         let detail = response.text().unwrap_or_default();
         return Err(format!(
-            "cannot download release asset {}: HTTP {status}{}",
-            asset.name,
+            "cannot download release asset {name}: HTTP {status}{}",
             response_detail(&detail)
         )
         .into());
     }
     let mut file = File::create(destination)?;
     std::io::copy(&mut response, &mut file)
-        .map_err(|error| format!("cannot save release asset {}: {error}", asset.name))?;
+        .map_err(|error| format!("cannot save release asset {name}: {error}"))?;
     file.flush()?;
     file.sync_all()?;
     Ok(())
@@ -532,24 +533,72 @@ mod tests {
     }
 
     #[test]
-    fn public_release_metadata_selects_assets_by_exact_name() {
-        let release: GitHubRelease = serde_json::from_str(
-            r#"{
-                "tag_name":"v0.0.267",
-                "assets":[
-                    {"name":"me-linux-x86_64","browser_download_url":"https://github.com/LytsingStudio/me-rust/releases/download/v0.0.267/me-linux-x86_64"},
-                    {"name":"SHA256SUMS","browser_download_url":"https://github.com/LytsingStudio/me-rust/releases/download/v0.0.267/SHA256SUMS"}
-                ]
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(release.tag_name, "v0.0.267");
-        assert_eq!(
-            release_asset(&release, "me-linux-x86_64").unwrap().name,
-            "me-linux-x86_64"
+    fn public_release_urls_are_versioned_and_need_no_api_metadata() {
+        let tagged =
+            reqwest::Url::parse("https://github.com/LytsingStudio/me-rust/releases/tag/v0.0.267")
+                .unwrap();
+        assert_eq!(release_tag_from_url(&tagged).unwrap(), "v0.0.267");
+        assert!(
+            release_tag_from_url(
+                &reqwest::Url::parse("https://github.com/LytsingStudio/me-rust/releases/latest")
+                    .unwrap()
+            )
+            .is_err()
         );
-        assert!(release_asset(&release, "me-linux-arm64").is_err());
+        assert!(
+            release_tag_from_url(
+                &reqwest::Url::parse(
+                    "https://github.com/LytsingStudio/me-rust/releases/tag/not-a-version"
+                )
+                .unwrap()
+            )
+            .is_err()
+        );
+
+        let release = PublicRelease {
+            tag_name: "v0.0.267".into(),
+        };
+        assert_eq!(
+            release_asset_url(&release, "me-linux-x86_64")
+                .unwrap()
+                .as_str(),
+            "https://github.com/LytsingStudio/me-rust/releases/download/v0.0.267/me-linux-x86_64"
+        );
+    }
+
+    #[test]
+    fn latest_release_uses_the_public_redirect_instead_of_the_github_api() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /releases/latest "));
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{address}/releases/tag/v0.0.274\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let read = stream.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .starts_with("GET /releases/tag/v0.0.274 ")
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+
+        let release =
+            latest_release_from_url(&client, &format!("http://{address}/releases/latest")).unwrap();
+        server.join().unwrap();
+        assert_eq!(release.tag_name, "v0.0.274");
     }
 
     #[test]
@@ -586,12 +635,13 @@ mod tests {
             .no_proxy()
             .build()
             .unwrap();
-        let asset = GitHubReleaseAsset {
-            name: "asset".into(),
-            browser_download_url: format!("http://{address}/asset"),
-        };
-
-        download_asset(&client, &asset, &destination).unwrap();
+        download_asset(
+            &client,
+            "asset",
+            &format!("http://{address}/asset"),
+            &destination,
+        )
+        .unwrap();
         server.join().unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"release-bytes!");
         fs::remove_dir_all(directory).unwrap();
