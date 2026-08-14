@@ -30,6 +30,7 @@ use crate::{
 };
 
 pub const TOOLBOX_DIRECTORY: &str = ".me/tools";
+pub const WORKSPACE_TEMP_DIRECTORY: &str = ".me/tmp";
 pub const DEFAULT_PYTHON_MAJOR: u8 = 3;
 pub const DEFAULT_PYTHON_MINOR: u8 = 12;
 const DEFAULT_TERMINAL_FILE: &str = "Terminal.py";
@@ -1314,6 +1315,7 @@ impl Python312 {
 }
 
 pub fn ensure_default_toolboxes(workspace: &Path) -> Result<PathBuf> {
+    create_private_directory(&workspace.join(WORKSPACE_TEMP_DIRECTORY))?;
     let directory = workspace.join(TOOLBOX_DIRECTORY);
     create_private_directory(&directory)?;
     if toolbox_paths(workspace)?.is_empty() {
@@ -2036,6 +2038,7 @@ mod tests {
     fn empty_tools_directory_gets_all_default_toolboxes() {
         let workspace = temporary_workspace("default");
         let path = ensure_default_toolboxes(&workspace).unwrap();
+        assert!(workspace.join(WORKSPACE_TEMP_DIRECTORY).is_dir());
         assert_eq!(path.file_name().unwrap(), DEFAULT_TERMINAL_FILE);
         assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_TERMINAL_SOURCE);
         let file = path.parent().unwrap().join(DEFAULT_FILE_FILE);
@@ -2070,6 +2073,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("Custom.py"), "print('custom')").unwrap();
         ensure_default_toolboxes(&workspace).unwrap();
+        assert!(workspace.join(WORKSPACE_TEMP_DIRECTORY).is_dir());
         assert_eq!(
             toolbox_paths(&workspace).unwrap(),
             vec![directory.join("Custom.py")]

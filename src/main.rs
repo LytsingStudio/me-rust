@@ -1068,6 +1068,7 @@ mod tests {
         assert!(workspace.join(".me/tools/Terminal.py").is_file());
         assert!(workspace.join(".me/tools/File.py").is_file());
         assert!(workspace.join(".me/tools/WebBrowser.py").is_file());
+        assert!(workspace.join(".me/tmp").is_dir());
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("是否立即创建"));
         assert!(output.contains("created workspace"));

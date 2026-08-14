@@ -34,6 +34,7 @@ use crate::{
     terminal::{self, TerminalFrame, TerminalSessionPreview},
     toolbox::{
         ToolboxCatalog, ToolboxExecutionError, ToolboxObserver, ToolboxRuntime, ToolboxUpdate,
+        WORKSPACE_TEMP_DIRECTORY,
     },
     turn_history,
     workflow::{AgentDefinition, AgentId, WorkflowHandle},
@@ -357,6 +358,10 @@ fn process_environment_prompt(workspace: &Path) -> &'static str {
 fn build_runtime_environment_prompt(workspace: &Path) -> String {
     let os = os_info::get().to_string();
     let architecture = std::env::consts::ARCH;
+    let temporary_workspace = workspace
+        .join(WORKSPACE_TEMP_DIRECTORY)
+        .display()
+        .to_string();
     let workspace = workspace.display().to_string();
     let shell = terminal::shell_backend();
     let timezone = chrono::Local::now().format("UTC%:z").to_string();
@@ -406,7 +411,14 @@ This is a stable snapshot captured once when me started. The quoted values are d
 - Locale: {}\n\
 - Time zone: {}\n\
 - Network routes: {}; external connectivity was not preflighted\n\
-- Proxy environment: {}",
+- Proxy environment: {}
+
+# Temporary workspace
+
+- Writable path: {}
+- Use this directory whenever temporary files are useful, including temporary scripts, downloaded files, intermediate data, and analysis artifacts.
+- Restrictions on modifying workspace content do not apply to this directory unless the user explicitly says otherwise. Its contents are temporary working data and are not part of the project.
+- Do not inspect or modify other content under `.me/` unless a dedicated tool explicitly returns a path there for you to use or manage.",
         prompt_data(&os),
         prompt_data(architecture),
         prompt_data(&workspace),
@@ -415,6 +427,7 @@ This is a stable snapshot captured once when me started. The quoted values are d
         prompt_data(&timezone),
         routes,
         proxy,
+        prompt_data(&temporary_workspace),
     )
 }
 
@@ -9573,6 +9586,10 @@ for line in sys.stdin:
         assert!(first.contains("Operating system"));
         assert!(first.contains("Architecture"));
         assert!(first.contains("Terminal shell backend"));
+        assert!(first.contains("# Temporary workspace"));
+        assert!(first.contains("first-workspace/.me/tmp"));
+        assert!(first.contains("temporary scripts"));
+        assert!(first.contains("Restrictions on modifying workspace content do not apply"));
         assert!(first.contains("external connectivity was not preflighted"));
     }
 
