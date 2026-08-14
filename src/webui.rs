@@ -1159,7 +1159,16 @@ mod tests {
             STYLE_CSS.contains(".status-context-selector { flex: 0 0 auto; margin-left: auto;")
         );
         assert!(APP_JS.contains("openChoice(\"创建新的会话？\""));
-        assert!(APP_JS.contains("选择该会话使用的编排器。创建后不可更改。"));
+        assert!(APP_JS.contains("选择 Agent 类型。创建后不可更改。"));
+        assert!(APP_JS.contains("标准 (main-agent)"));
+        assert!(APP_JS.contains("单 Agent 模式，响应直接，Token 开销较低"));
+        assert!(APP_JS.contains("协作 (manager-agent)"));
+        assert!(
+            APP_JS
+                .contains("双 Agent 协作，适合复杂任务，减少主模型上下文占用，但总 Token 开销更高")
+        );
+        assert!(APP_JS.contains("聊天 (chatbot)"));
+        assert!(APP_JS.contains("仅进行对话，不使用工作工具"));
         assert!(APP_JS.contains("state.snapshot.orchestrators"));
         assert!(APP_JS.contains("state.snapshot.default_orchestrator"));
         assert!(!APP_JS.contains("创建新的独立 Agent runtime 和 EDB"));

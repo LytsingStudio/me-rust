@@ -2372,8 +2372,16 @@ function openRewind() {
 }
 
 function openAddAgent() {
-  const choices = (state.snapshot.orchestrators || []).map((orchestrator) => ({ value: orchestrator, label: orchestrator }));
-  openChoice("创建新的会话？", "选择该会话使用的编排器。创建后不可更改。", choices, state.snapshot.default_orchestrator,
+  const presentation = {
+    "main-agent": ["标准 (main-agent)", "单 Agent 模式，响应直接，Token 开销较低"],
+    "manager-agent": ["协作 (manager-agent)", "双 Agent 协作，适合复杂任务，减少主模型上下文占用，但总 Token 开销更高"],
+    chatbot: ["聊天 (chatbot)", "仅进行对话，不使用工作工具"],
+  };
+  const choices = (state.snapshot.orchestrators || []).map((orchestrator) => {
+    const [label, detail] = presentation[orchestrator] || [orchestrator, "自定义 Agent"];
+    return { value: orchestrator, label, detail };
+  });
+  openChoice("创建新的会话？", "选择 Agent 类型。创建后不可更改。", choices, state.snapshot.default_orchestrator,
     async (orchestrator) => {
     const payload = await sendCommand({ command: "add_agent", orchestrator });
     const id = payload?.receipt?.agent_id;

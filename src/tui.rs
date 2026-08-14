@@ -3660,6 +3660,9 @@ fn render_overlay(stdout: &mut Stdout, overlay: &OverlayState, input: &str) -> R
     if matches!(overlay, OverlayState::ContextDetail { .. }) {
         return render_context_detail_overlay(stdout, overlay);
     }
+    if matches!(overlay, OverlayState::AgentAdd { .. }) {
+        return render_agent_add_overlay(stdout, overlay);
+    }
     let (terminal_width, terminal_height) = terminal::size()?;
     let screen_width = usize::from(terminal_width.max(1));
     let box_width = screen_width
@@ -3721,6 +3724,81 @@ fn render_overlay(stdout: &mut Stdout, overlay: &OverlayState, input: &str) -> R
     }
     queue!(stdout, Hide)?;
     Ok(())
+}
+
+fn render_agent_add_overlay(stdout: &mut Stdout, overlay: &OverlayState) -> Result<()> {
+    let OverlayState::AgentAdd { choices, selected } = overlay else {
+        return Err("agent add renderer requires an AgentAdd overlay".into());
+    };
+    let (terminal_width, terminal_height) = terminal::size()?;
+    let screen_width = usize::from(terminal_width.max(1));
+    let box_width = screen_width
+        .saturating_sub(4)
+        .clamp(32, 96)
+        .min(screen_width);
+    let rows = agent_add_overlay_rows(choices, *selected, box_width);
+    render_centered_overlay_rows(stdout, &rows, box_width, terminal_height)
+}
+
+fn agent_add_overlay_rows(choices: &[String], selected: usize, box_width: usize) -> Vec<UiRow> {
+    let inner = box_width.saturating_sub(2);
+    let available = inner.saturating_sub(2).max(1);
+    let mut rows = vec![UiRow::new(
+        framed_title("创建新的会话？", box_width),
+        RowTone::OverlayBorder,
+    )];
+    for line in wrap("选择 Agent 类型。创建后不可更改。", available) {
+        rows.push(UiRow::new(framed_line(&line, inner), RowTone::OverlayText));
+    }
+    rows.push(UiRow::new(framed_line("", inner), RowTone::OverlayText));
+    if choices.is_empty() {
+        rows.push(UiRow::new(
+            framed_line("没有可用 Agent", inner),
+            RowTone::OverlayText,
+        ));
+    } else {
+        for (index, orchestrator) in choices.iter().enumerate() {
+            let (label, detail) = agent_type_presentation(orchestrator);
+            rows.push(UiRow::new(
+                framed_line(&label, inner),
+                if index == selected {
+                    RowTone::OverlaySelected
+                } else {
+                    RowTone::OverlayText
+                },
+            ));
+            for line in wrap(detail, available.saturating_sub(2).max(1)) {
+                rows.push(UiRow::new(
+                    framed_line(&format!("  {line}"), inner),
+                    RowTone::OverlayHint,
+                ));
+            }
+        }
+    }
+    rows.push(UiRow::new(
+        framed_line("↑↓ 选择 · Enter 创建 · Esc 取消", inner),
+        RowTone::OverlayHint,
+    ));
+    rows.push(UiRow::new(
+        format!("╰{}╯", "─".repeat(inner)),
+        RowTone::OverlayBorder,
+    ));
+    rows
+}
+
+fn agent_type_presentation(orchestrator: &str) -> (String, &'static str) {
+    match orchestrator {
+        "main-agent" => (
+            "标准 (main-agent)".into(),
+            "单 Agent 模式，响应直接，Token 开销较低",
+        ),
+        "manager-agent" => (
+            "协作 (manager-agent)".into(),
+            "双 Agent 协作，适合复杂任务，减少主模型上下文占用，但总 Token 开销更高",
+        ),
+        "chatbot" => ("聊天 (chatbot)".into(), "仅进行对话，不使用工作工具"),
+        _ => (orchestrator.to_owned(), "自定义 Agent"),
+    }
 }
 
 fn render_context_overlay(stdout: &mut Stdout, overlay: &OverlayState) -> Result<()> {
@@ -4050,9 +4128,12 @@ fn overlay_content(overlay: &OverlayState, input: &str) -> (String, String, Vec<
             *selected,
         ),
         OverlayState::AgentAdd { choices, selected } => (
-            "Add agent".into(),
-            "选择编排器；创建后不可更改".into(),
-            choices.clone(),
+            "创建新的会话？".into(),
+            "选择 Agent 类型。创建后不可更改。".into(),
+            choices
+                .iter()
+                .map(|orchestrator| agent_type_presentation(orchestrator).0)
+                .collect(),
             *selected,
         ),
         OverlayState::AgentDelete {
@@ -8303,9 +8384,53 @@ mod tests {
 
         let id = AgentId::new("agent-a1").unwrap();
         let mut add = OverlayState::AgentAdd {
-            choices: vec!["main-agent".into(), "chatbot".into()],
+            choices: vec![
+                "main-agent".into(),
+                "manager-agent".into(),
+                "chatbot".into(),
+            ],
             selected: 0,
         };
+        let rows = agent_add_overlay_rows(
+            match &add {
+                OverlayState::AgentAdd { choices, .. } => choices,
+                _ => unreachable!(),
+            },
+            0,
+            140,
+        );
+        let copy = rows
+            .iter()
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(copy.contains("创建新的会话？"));
+        assert!(copy.contains("选择 Agent 类型。创建后不可更改。"));
+        assert!(copy.contains("标准 (main-agent)"));
+        assert!(copy.contains("单 Agent 模式，响应直接，Token 开销较低"));
+        assert!(copy.contains("协作 (manager-agent)"));
+        assert!(
+            copy.contains("双 Agent 协作，适合复杂任务，减少主模型上下文占用，但总 Token 开销更高")
+        );
+        assert!(copy.contains("聊天 (chatbot)"));
+        assert!(copy.contains("仅进行对话，不使用工作工具"));
+        assert!(rows.iter().any(|row| {
+            row.text.contains("标准 (main-agent)") && row.tone == RowTone::OverlaySelected
+        }));
+        for width in [32, 48, 96] {
+            assert!(
+                agent_add_overlay_rows(
+                    match &add {
+                        OverlayState::AgentAdd { choices, .. } => choices,
+                        _ => unreachable!(),
+                    },
+                    0,
+                    width,
+                )
+                .iter()
+                .all(|row| display_width(&row.text) <= width)
+            );
+        }
         assert_eq!(
             handle_overlay_key(&mut add, &mut input, KeyCode::Enter),
             OverlayAction::SubmitAgentAdd("main-agent".into())
@@ -8313,7 +8438,16 @@ mod tests {
         handle_overlay_key(&mut add, &mut input, KeyCode::Down);
         assert_eq!(
             handle_overlay_key(&mut add, &mut input, KeyCode::Enter),
+            OverlayAction::SubmitAgentAdd("manager-agent".into())
+        );
+        handle_overlay_key(&mut add, &mut input, KeyCode::Down);
+        assert_eq!(
+            handle_overlay_key(&mut add, &mut input, KeyCode::Enter),
             OverlayAction::SubmitAgentAdd("chatbot".into())
+        );
+        assert_eq!(
+            handle_overlay_key(&mut add, &mut input, KeyCode::Esc),
+            OverlayAction::Close
         );
         let mut delete = OverlayState::AgentDelete {
             id: id.clone(),
