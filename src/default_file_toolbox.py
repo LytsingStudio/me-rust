@@ -434,7 +434,41 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "Search": object_schema(
         {
             "path": PATH_SCHEMA,
-            "matches": {"type": "array", "items": {"type": "object"}},
+            "matches": {
+                "type": "array",
+                "items": object_schema(
+                    {
+                        "path": PATH_SCHEMA,
+                        "column": {"type": "integer"},
+                        "match_length": {"type": "integer"},
+                        "before": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                            "description": "Exact complete context lines before the match, keyed by their 1-based, minimally zero-padded file line numbers.",
+                        },
+                        "match_text": {
+                            "type": "object",
+                            "additionalProperties": {"type": ["string", "object"]},
+                            "minProperties": 1,
+                            "maxProperties": 1,
+                            "description": "The exact matched file line under its 1-based, minimally zero-padded line number. Safe model-context truncation may replace only this value with a text_fragments object.",
+                        },
+                        "after": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                            "description": "Exact complete context lines after the match, keyed by their 1-based, minimally zero-padded file line numbers.",
+                        },
+                    },
+                    [
+                        "path",
+                        "column",
+                        "match_length",
+                        "before",
+                        "match_text",
+                        "after",
+                    ],
+                ),
+            },
             "skipped_binary": {"type": "integer"},
             "truncated": {"type": "boolean"},
         },
@@ -538,7 +572,7 @@ INSTRUCTIONS = {
     "ReadBytes": "The result is base64 and includes the 8-character concurrency fingerprint of the complete file, not only the returned range.",
     "List": "Depth counts levels below path. Results are stable and symbolic-link directories are never traversed.",
     "Find": "Patterns and exclusions match workspace-relative POSIX paths. Results are stable and symbolic-link directories are never traversed.",
-    "Search": "Literal search is the default. Matches use 1-based line and character columns. Text encoding is detected conservatively per file; binary, uncertain, and oversized files are skipped.",
+    "Search": "Literal search is the default. Each match returns before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and exact line text as File.Read. The sole key in match_text is the matching file line; column is 1-based within that line, so no separate line field is returned. Example: {\"path\":\"src/main.rs\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\\n\"},\"match_text\":{\"042\":\"    runtime.start();\\n\"},\"after\":{\"043\":\"}\\n\"}}. With top-level truncate:true, missing before or after keys are omitted context lines; the sole match_text value may instead be a text_fragments object, while its line key and the match metadata remain intact. Text encoding is detected conservatively per file; binary, uncertain, and oversized files are skipped.",
     "Stat": "A missing path is a normal result. Content hashes are returned only for ordinary files, not directories or symbolic links.",
     "MakeDirectory": "parents defaults to false, requiring the immediate parent to exist. Set parents=true to create every missing directory in the path. The target itself must not already exist; existing files, directories, and symbolic links return already_exists.",
     "Create": "The parent directory must already exist. encoding defaults to utf-8 because a new file has no bytes to inspect; bom defaults to false and is allowed only for UTF encodings. Creation fails if the destination exists.",
@@ -1180,6 +1214,14 @@ def split_text_file_lines(text: str) -> list[str]:
     return lines
 
 
+def line_without_ending(line: str) -> str:
+    if line.endswith("\r\n"):
+        return line[:-2]
+    if line.endswith("\r") or line.endswith("\n"):
+        return line[:-1]
+    return line
+
+
 def execute_read(data: dict[str, Any]) -> dict[str, Any]:
     logical = string_arg(data, "path")
     start_line = int_arg(data, "start_line", 1, 1, 2**31 - 1)
@@ -1328,18 +1370,29 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
         except (ToolError, OSError):
             skipped_binary += 1
             continue
-        lines = text.splitlines()
-        for line_index, line in enumerate(lines):
-            for found in pattern.finditer(line):
+        lines = split_text_file_lines(text)
+        line_number_width = max(1, len(str(len(lines))))
+        for line_index, exact_line in enumerate(lines):
+            searchable_line = line_without_ending(exact_line)
+            for found in pattern.finditer(searchable_line):
+                before_start = max(0, line_index - context_before)
+                after_end = min(len(lines), line_index + 1 + context_after)
                 matches.append(
                     {
                         "path": relative,
-                        "line": line_index + 1,
                         "column": found.start() + 1,
                         "match_length": found.end() - found.start(),
-                        "text": line,
-                        "before": lines[max(0, line_index - context_before) : line_index],
-                        "after": lines[line_index + 1 : line_index + 1 + context_after],
+                        "before": {
+                            str(index + 1).zfill(line_number_width): lines[index]
+                            for index in range(before_start, line_index)
+                        },
+                        "match_text": {
+                            str(line_index + 1).zfill(line_number_width): exact_line
+                        },
+                        "after": {
+                            str(index + 1).zfill(line_number_width): lines[index]
+                            for index in range(line_index + 1, after_end)
+                        },
                     }
                 )
                 if len(matches) >= max_matches:

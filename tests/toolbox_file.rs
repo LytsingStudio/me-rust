@@ -276,6 +276,23 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
         "object"
     );
     assert!(read_output["output"]["properties"].get("content").is_none());
+    let search_output = toolbox.query("getOutputSchema", Some("Search"));
+    let search_match = &search_output["output"]["properties"]["matches"]["items"];
+    assert!(
+        search_match["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("match_text"))
+    );
+    assert!(search_match["properties"].get("line").is_none());
+    assert!(search_match["properties"].get("text").is_none());
+    assert_eq!(search_match["properties"]["match_text"]["maxProperties"], 1);
+    let search_instructions = toolbox.query("getInstructions", Some("Search"));
+    let search_instructions = search_instructions["output"].as_str().unwrap();
+    assert!(search_instructions.contains("before, match_text, and after"));
+    assert!(search_instructions.contains("no separate line field"));
+    assert!(search_instructions.contains("top-level truncate:true"));
+    assert!(search_instructions.contains("text_fragments"));
     let create_encodings = toolbox.query("getInputSchema", Some("Create"))["output"]["properties"]
         ["encoding"]["enum"]
         .as_array()
@@ -846,9 +863,19 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
         }),
     );
     assert_eq!(search["output"]["matches"].as_array().unwrap().len(), 2);
-    assert_eq!(search["output"]["matches"][0]["line"], 2);
     assert_eq!(search["output"]["matches"][0]["column"], 1);
-    assert_eq!(search["output"]["matches"][0]["before"], json!(["zero"]));
+    assert_eq!(
+        search["output"]["matches"][0]["before"],
+        json!({"1":"zero\n"})
+    );
+    assert_eq!(
+        search["output"]["matches"][0]["match_text"],
+        json!({"2":"Needle one\n"})
+    );
+    assert_eq!(
+        search["output"]["matches"][0]["after"],
+        json!({"3":"last\n"})
+    );
     assert_eq!(search["output"]["skipped_binary"], 1);
 
     let status = toolbox.execute(
@@ -884,6 +911,21 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
             .map(|number| format!("{number:02}"))
             .collect::<Vec<_>>()
     );
+    let padded_search = toolbox.execute(
+        "Search",
+        json!({
+            "path":"twelve.txt",
+            "query":"line 10",
+            "context_before":1,
+            "context_after":1
+        }),
+    );
+    let padded_match = &padded_search["output"]["matches"][0];
+    assert_eq!(padded_match["before"], json!({"09":"line 9\n"}));
+    assert_eq!(padded_match["match_text"], json!({"10":"line 10\n"}));
+    assert_eq!(padded_match["after"], json!({"11":"line 11\n"}));
+    assert!(padded_match.get("line").is_none());
+    assert!(padded_match.get("text").is_none());
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();

@@ -266,17 +266,17 @@ impl TruncationState {
         let Some(item) = matches.first_mut().and_then(Value::as_object_mut) else {
             return false;
         };
-        if let Some(lines) = item.get_mut("before").and_then(Value::as_array_mut)
+        if let Some(lines) = item.get_mut("before").and_then(Value::as_object_mut)
             && !lines.is_empty()
         {
-            let removed = remove_oldest_batch(lines);
+            let removed = remove_oldest_numbered_batch(lines);
             self.record_prefix("match_context_lines", removed);
             return true;
         }
-        if let Some(lines) = item.get_mut("after").and_then(Value::as_array_mut)
+        if let Some(lines) = item.get_mut("after").and_then(Value::as_object_mut)
             && !lines.is_empty()
         {
-            let removed = remove_newest_batch(lines);
+            let removed = remove_newest_numbered_batch(lines);
             self.removed_units += removed;
             self.details.insert(
                 "match_context_lines".into(),
@@ -287,7 +287,14 @@ impl TruncationState {
         if crop_search_match_text(item) {
             self.removed_units += 1;
             let range = item
-                .get("text")
+                .get("match_text")
+                .and_then(Value::as_object)
+                .and_then(|lines| numbered_line_keys(lines).first().cloned())
+                .and_then(|(_, key)| {
+                    item.get("match_text")
+                        .and_then(Value::as_object)
+                        .and_then(|lines| lines.get(&key))
+                })
                 .map(text_fragment_range)
                 .unwrap_or_else(|| json!({}));
             self.details.insert("match_text".into(), range);
@@ -700,15 +707,6 @@ fn remove_oldest_batch(array: &mut Vec<Value>) -> usize {
     count
 }
 
-fn remove_newest_batch(array: &mut Vec<Value>) -> usize {
-    let count = batch_size(array.len());
-    if count == 0 {
-        return 0;
-    }
-    array.truncate(array.len() - count);
-    count
-}
-
 fn remove_middle_batch(array: &mut Vec<Value>) -> usize {
     if array.is_empty() {
         return 0;
@@ -778,17 +776,27 @@ fn text_fragment(text: &str) -> Option<Value> {
 }
 
 fn crop_search_match_text(item: &mut Map<String, Value>) -> bool {
-    if item.get("text").is_some_and(Value::is_object) {
-        return item.get_mut("text").is_some_and(crop_text_value);
-    }
-    let Some(text) = item.get("text").and_then(Value::as_str).map(str::to_owned) else {
-        return false;
-    };
     let column = item.get("column").and_then(Value::as_u64).unwrap_or(1) as usize;
     let match_length = item
         .get("match_length")
         .and_then(Value::as_u64)
         .unwrap_or(1) as usize;
+    let Some(match_text) = item.get_mut("match_text").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some((_, key)) = numbered_line_keys(match_text).first().cloned() else {
+        return false;
+    };
+    if match_text.get(&key).is_some_and(Value::is_object) {
+        return match_text.get_mut(&key).is_some_and(crop_text_value);
+    }
+    let Some(text) = match_text
+        .get(&key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return false;
+    };
     let char_boundaries = text
         .char_indices()
         .map(|(index, _)| index)
@@ -850,8 +858,8 @@ fn crop_search_match_text(item: &mut Map<String, Value>) -> bool {
             })
         })
         .collect::<Vec<_>>();
-    item.insert(
-        "text".into(),
+    match_text.insert(
+        key,
         json!({"kind":"text_fragments","original_bytes":text.len(),"fragments":fragments}),
     );
     true
@@ -970,6 +978,25 @@ fn numbered_line_keys(lines: &Map<String, Value>) -> Vec<(u64, String)> {
         .collect::<Vec<_>>();
     numbered.sort_by_key(|(number, _)| *number);
     numbered
+}
+
+fn remove_oldest_numbered_batch(lines: &mut Map<String, Value>) -> usize {
+    let numbered = numbered_line_keys(lines);
+    let count = batch_size(numbered.len());
+    for (_, key) in numbered.into_iter().take(count) {
+        lines.remove(&key);
+    }
+    count
+}
+
+fn remove_newest_numbered_batch(lines: &mut Map<String, Value>) -> usize {
+    let numbered = numbered_line_keys(lines);
+    let count = batch_size(numbered.len());
+    let keep = numbered.len().saturating_sub(count);
+    for (_, key) in numbered.into_iter().skip(keep) {
+        lines.remove(&key);
+    }
+    count
 }
 
 fn numbered_lines_range(lines: &Map<String, Value>) -> Value {
@@ -1971,10 +1998,11 @@ mod tests {
     fn file_search_keeps_matches_as_whole_objects() {
         let matches = (0..300)
             .map(|index| {
+                let line = index + 1;
                 json!({
-                    "path":"src/a.rs","line":index + 1,"column":1,
-                    "text":format!("match-{index} {}", "x".repeat(100)),
-                    "before":[],"after":[]
+                    "path":"src/a.rs","column":1,"match_length":5,
+                    "match_text":{line.to_string():format!("match-{index} {}", "x".repeat(100))},
+                    "before":{},"after":{}
                 })
             })
             .collect::<Vec<_>>();
@@ -1985,37 +2013,49 @@ mod tests {
         );
         assert_eq!(result["truncate"], true);
         let retained = result["result"]["detail"]["matches"].as_array().unwrap();
-        assert!(retained.first().unwrap()["line"].as_u64().unwrap() > 1);
-        assert!(retained.iter().all(|item| item.get("path").is_some()
-            && item.get("line").is_some()
-            && item.get("text").is_some()));
+        assert!(
+            retained.first().unwrap()["match_text"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                > 1
+        );
+        assert!(
+            retained
+                .iter()
+                .all(|item| item.get("path").is_some() && item.get("match_text").is_some())
+        );
     }
 
     #[test]
     fn single_huge_search_match_preserves_the_match_and_outer_context_semantics() {
         let text = format!("HEAD{}NEEDLE{}TAIL", "甲".repeat(8_000), "乙".repeat(8_000));
         let column = text.chars().position(|character| character == 'N').unwrap() + 1;
-        let before = (0..20)
-            .map(|index| format!("before-{index}"))
-            .collect::<Vec<_>>();
-        let after = (0..20)
-            .map(|index| format!("after-{index}"))
-            .collect::<Vec<_>>();
+        let before = (1..=20)
+            .map(|line| (line.to_string(), json!(format!("before-{line}"))))
+            .collect::<Map<_, _>>();
+        let after = (22..=41)
+            .map(|line| (line.to_string(), json!(format!("after-{line}"))))
+            .collect::<Map<_, _>>();
         let result = truncate_for_model_with_limit(
             "File.Search",
             wrapper(json!({"matches":[{
-                "path":"a.txt","line":21,"column":column,"match_length":6,
-                "text":text,"before":before,"after":after
+                "path":"a.txt","column":column,"match_length":6,
+                "match_text":{"21":text},"before":before,"after":after
             }],"truncated":false})),
             850,
         );
         assert_eq!(result["truncate"], true);
         let item = &result["result"]["detail"]["matches"][0];
-        let before = item["before"].as_array().unwrap();
-        let after = item["after"].as_array().unwrap();
-        assert!(before.is_empty() || before.last().unwrap() == "before-19");
-        assert!(after.is_empty() || after.first().unwrap() == "after-0");
-        let retained = item["text"]["fragments"]
+        let before = item["before"].as_object().unwrap();
+        let after = item["after"].as_object().unwrap();
+        assert!(before.is_empty() || before.contains_key("20"));
+        assert!(after.is_empty() || after.contains_key("22"));
+        let retained = item["match_text"]["21"]["fragments"]
             .as_array()
             .unwrap()
             .iter()
@@ -2033,13 +2073,13 @@ mod tests {
         let result = truncate_for_model_with_limit(
             "File.Search",
             wrapper(json!({"matches":[{
-                "path":"a.txt","line":1,"column":11,"match_length":matched.chars().count(),
-                "text":text,"before":[],"after":[]
+                "path":"a.txt","column":11,"match_length":matched.chars().count(),
+                "match_text":{"1":text},"before":{},"after":{}
             }],"truncated":false})),
             1_000,
         );
         assert_eq!(result["truncate"], true);
-        let fragments = result["result"]["detail"]["matches"][0]["text"]["fragments"]
+        let fragments = result["result"]["detail"]["matches"][0]["match_text"]["1"]["fragments"]
             .as_array()
             .unwrap();
         let retained = fragments
@@ -2048,6 +2088,8 @@ mod tests {
             .collect::<String>();
         assert!(retained.contains("MATCH-BEGIN"));
         assert!(retained.contains("MATCH-END"));
+        assert!(result["truncate_info"]["ranges"]["match_text"]["removed_byte_start"].is_number());
+        assert!(result["truncate_info"]["ranges"]["match_text"]["removed_byte_end"].is_number());
     }
 
     #[test]
