@@ -312,7 +312,7 @@ fn generated_web_browser_describes_the_raw_snapshot_protocol_without_installing(
     let snapshot_output = toolbox.query("getOutputSchema", Some("Snapshot"));
     assert_eq!(
         snapshot_output["output"]["properties"]["accessibility_tree"]["type"],
-        "string"
+        json!(["string", "object"])
     );
     assert_eq!(
         snapshot_output["output"]["properties"]["screen_path"]["type"],
@@ -377,7 +377,10 @@ fn generated_web_browser_describes_the_raw_snapshot_protocol_without_installing(
     );
 
     let (_, active_pages) = toolbox.execute("__activePages", json!({}));
-    assert_eq!(output(&active_pages), &json!({"pages": []}));
+    assert_eq!(
+        output(&active_pages),
+        &json!({"pages": [], "active_page_id": null})
+    );
 
     assert!(!config.join("runtimes").exists());
     assert!(!config.join("browsers").exists());

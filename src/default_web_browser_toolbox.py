@@ -238,8 +238,8 @@ SNAPSHOT_SCHEMA = object_schema(
         "state": {"type": "string"},
         "kind": SNAPSHOT_KIND,
         "accessibility_tree": {
-            "type": "string",
-            "description": "Unmodified Playwright ARIA snapshot in AI mode. Present for text and both.",
+            "type": ["string", "object"],
+            "description": "Unmodified Playwright ARIA snapshot in AI mode. Present for text and both. A model-context safety crop may return aria_fragments with exact source line ranges; an oversized single text region may use text_fragments with exact byte ranges.",
         },
         "screen_path": {
             "type": "string",
@@ -342,7 +342,11 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "Snapshot": SNAPSHOT_SCHEMA,
     "Pages": object_schema(
-        {"pages": {"type": "array", "items": PAGE_RECORD_SCHEMA}}, ["pages"]
+        {
+            "pages": {"type": "array", "items": PAGE_RECORD_SCHEMA},
+            "active_page_id": {"type": ["string", "null"], "pattern": r"^p[0-9]{7}$"},
+        },
+        ["pages", "active_page_id"],
     ),
     "Back": object_schema(
         {"page_id": PAGE_ID, "navigated": {"type": "boolean"}, "url": {"type": "string"}},
@@ -2473,7 +2477,7 @@ class BrowserRuntime:
             for state in self.pages.values()
             if not state.page.is_closed()
         ]
-        return {"pages": pages}
+        return {"pages": pages, "active_page_id": self._focused_page_id()}
 
     def close_page(self, state: PageState) -> dict[str, Any]:
         state.page.close(run_before_unload=False)
@@ -2583,7 +2587,7 @@ def execute(tool: str, data: dict[str, Any], request_id: int) -> Any:
             or RUNTIME.browser is None
             or not RUNTIME.browser.is_connected()
         ):
-            return {"pages": []}
+            return {"pages": [], "active_page_id": None}
         return RUNTIME.list_pages()
     runtime = browser_runtime()
     runtime.start(lambda message: update(request_id, message))

@@ -32,6 +32,7 @@ use crate::{
         openai_stream_event, openai_stream_usage,
     },
     terminal::{self, TerminalFrame, TerminalSessionPreview},
+    tool_result_truncation,
     toolbox::{
         ToolboxCatalog, ToolboxExecutionError, ToolboxObserver, ToolboxRuntime, ToolboxUpdate,
         WORKSPACE_TEMP_DIRECTORY,
@@ -5194,6 +5195,7 @@ fn main_model_context_with_toolboxes_and_environment(
                     .into());
                 };
                 let content = structured_tool_result(
+                    &call.name,
                     outputs.remove(&result.tool_call_id).unwrap_or_default(),
                     result,
                 )?;
@@ -5366,7 +5368,7 @@ fn preserve_title_exchange_after_context_boundary(
     context.push_value(json!({
         "role": "tool",
         "tool_call_id": call.provider_call_id,
-        "content": structured_tool_result(Vec::new(), &normalized_result)?,
+        "content": structured_tool_result(&call.name, Vec::new(), &normalized_result)?,
     }));
     Ok(())
 }
@@ -5377,6 +5379,7 @@ enum ModelToolUpdate {
 }
 
 fn structured_tool_result(
+    tool_name: &str,
     updates: Vec<ModelToolUpdate>,
     result: &ToolCallResultEvent,
 ) -> Result<String> {
@@ -5419,7 +5422,9 @@ fn structured_tool_result(
                 .expect("terminal tool result is an object")
                 .insert("other_updates".into(), Value::Array(other));
         }
-        return Ok(serde_json::to_string(&value)?);
+        return Ok(serde_json::to_string(
+            &tool_result_truncation::truncate_for_model(tool_name, value),
+        )?);
     }
 
     let mut value = json!({"result": result_value});
@@ -5429,7 +5434,9 @@ fn structured_tool_result(
     if !other.is_empty() {
         object.insert("updates".into(), Value::Array(other));
     }
-    Ok(serde_json::to_string(&value)?)
+    Ok(serde_json::to_string(
+        &tool_result_truncation::truncate_for_model(tool_name, value),
+    )?)
 }
 
 fn resolve_main_system_prompt(
@@ -9881,7 +9888,65 @@ for line in sys.stdin:
         assert_eq!(update["cursor"]["underlying"], "c");
         assert_eq!(result["result"]["state"], "succeeded");
         assert_eq!(result["result"]["exit_code"], Value::Null);
+        assert_eq!(result["truncate"], false);
         assert!(result.get("base_event_id").is_none());
+    }
+
+    #[test]
+    fn model_context_safely_truncates_tool_json_without_changing_edb_detail() {
+        let mut edb = main_agent_pending_tool("File.Read", r#"{"path":"large.txt"}"#);
+        let content = (0..12_000)
+            .map(|line| format!("line-{line:05} {}\n", "内容".repeat(10)))
+            .collect::<String>();
+        let detail = json!({
+            "path":"large.txt",
+            "content":content,
+            "start_line":1,
+            "end_line":12_000,
+            "total_lines":12_000,
+            "eof":true,
+            "truncated":false,
+            "hash":"1234abcd",
+            "size":content.len(),
+            "encoding":"utf-8",
+            "encoding_confidence":1.0,
+            "bom":false
+        });
+        let raw_detail = serde_json::to_string(&detail).unwrap();
+        edb.append_tool_result(10, ToolResultState::Succeeded, None, raw_detail.clone())
+            .unwrap();
+
+        let context = main_model_context(&edb).unwrap();
+        let tool = context
+            .messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .unwrap();
+        let result: Value = serde_json::from_str(tool["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["truncate"], true);
+        assert_eq!(result["truncate_info"]["tool"], "File.Read");
+        assert!(result["result"]["detail"]["content"].is_null());
+        assert_eq!(
+            result["result"]["detail"]["content_segments"][0]["start_line"],
+            1
+        );
+        assert_eq!(
+            result["result"]["detail"]["content_segments"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["end_line"],
+            12_000
+        );
+        let persisted = edb
+            .events()
+            .iter()
+            .find_map(|event| match event {
+                Event::ToolCallResult(result) if result.tool_call_id == 10 => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(persisted.detail, raw_detail);
     }
 
     #[test]

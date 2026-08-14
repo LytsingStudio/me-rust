@@ -1504,7 +1504,11 @@ fn render_catalog_prompt(
     briefs: &[(String, String)],
     excluded_toolbox: Option<&str>,
 ) -> Result<String> {
-    let mut sections = Vec::new();
+    let mut sections = vec![r#"# Tool result envelope
+
+Every tool response is a JSON object with a top-level `truncate` boolean. `truncate:false` means the complete tool result is present. `truncate:true` means ME-RUST safely reduced only the tool's potentially large content before adding it to model context; read `truncate_info` for the retained and omitted original ranges. Existing tool-specific `truncated` fields have their documented collection-time meaning and are independent of this envelope.
+
+Safe truncation never cuts serialized JSON or leaves dangling references. Ordered logs and result lists omit their oldest complete items. Documents and long text retain exact beginning and ending fragments. When a normal string cannot remain contiguous, it is represented as a `text_fragments` object whose fragments carry exact original byte offsets; never treat separated fragments as adjacent original text. A cropped browser accessibility tree uses `aria_fragments`, whose fragments carry exact original line ranges and remain separated by omitted source ranges."#.into()];
     for (toolbox, brief) in briefs {
         if excluded_toolbox == Some(toolbox.as_str()) {
             continue;

@@ -342,7 +342,19 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "Read": object_schema(
         {
             "path": PATH_SCHEMA,
-            "content": {"type": "string"},
+            "content": {"type": ["string", "object", "null"]},
+            "content_segments": {
+                "type": "array",
+                "items": object_schema(
+                    {
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"},
+                        "content": {"type": ["string", "object"]},
+                    },
+                    ["start_line", "end_line", "content"],
+                ),
+                "description": "Exact non-contiguous source ranges present only after model-context safety truncation.",
+            },
             "start_line": {"type": "integer"},
             "end_line": {"type": "integer"},
             "total_lines": {"type": "integer"},
@@ -367,7 +379,20 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "ReadBytes": object_schema(
         {
             "path": PATH_SCHEMA,
-            "base64": {"type": "string"},
+            "base64": {"type": ["string", "null"]},
+            "chunks": {
+                "type": "array",
+                "items": object_schema(
+                    {
+                        "offset": {"type": "integer"},
+                        "length": {"type": "integer"},
+                        "base64": {"type": "string"},
+                    },
+                    ["offset", "length", "base64"],
+                ),
+                "description": "Exact non-contiguous byte ranges present only after model-context safety truncation.",
+            },
+            "returned_length": {"type": "integer"},
             "offset": {"type": "integer"},
             "length": {"type": "integer"},
             "size": {"type": "integer"},
@@ -1240,6 +1265,7 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
                         "path": relative,
                         "line": line_index + 1,
                         "column": found.start() + 1,
+                        "match_length": found.end() - found.start(),
                         "text": line,
                         "before": lines[max(0, line_index - context_before) : line_index],
                         "after": lines[line_index + 1 : line_index + 1 + context_after],
