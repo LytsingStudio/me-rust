@@ -1329,11 +1329,30 @@ impl From<&TerminalSessionPreview> for TerminalPreviewSelection {
     }
 }
 
-#[derive(Default)]
 struct TerminalPreviewRenderer {
     last_session_id: Option<String>,
     last_revision: Option<u64>,
     last_host_size: Option<(u16, u16)>,
+    scroll_top: u64,
+    total_rows: u64,
+    visible_rows: u16,
+    follow_bottom: bool,
+    needs_redraw: bool,
+}
+
+impl Default for TerminalPreviewRenderer {
+    fn default() -> Self {
+        Self {
+            last_session_id: None,
+            last_revision: None,
+            last_host_size: None,
+            scroll_top: 0,
+            total_rows: 0,
+            visible_rows: 0,
+            follow_bottom: true,
+            needs_redraw: true,
+        }
+    }
 }
 
 impl TerminalPreviewRenderer {
@@ -1342,9 +1361,54 @@ impl TerminalPreviewRenderer {
     }
 
     fn is_current(&self, session: &TerminalSessionPreview, host_size: (u16, u16)) -> bool {
-        self.last_session_id.as_deref() == Some(session.session_id.as_str())
+        !self.needs_redraw
+            && self.last_session_id.as_deref() == Some(session.session_id.as_str())
             && self.last_revision == Some(session.revision)
             && self.last_host_size == Some(host_size)
+    }
+
+    fn maximum_scroll_top(&self) -> u64 {
+        self.total_rows.saturating_sub(u64::from(self.visible_rows))
+    }
+
+    fn scroll_up(&mut self, rows: u64) {
+        let next = self.scroll_top.saturating_sub(rows);
+        if next != self.scroll_top {
+            self.scroll_top = next;
+            self.follow_bottom = false;
+            self.needs_redraw = true;
+        }
+    }
+
+    fn scroll_down(&mut self, rows: u64) {
+        let maximum = self.maximum_scroll_top();
+        let next = self.scroll_top.saturating_add(rows).min(maximum);
+        if next != self.scroll_top || !self.follow_bottom && next == maximum {
+            self.scroll_top = next;
+            self.follow_bottom = next == maximum;
+            self.needs_redraw = true;
+        }
+    }
+
+    fn page_rows(&self) -> u64 {
+        u64::from(self.visible_rows.max(1))
+    }
+
+    fn scroll_home(&mut self) {
+        if self.scroll_top != 0 || self.follow_bottom {
+            self.scroll_top = 0;
+            self.follow_bottom = false;
+            self.needs_redraw = true;
+        }
+    }
+
+    fn scroll_end(&mut self) {
+        let maximum = self.maximum_scroll_top();
+        if self.scroll_top != maximum || !self.follow_bottom {
+            self.scroll_top = maximum;
+            self.follow_bottom = true;
+            self.needs_redraw = true;
+        }
     }
 
     fn redraw<W: Write>(
@@ -1361,11 +1425,20 @@ impl TerminalPreviewRenderer {
         }
         let clear_screen = self.last_session_id.as_deref() != Some(frame.session_id.as_str())
             || self.last_host_size != Some(host_size);
-        render_terminal_preview_frame(stdout, frame, host_size, clear_screen)?;
+        self.total_rows = u64::try_from(frame.rows.len()).unwrap_or(u64::MAX);
+        self.visible_rows = host_size.1.saturating_sub(1);
+        let maximum = self.maximum_scroll_top();
+        if self.follow_bottom {
+            self.scroll_top = maximum;
+        } else {
+            self.scroll_top = self.scroll_top.min(maximum);
+        }
+        render_terminal_preview_frame(stdout, frame, host_size, self.scroll_top, clear_screen)?;
         stdout.flush()?;
         self.last_session_id = Some(frame.session_id.clone());
         self.last_revision = Some(frame.revision);
         self.last_host_size = Some(host_size);
+        self.needs_redraw = false;
         Ok(())
     }
 }
@@ -1964,6 +2037,43 @@ pub fn run(
                     continue;
                 }
                 if view == TuiView::TerminalPreview {
+                    let changed = match key.code {
+                        KeyCode::Up => {
+                            preview_renderer.scroll_up(1);
+                            true
+                        }
+                        KeyCode::Down => {
+                            preview_renderer.scroll_down(1);
+                            true
+                        }
+                        KeyCode::PageUp => {
+                            preview_renderer.scroll_up(preview_renderer.page_rows());
+                            true
+                        }
+                        KeyCode::PageDown => {
+                            preview_renderer.scroll_down(preview_renderer.page_rows());
+                            true
+                        }
+                        KeyCode::Home => {
+                            preview_renderer.scroll_home();
+                            true
+                        }
+                        KeyCode::End => {
+                            preview_renderer.scroll_end();
+                            true
+                        }
+                        _ => false,
+                    };
+                    if changed && let Some(agent_id) = current_agent.as_ref() {
+                        refresh_terminal_preview(
+                            backend,
+                            agent_id,
+                            &mut stdout,
+                            &mut preview_selection,
+                            &mut preview_sessions,
+                            &mut preview_renderer,
+                        )?;
+                    }
                     continue;
                 }
                 if view == TuiView::WorkMap {
@@ -3467,23 +3577,24 @@ fn clear_for_full_redraw<W: Write>(stdout: &mut W, purge_scrollback: bool) -> io
     queue!(stdout, Clear(ClearType::All), MoveTo(0, 0), Hide)
 }
 
-fn terminal_preview_fits(frame: &TerminalFrame, host_size: (u16, u16)) -> bool {
-    host_size.0 >= frame.width && host_size.1 >= frame.height.saturating_add(1)
-}
-
 #[cfg(test)]
 fn render_terminal_preview<W: Write>(
     stdout: &mut W,
     frame: &TerminalFrame,
     host_size: (u16, u16),
 ) -> io::Result<()> {
-    render_terminal_preview_frame(stdout, frame, host_size, true)
+    let visible_rows = host_size.1.saturating_sub(1);
+    let scroll_top = u64::try_from(frame.rows.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(u64::from(visible_rows));
+    render_terminal_preview_frame(stdout, frame, host_size, scroll_top, true)
 }
 
 fn render_terminal_preview_frame<W: Write>(
     stdout: &mut W,
     frame: &TerminalFrame,
     host_size: (u16, u16),
+    scroll_top: u64,
     clear_screen: bool,
 ) -> io::Result<()> {
     if clear_screen {
@@ -3491,28 +3602,15 @@ fn render_terminal_preview_frame<W: Write>(
     } else {
         queue!(stdout, Hide)?;
     }
-    if !terminal_preview_fits(frame, host_size) {
-        let message = format!(
-            "Terminal {} 需要至少 {}×{}，当前为 {}×{}；请扩大窗口",
-            frame.session_id,
-            frame.width,
-            frame.height.saturating_add(1),
-            host_size.0,
-            host_size.1
-        );
+    let content_height = host_size.1.saturating_sub(1);
+    for y in 0..content_height {
         queue!(
             stdout,
-            MoveTo(0, 0),
-            SetForegroundColor(STATUS_HINT_COLOR),
-            Print(take_display_width(&message, usize::from(host_size.0))),
+            MoveTo(0, y),
             ResetColor,
             SetAttribute(Attribute::Reset),
-            Hide
+            Clear(ClearType::CurrentLine)
         )?;
-        if host_size.1 > 0 {
-            print_terminal_preview_status(stdout, &frame.session_id, host_size.1 - 1)?;
-        }
-        return Ok(());
     }
 
     let styles = frame
@@ -3521,24 +3619,38 @@ fn render_terminal_preview_frame<W: Write>(
         .map(|definition| (definition.id, &definition.style))
         .collect::<BTreeMap<_, _>>();
     for row in &frame.rows {
-        let Ok(y) = u16::try_from(row.row) else {
+        let Some(relative_row) = row.row.checked_sub(scroll_top) else {
             continue;
         };
-        if y >= frame.height {
+        let Ok(y) = u16::try_from(relative_row) else {
+            continue;
+        };
+        if y >= content_height {
             continue;
         }
-        print_terminal_preview_row(stdout, y, frame.width, row, &styles)?;
+        print_terminal_preview_row(
+            stdout,
+            y,
+            frame.width,
+            host_size.0.min(frame.width),
+            row,
+            &styles,
+        )?;
     }
-    print_terminal_preview_status(stdout, &frame.session_id, host_size.1 - 1)?;
+    if host_size.1 > 0 {
+        print_terminal_preview_status(stdout, &frame.session_id, host_size.1 - 1, host_size.0)?;
+    }
     if frame.cursor.visible
-        && frame.cursor.row < u64::from(frame.height)
-        && frame.cursor.col < frame.width
+        && frame.cursor.row >= scroll_top
+        && frame.cursor.row < scroll_top.saturating_add(u64::from(content_height))
+        && frame.cursor.col < host_size.0.min(frame.width)
     {
         queue!(
             stdout,
             MoveTo(
                 frame.cursor.col,
-                u16::try_from(frame.cursor.row).expect("visible cursor row fits u16")
+                u16::try_from(frame.cursor.row - scroll_top)
+                    .expect("visible terminal preview cursor row fits u16")
             ),
             Show
         )?;
@@ -3551,7 +3663,8 @@ fn render_terminal_preview_frame<W: Write>(
 fn print_terminal_preview_row<W: Write>(
     stdout: &mut W,
     y: u16,
-    width: u16,
+    terminal_width: u16,
+    visible_width: u16,
     row: &crate::terminal::TerminalRowUpdate,
     styles: &BTreeMap<u32, &TerminalStyle>,
 ) -> io::Result<()> {
@@ -3564,7 +3677,7 @@ fn print_terminal_preview_row<W: Write>(
     )?;
     let mut column = 0_u16;
     for run in &row.runs {
-        if run.col >= width {
+        if run.col >= terminal_width || run.col >= visible_width {
             continue;
         }
         if run.col > column {
@@ -3578,15 +3691,19 @@ fn print_terminal_preview_row<W: Write>(
         let default_style = TerminalStyle::default();
         let style = styles.get(&run.style).copied().unwrap_or(&default_style);
         set_terminal_style(stdout, style)?;
-        queue!(stdout, Print(&run.text))?;
-        column = run.col.saturating_add(run.width).min(width);
+        let available = visible_width.saturating_sub(run.col);
+        queue!(
+            stdout,
+            Print(take_display_width(&run.text, usize::from(available)))
+        )?;
+        column = run.col.saturating_add(run.width).min(visible_width);
     }
-    if column < width {
+    if column < visible_width {
         queue!(
             stdout,
             ResetColor,
             SetAttribute(Attribute::Reset),
-            Print(" ".repeat(usize::from(width - column)))
+            Print(" ".repeat(usize::from(visible_width - column)))
         )?;
     }
     queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))?;
@@ -3631,26 +3748,31 @@ fn print_terminal_preview_status<W: Write>(
     stdout: &mut W,
     session_id: &str,
     y: u16,
+    width: u16,
 ) -> io::Result<()> {
     queue!(
         stdout,
         MoveTo(0, y),
         ResetColor,
         SetAttribute(Attribute::Reset),
-        Clear(ClearType::CurrentLine),
-        SetForegroundColor(STATUS_ME_COLOR),
-        Print(" me"),
-        SetForegroundColor(STATUS_HINT_COLOR),
-        Print(" · "),
-        SetForegroundColor(STATUS_ORCHESTRATOR_COLOR),
-        Print("Terminal"),
-        SetForegroundColor(STATUS_HINT_COLOR),
-        Print(" · "),
-        SetForegroundColor(STATUS_MODEL_COLOR),
-        Print(session_id),
-        ResetColor,
-        SetAttribute(Attribute::Reset)
-    )
+        Clear(ClearType::CurrentLine)
+    )?;
+    let mut remaining = usize::from(width);
+    for (text, color) in [
+        (" me", STATUS_ME_COLOR),
+        (" · ", STATUS_HINT_COLOR),
+        ("Terminal", STATUS_ORCHESTRATOR_COLOR),
+        (" · ", STATUS_HINT_COLOR),
+        (session_id, STATUS_MODEL_COLOR),
+    ] {
+        if remaining == 0 {
+            break;
+        }
+        let visible = take_display_width(text, remaining);
+        remaining = remaining.saturating_sub(display_width(&visible));
+        queue!(stdout, SetForegroundColor(color), Print(visible))?;
+    }
+    queue!(stdout, ResetColor, SetAttribute(Attribute::Reset))
 }
 
 fn render_overlay(stdout: &mut Stdout, overlay: &OverlayState, input: &str) -> Result<()> {
@@ -6412,6 +6534,7 @@ mod tests {
             revision: 4,
             width: 8,
             height: 2,
+            viewport: [0, 1],
             style_defs: vec![crate::terminal::TerminalStyleDefinition {
                 id: 1,
                 style: TerminalStyle {
@@ -6999,19 +7122,10 @@ mod tests {
     }
 
     #[test]
-    fn terminal_preview_requires_exact_pty_size_plus_status_row() {
-        let frame = preview_frame();
-        assert!(terminal_preview_fits(&frame, (8, 3)));
-        assert!(terminal_preview_fits(&frame, (120, 40)));
-        assert!(!terminal_preview_fits(&frame, (7, 40)));
-        assert!(!terminal_preview_fits(&frame, (120, 2)));
-    }
-
-    #[test]
     fn terminal_preview_renders_cells_styles_cursor_and_status_without_scaling() {
         let frame = preview_frame();
         let mut output = Vec::new();
-        render_terminal_preview(&mut output, &frame, (12, 5)).unwrap();
+        render_terminal_preview(&mut output, &frame, (40, 5)).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("run"));
         assert!(output.contains("好"));
@@ -7057,16 +7171,66 @@ mod tests {
     }
 
     #[test]
-    fn undersized_terminal_preview_asks_for_a_larger_window() {
+    fn undersized_terminal_preview_clips_without_resizing_or_rejecting_the_frame() {
         let mut frame = preview_frame();
         frame.width = 81;
         let mut output = Vec::new();
-        render_terminal_preview(&mut output, &frame, (80, 3)).unwrap();
+        render_terminal_preview(&mut output, &frame, (4, 3)).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("请扩大窗口"));
-        assert!(output.contains("Terminal"));
-        assert!(output.contains("pty-27"));
-        assert!(!output.contains("run"));
+        assert!(!output.contains("请扩大窗口"));
+        assert!(output.contains("run"));
+    }
+
+    #[test]
+    fn terminal_preview_scrolls_full_history_and_only_follows_output_at_the_bottom() {
+        let mut frame = preview_frame();
+        frame.height = 2;
+        frame.viewport = [4, 5];
+        frame.rows = (0_u64..6)
+            .map(|row| crate::terminal::TerminalRowUpdate {
+                row,
+                wrapped: false,
+                runs: vec![crate::terminal::TerminalRowRun {
+                    col: 0,
+                    width: 5,
+                    text: format!("row-{row}"),
+                    style: 0,
+                }],
+            })
+            .collect();
+        frame.cursor.row = 5;
+
+        let mut renderer = TerminalPreviewRenderer::default();
+        renderer.redraw(&mut Vec::new(), &frame, (12, 3)).unwrap();
+        assert_eq!(renderer.scroll_top, 4);
+        assert!(renderer.follow_bottom);
+
+        renderer.scroll_up(2);
+        renderer.redraw(&mut Vec::new(), &frame, (12, 3)).unwrap();
+        assert_eq!(renderer.scroll_top, 2);
+        assert!(!renderer.follow_bottom);
+
+        frame.revision += 1;
+        frame.viewport = [5, 6];
+        frame.rows.push(crate::terminal::TerminalRowUpdate {
+            row: 6,
+            wrapped: false,
+            runs: vec![crate::terminal::TerminalRowRun {
+                col: 0,
+                width: 5,
+                text: "row-6".into(),
+                style: 0,
+            }],
+        });
+        frame.cursor.row = 6;
+        renderer.redraw(&mut Vec::new(), &frame, (12, 3)).unwrap();
+        assert_eq!(renderer.scroll_top, 2);
+        assert!(!renderer.follow_bottom);
+
+        renderer.scroll_end();
+        renderer.redraw(&mut Vec::new(), &frame, (12, 3)).unwrap();
+        assert_eq!(renderer.scroll_top, 5);
+        assert!(renderer.follow_bottom);
     }
 
     #[test]

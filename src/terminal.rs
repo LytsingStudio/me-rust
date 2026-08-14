@@ -1263,6 +1263,7 @@ pub struct TerminalFrame {
     pub revision: u64,
     pub width: u16,
     pub height: u16,
+    pub viewport: [u64; 2],
     pub style_defs: Vec<TerminalStyleDefinition>,
     pub rows: Vec<TerminalRowUpdate>,
     pub cursor: TerminalCursor,
@@ -1950,7 +1951,23 @@ impl TerminalRenderer {
     fn frame(&self, created: &TerminalCreated, revision: u64) -> TerminalFrame {
         let screen = self.parser.screen();
         let mut styles = StyleTable::default();
-        let rows = render_visible_rows(screen, 0, &mut styles)
+        let (viewport_start, rendered_rows) = if screen.alternate_screen() {
+            (0, render_visible_rows(screen, 0, &mut styles))
+        } else {
+            let (scrollback, rows) = render_primary_rows(screen, 0, &mut styles);
+            (
+                u64::try_from(scrollback).expect("terminal scrollback fits u64"),
+                rows.into_iter()
+                    .map(|(row, rendered)| {
+                        (
+                            u64::try_from(row).expect("terminal preview row fits u64"),
+                            rendered,
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let rows = rendered_rows
             .into_iter()
             .map(|(row, rendered)| TerminalRowUpdate {
                 row,
@@ -1973,9 +1990,15 @@ impl TerminalRenderer {
             revision,
             width: created.width,
             height: created.height,
+            viewport: [
+                viewport_start,
+                viewport_start
+                    .saturating_add(u64::from(created.height))
+                    .saturating_sub(1),
+            ],
             style_defs,
             rows,
-            cursor: cursor_at(screen, 0),
+            cursor: cursor_at(screen, viewport_start),
         }
     }
 
@@ -2681,6 +2704,7 @@ mod tests {
             .unwrap();
         assert_eq!(frame.rows[0].plain_text(), "hello");
         assert_eq!(frame.rows[1].plain_text(), "world");
+        assert_eq!(frame.viewport, [0, 3]);
     }
 
     #[test]
@@ -2716,6 +2740,7 @@ mod tests {
         let frame = observer.frame("pty-10").unwrap().unwrap();
         assert_eq!(frame.width, 40);
         assert_eq!(frame.height, 4);
+        assert_eq!(frame.viewport, [0, 3]);
         assert_eq!(frame.rows[0].plain_text(), "pty-10");
         observer.remove("pty-10");
         assert!(observer.frame("pty-10").unwrap().is_none());
@@ -3168,6 +3193,37 @@ mod tests {
         assert_eq!(first_model_read.plain_text(), "red");
         assert_eq!(first_model_read.style_defs.len(), 1);
         assert!(renderer.capture(20_000).rows.is_empty());
+    }
+
+    #[test]
+    fn read_only_frame_contains_primary_scrollback_and_current_viewport() {
+        let mut renderer = TerminalRenderer::new(2, 20);
+        renderer.process(b"one\r\ntwo\r\nthree\r\nfour");
+        let frame = renderer.frame(
+            &TerminalCreated {
+                session_id: "pty-history".into(),
+                state: "running".into(),
+                shell: "test-shell".into(),
+                width: 20,
+                height: 2,
+                cwd: ".".into(),
+            },
+            9,
+        );
+        assert_eq!(frame.viewport, [2, 3]);
+        assert_eq!(
+            frame
+                .rows
+                .iter()
+                .map(TerminalRowUpdate::plain_text)
+                .collect::<Vec<_>>(),
+            vec!["one", "two", "three", "four"]
+        );
+        assert_eq!(frame.cursor.row, 3);
+
+        let patch = renderer.capture(20_000);
+        assert_eq!(patch.viewport, [2, 3]);
+        assert_eq!(patch.plain_text(), "one\ntwo\nthree\nfour");
     }
 
     #[test]

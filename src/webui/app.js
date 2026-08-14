@@ -30,6 +30,7 @@ const state = {
   view: { kind: "chat", sessionId: null },
   terminals: [],
   terminalRevisions: new Map(),
+  terminalFollowBottom: true,
   expandedTools: new Set(),
   expandedHistoryObjectives: new Set(),
   workerActivityIndexes: new Map(),
@@ -1364,6 +1365,9 @@ function selectAgent(id) {
   state.view = { kind: "chat", sessionId: null };
   state.terminals = [];
   state.terminalRevisions.clear();
+  state.terminalFollowBottom = true;
+  delete elements.terminalScreen.dataset.terminalKey;
+  delete elements.terminalScreen.dataset.revision;
   restoreDraft();
   renderAll();
 }
@@ -1383,6 +1387,10 @@ function renderTabs() {
 
 function showView(view) {
   flushPendingRender();
+  if (view.kind === "terminal"
+      && (state.view.kind !== "terminal" || state.view.sessionId !== view.sessionId)) {
+    state.terminalFollowBottom = true;
+  }
   state.view = view;
   renderTabs();
   renderObjective();
@@ -2235,15 +2243,21 @@ async function renderTerminal() {
     const revisionKey = `${state.selectedAgent}:${sessionId}`;
     const previousRevision = state.terminalRevisions.get(revisionKey) || 0;
     if (frame.revision < previousRevision) return;
-    state.terminalRevisions.set(revisionKey, frame.revision);
-    const metrics = terminalCapacity();
-    if (metrics.columns < frame.width || metrics.rows < frame.height) {
-      showTerminalMessage(`Terminal ${sessionId} 需要至少 ${frame.width}×${frame.height}，当前约为 ${metrics.columns}×${metrics.rows}；请扩大窗口`);
+    const sameRenderedFrame = elements.terminalScreen.dataset.terminalKey === revisionKey
+      && Number(elements.terminalScreen.dataset.revision) === frame.revision;
+    if (sameRenderedFrame) {
+      if (state.terminalFollowBottom) scrollTerminalToBottom();
       return;
     }
+    const switchingTerminal = elements.terminalScreen.dataset.terminalKey !== revisionKey;
+    const scroll = captureTerminalScroll(
+      elements.terminalView,
+      state.terminalFollowBottom || switchingTerminal,
+    );
+    state.terminalRevisions.set(revisionKey, frame.revision);
     elements.terminalMessage.classList.add("hidden");
     elements.terminalScreen.classList.remove("hidden");
-    elements.terminalScreen.style.minWidth = `${frame.width}ch`;
+    elements.terminalScreen.style.width = `${frame.width}ch`;
     const styles = new Map((frame.style_defs || []).map((definition) => [definition.id, definition.style]));
     elements.terminalScreen.innerHTML = (frame.rows || []).map((row) => {
       const runs = (row.runs || []).map((run) => `<span style="left:${run.col}ch;${terminalStyle(styles.get(run.style))}">${escapeHtml(run.text)}</span>`).join("");
@@ -2251,6 +2265,10 @@ async function renderTerminal() {
         ? `<span class="terminal-cursor" style="left:${frame.cursor.col}ch;width:${frame.cursor.wide ? 2 : 1}ch"></span>` : "";
       return `<div class="terminal-row" style="width:${frame.width}ch;position:relative"><span style="position:absolute">${" ".repeat(frame.width)}</span>${runs}${cursor}</div>`;
     }).join("");
+    elements.terminalScreen.dataset.terminalKey = revisionKey;
+    elements.terminalScreen.dataset.revision = String(frame.revision);
+    restoreTerminalScroll(elements.terminalView, scroll);
+    state.terminalFollowBottom = scroll.followBottom;
   } catch (error) {
     showTerminalMessage(error.message);
   }
@@ -2260,18 +2278,27 @@ function showTerminalMessage(message) {
   elements.terminalMessage.textContent = message;
   elements.terminalMessage.classList.remove("hidden");
   elements.terminalScreen.classList.add("hidden");
+  delete elements.terminalScreen.dataset.terminalKey;
+  delete elements.terminalScreen.dataset.revision;
 }
 
-function terminalCapacity() {
-  const canvas = document.createElement("canvas");
-  const context = canvas.getContext("2d");
-  context.font = getComputedStyle(elements.terminalScreen).font;
-  const width = context.measureText("M").width || 8;
-  const lineHeight = parseFloat(getComputedStyle(elements.terminalScreen).lineHeight) || 18;
+function terminalIsNearBottom(view) {
+  return view.scrollHeight - view.scrollTop - view.clientHeight <= 2;
+}
+
+function captureTerminalScroll(view, followBottom) {
   return {
-    columns: Math.floor((elements.terminalView.clientWidth - 40) / width),
-    rows: Math.floor((elements.terminalView.clientHeight - 40) / lineHeight),
+    scrollTop: view.scrollTop,
+    followBottom: followBottom || terminalIsNearBottom(view),
   };
+}
+
+function restoreTerminalScroll(view, snapshot) {
+  view.scrollTop = snapshot.followBottom ? view.scrollHeight : snapshot.scrollTop;
+}
+
+function scrollTerminalToBottom() {
+  elements.terminalView.scrollTop = elements.terminalView.scrollHeight;
 }
 
 function terminalStyle(style = {}) {
@@ -2831,7 +2858,10 @@ window.addEventListener("resize", () => {
   closeAgentMenu();
   positionToastRegion();
   updateScrollToBottomButton();
-  if (state.view.kind === "terminal") void renderTerminal();
+  if (state.view.kind === "terminal") {
+    if (state.terminalFollowBottom) requestAnimationFrame(scrollTerminalToBottom);
+    void renderTerminal();
+  }
 });
 window.addEventListener("pagehide", flushDraftBeforePageCloses);
 const transcriptBottomFollower = createTranscriptBottomFollower(
@@ -2849,6 +2879,11 @@ elements.transcript.addEventListener("touchstart", suspendTranscriptAutoFollow, 
 elements.transcript.addEventListener("touchend", suspendTranscriptAutoFollow, { passive: true });
 elements.transcript.addEventListener("pointerdown", suspendTranscriptAutoFollow);
 elements.transcript.addEventListener("pointerup", suspendTranscriptAutoFollow);
+elements.terminalView.addEventListener("scroll", () => {
+  if (state.view.kind === "terminal") {
+    state.terminalFollowBottom = terminalIsNearBottom(elements.terminalView);
+  }
+}, { passive: true });
 function refreshRunningToolElapsed() {
   if (inputHasPriority()) return;
   elements.transcriptContent.querySelectorAll("[data-running-started]").forEach((node) => {
