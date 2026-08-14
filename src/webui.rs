@@ -1169,6 +1169,8 @@ mod tests {
         );
         assert!(APP_JS.contains("聊天 (chatbot)"));
         assert!(APP_JS.contains("仅进行对话，不使用工作工具"));
+        assert!(STYLE_CSS.contains(".choice { display: flex; align-items: center;"));
+        assert!(STYLE_CSS.contains(".choice input { flex: 0 0 auto; margin: 0;"));
         assert!(APP_JS.contains("state.snapshot.orchestrators"));
         assert!(APP_JS.contains("state.snapshot.default_orchestrator"));
         assert!(!APP_JS.contains("创建新的独立 Agent runtime 和 EDB"));

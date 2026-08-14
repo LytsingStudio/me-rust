@@ -255,9 +255,9 @@ button { color: inherit; }
 .modal > p { margin: 0; padding: 13px 17px 0; color: var(--muted); font-size: 13px; }
 .modal-content { min-height: 60px; overflow: auto; padding: 14px 17px; }
 .choice-list { display: grid; gap: 5px; }
-.choice { display: flex; align-items: flex-start; gap: 9px; padding: 10px; border: 1px solid transparent; border-radius: 9px; cursor: pointer; }
+.choice { display: flex; align-items: center; gap: 9px; padding: 10px; border: 1px solid transparent; border-radius: 9px; cursor: pointer; }
 .choice:hover, .choice.selected { border-color: var(--border-bright); background: var(--panel-3); }
-.choice input { margin-top: 2px; accent-color: var(--violet); }
+.choice input { flex: 0 0 auto; margin: 0; accent-color: var(--violet); }
 .choice small { display: block; margin-top: 2px; color: var(--dim); }
 .drawer-backdrop { position: fixed; z-index: 65; inset: 0; display: flex; align-items: flex-end; justify-content: center; padding: 20px 20px 0; background: rgb(0 0 0 / 55%); backdrop-filter: blur(4px); }
 .choice-drawer { width: min(640px, 100%); max-height: min(680px, 86vh); display: flex; flex-direction: column; border: 1px solid var(--border-bright); border-bottom: 0; border-radius: 16px 16px 0 0; background: #151820; box-shadow: var(--shadow); }
