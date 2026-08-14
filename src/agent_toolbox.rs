@@ -1882,6 +1882,7 @@ mod tests {
         let model = ModelConfig {
             name: "local".into(),
             provider: ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: format!("http://{address}"),
             endpoint: "/chat/completions".into(),
             api_key: Some("test".into()),
@@ -2044,6 +2045,7 @@ mod tests {
         let model = ModelConfig {
             name: "local".into(),
             provider: ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: format!("http://{address}"),
             endpoint: "/chat/completions".into(),
             api_key: Some("test".into()),
@@ -2489,6 +2491,7 @@ mod tests {
         let model = ModelConfig {
             name: "local".into(),
             provider: ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: format!("http://{address}"),
             endpoint: "/chat/completions".into(),
             api_key: Some("test".into()),

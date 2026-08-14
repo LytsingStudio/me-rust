@@ -949,6 +949,7 @@ mod tests {
         me::config::ModelConfig {
             name: name.into(),
             provider: me::config::ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: "https://example.invalid/v1".into(),
             endpoint: "/chat/completions".into(),
             api_key: Some("key".into()),
@@ -1409,6 +1410,7 @@ mod tests {
         let mut model = me::config::ModelConfig {
             name: "test".into(),
             provider: me::config::ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: "https://example.com/v1".into(),
             endpoint: "/chat/completions".into(),
             api_key: Some("key".into()),

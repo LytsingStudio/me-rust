@@ -666,6 +666,7 @@ mod tests {
         ModelConfig {
             name: "test".into(),
             provider: ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: "https://example.com/v1".into(),
             endpoint: "/chat/completions".into(),
             api_key: Some("key".into()),
@@ -687,6 +688,7 @@ mod tests {
         ModelConfig {
             name: "gpt-5.6-sol".into(),
             provider: ProviderType::CodexOauth,
+            reserve_output_context: false,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             endpoint: "/responses".into(),
             api_key: None,
@@ -719,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn output_reservation_uses_the_actual_request_parameter_but_not_codex() {
+    fn output_reservation_uses_the_actual_request_parameter_and_explicit_policy() {
         let mut configured = config();
         configured
             .effort_parameters
@@ -735,6 +737,16 @@ mod tests {
                 .unwrap()
                 .output_token_reservation(Some("high")),
             0
+        );
+
+        let mut explicitly_reserved = codex_config();
+        explicitly_reserved.reserve_output_context = true;
+        explicitly_reserved.parameters = toml::from_str("max_output_tokens = 999").unwrap();
+        assert_eq!(
+            ModelApi::new(explicitly_reserved)
+                .unwrap()
+                .output_token_reservation(Some("high")),
+            999
         );
     }
 

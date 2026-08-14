@@ -348,6 +348,7 @@ fn model_configs(credential_file: PathBuf) -> Vec<ModelConfig> {
             ModelConfig {
                 name: name.to_owned(),
                 provider: ProviderType::CodexOauth,
+                reserve_output_context: false,
                 base_url: CODEX_BASE_URL.to_owned(),
                 endpoint: "/responses".to_owned(),
                 api_key: None,
@@ -796,6 +797,7 @@ mod tests {
         let existing = ModelConfig {
             name: "default".into(),
             provider: ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: "https://example.com".into(),
             endpoint: "/chat/completions".into(),
             api_key: Some("test".into()),
@@ -822,7 +824,7 @@ mod tests {
                 .models
                 .iter()
                 .filter(|model| model.provider == ProviderType::CodexOauth)
-                .all(|model| model.api_key.is_none())
+                .all(|model| model.api_key.is_none() && !model.reserve_output_context)
         );
 
         fs::remove_dir_all(directory).unwrap();

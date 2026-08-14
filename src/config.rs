@@ -56,6 +56,8 @@ pub struct ModelCapabilities {
 pub struct ModelConfig {
     pub name: String,
     pub provider: ProviderType,
+    #[serde(default = "default_reserve_output_context")]
+    pub reserve_output_context: bool,
     pub base_url: String,
     pub endpoint: String,
     pub api_key: Option<String>,
@@ -74,6 +76,10 @@ pub struct ModelConfig {
 
 fn default_timeout() -> u64 {
     120
+}
+
+fn default_reserve_output_context() -> bool {
+    true
 }
 
 impl ModelConfig {
@@ -115,7 +121,7 @@ impl ModelConfig {
     }
 
     pub fn output_token_reservation(&self, effort: Option<&str>) -> u64 {
-        if self.provider == ProviderType::CodexOauth {
+        if !self.reserve_output_context {
             return 0;
         }
         effort
@@ -429,6 +435,7 @@ mod tests {
         ModelConfig {
             name: "test".into(),
             provider: ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: "https://example.com/v1".into(),
             endpoint: "/chat/completions".into(),
             api_key: Some("key".into()),
@@ -490,11 +497,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_model_without_reservation_policy_keeps_output_reservation() {
+        let serialized = toml::to_string(&model()).unwrap();
+        let legacy = serialized.replace("reserve_output_context = true\n", "");
+        let loaded: ModelConfig = toml::from_str(&legacy).unwrap();
+        assert!(loaded.reserve_output_context);
+    }
+
+    #[test]
     fn built_in_models_request_their_declared_maximum_output() {
         let directory = temporary_path("default-output-limits");
         let config = default_global_config(&directory).unwrap();
 
         for model in config.models {
+            assert!(
+                model.reserve_output_context,
+                "{} must explicitly reserve its configured output budget",
+                model.name
+            );
             let declared = model
                 .capabilities
                 .max_output_tokens

@@ -10179,6 +10179,7 @@ for line in sys.stdin:
         ModelConfig {
             name: name.into(),
             provider: ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: "https://example.invalid/v1".into(),
             endpoint: "/chat/completions".into(),
             api_key: Some("unused".into()),

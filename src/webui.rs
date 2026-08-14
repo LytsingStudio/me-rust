@@ -875,6 +875,7 @@ mod tests {
         ModelConfig {
             name: "test".into(),
             provider: ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: "http://127.0.0.1:1/v1".into(),
             endpoint: "chat/completions".into(),
             api_key: Some("must-not-reach-webui".into()),

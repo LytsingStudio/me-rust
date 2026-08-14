@@ -468,6 +468,7 @@ mod tests {
         ModelConfig {
             name: name.into(),
             provider: ProviderType::OpenaiCompatible,
+            reserve_output_context: true,
             base_url: "https://example.com/v1".into(),
             endpoint: "/chat/completions".into(),
             api_key: None,
