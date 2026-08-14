@@ -45,6 +45,12 @@ HUNK_PATTERN = re.compile(
 )
 MAX_TEXT_BYTES = 64 * 1024 * 1024
 MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024
+MAX_EDIT_OPERATIONS = 128
+EDIT_TIP = (
+    "The file was edited and its previous line numbers are now stale. "
+    "Before editing this file again, use File.Read or File.Search to refresh "
+    "its line numbers and hash."
+)
 TEXT_ENCODINGS = [
     "auto",
     "utf-8",
@@ -147,6 +153,18 @@ class PatchHunk:
 class TextLine:
     text: str
     ending: str
+
+
+@dataclass(frozen=True)
+class ResolvedEdit:
+    index: int
+    target_line_start: int
+    target_line_end: int
+    source_start: int
+    source_end: int
+    new_text: str
+    new_text_bytes: int
+    kind: str
 
 
 def object_schema(
@@ -296,31 +314,36 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "path": PATH_SCHEMA,
             "expected_hash": HASH_SCHEMA,
             "encoding": {**ENCODING_SCHEMA, "default": "auto"},
-            "target_line_start": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 2**31 - 1,
-                "description": "First 1-based source line to replace. For insertion, this must equal target_line_end + 1.",
-            },
-            "target_line_end": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 2**31 - 1,
-                "description": "Last inclusive 1-based source line to replace. For insertion, this is one less than target_line_start.",
-            },
-            "new_text": {
-                "type": "string",
-                "maxLength": MAX_TEXT_BYTES,
-                "description": "Exact replacement text. Line endings are part of the value and are never added automatically.",
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_EDIT_OPERATIONS,
+                "description": "Atomic edit operations whose line coordinates all refer to the same original file identified by expected_hash.",
+                "items": object_schema(
+                    {
+                        "target_line_start": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 2**31 - 1,
+                            "description": "First 1-based original source line to replace. For insertion, this must equal target_line_end + 1.",
+                        },
+                        "target_line_end": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 2**31 - 1,
+                            "description": "Last inclusive 1-based original source line to replace. For insertion, this is one less than target_line_start.",
+                        },
+                        "new_text": {
+                            "type": "string",
+                            "maxLength": MAX_TEXT_BYTES,
+                            "description": "Exact replacement text. Line endings are part of the value and are never added automatically.",
+                        },
+                    },
+                    ["target_line_start", "target_line_end", "new_text"],
+                ),
             },
         },
-        [
-            "path",
-            "expected_hash",
-            "target_line_start",
-            "target_line_end",
-            "new_text",
-        ],
+        ["path", "expected_hash", "edits"],
     ),
     "Append": object_schema(
         {
@@ -439,6 +462,7 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "items": object_schema(
                     {
                         "path": PATH_SCHEMA,
+                        "hash": HASH_SCHEMA,
                         "column": {"type": "integer"},
                         "match_length": {"type": "integer"},
                         "before": {
@@ -461,6 +485,7 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                     },
                     [
                         "path",
+                        "hash",
                         "column",
                         "match_length",
                         "before",
@@ -512,20 +537,45 @@ for _tool in ("Create", "Edit", "Append", "Replace"):
     )
 OUTPUT_SCHEMAS["Edit"]["properties"].update(
     {
-        "target_line_start": {"type": "integer"},
-        "target_line_end": {"type": "integer"},
-        "selected_lines": {"type": "integer"},
-        "new_text_bytes": {"type": "integer"},
+        "edit_results": {
+            "type": "array",
+            "items": object_schema(
+                {
+                    "index": {"type": "integer"},
+                    "state": {"type": "string", "enum": ["succeeded"]},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["replace", "delete", "insert"],
+                    },
+                    "target_line_start": {"type": "integer"},
+                    "target_line_end": {"type": "integer"},
+                    "selected_lines": {"type": "integer"},
+                    "new_text_bytes": {"type": "integer"},
+                },
+                [
+                    "index",
+                    "state",
+                    "kind",
+                    "target_line_start",
+                    "target_line_end",
+                    "selected_lines",
+                    "new_text_bytes",
+                ],
+            ),
+        },
+        "previous_total_lines": {"type": "integer"},
+        "total_lines": {"type": "integer"},
         "previous_size": {"type": "integer"},
+        "tip": {"type": "string"},
     }
 )
 OUTPUT_SCHEMAS["Edit"]["required"].extend(
     [
-        "target_line_start",
-        "target_line_end",
-        "selected_lines",
-        "new_text_bytes",
+        "edit_results",
+        "previous_total_lines",
+        "total_lines",
         "previous_size",
+        "tip",
     ]
 )
 OUTPUT_SCHEMAS["Append"]["properties"]["appended_bytes"] = {"type": "integer"}
@@ -560,7 +610,7 @@ ROUTES = {
     "Stat": "Inspect existence, type, metadata, and current content hashes.",
     "MakeDirectory": "Create one explicit directory, optionally including its missing parent chain.",
     "Create": "Create a new text file in an explicit encoding, defaulting to UTF-8; never overwrite an existing file.",
-    "Edit": "Replace, delete, or insert one exact contiguous line range in a known text file.",
+    "Edit": "Atomically replace, delete, or insert one or more independently located line ranges in a known text file.",
     "Append": "Append exact text using the existing file's detected encoding without adding a newline.",
     "Replace": "Replace an entire known text file while preserving its detected encoding and BOM.",
     "Move": "Move one known regular file to a destination that does not exist.",
@@ -572,14 +622,15 @@ INSTRUCTIONS = {
     "ReadBytes": "The result is base64 and includes the 8-character concurrency fingerprint of the complete file, not only the returned range.",
     "List": "Depth counts levels below path. Results are stable and symbolic-link directories are never traversed.",
     "Find": "Patterns and exclusions match workspace-relative POSIX paths. Results are stable and symbolic-link directories are never traversed.",
-    "Search": "Literal search is the default. Each match returns before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and exact line text as File.Read. The sole key in match_text is the matching file line; column is 1-based within that line, so no separate line field is returned. Example: {\"path\":\"src/main.rs\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\\n\"},\"match_text\":{\"042\":\"    runtime.start();\\n\"},\"after\":{\"043\":\"}\\n\"}}. With top-level truncate:true, missing before or after keys are omitted context lines; the sole match_text value may instead be a text_fragments object, while its line key and the match metadata remain intact. Text encoding is detected conservatively per file; binary, uncertain, and oversized files are skipped.",
+    "Search": "Literal search is the default. Each match returns the file's current hash plus before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and exact line text as File.Read. The sole key in match_text is the matching file line; column is 1-based within that line, so no separate line field is returned. Example: {\"path\":\"src/main.rs\",\"hash\":\"0123abcd\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\\n\"},\"match_text\":{\"042\":\"    runtime.start();\\n\"},\"after\":{\"043\":\"}\\n\"}}. The hash and numbered lines form a current File.Edit baseline. With top-level truncate:true, missing before or after keys are omitted context lines; the sole match_text value may instead be a text_fragments object, while its line key, hash, and match metadata remain intact. Text encoding is detected conservatively per file; binary, uncertain, and oversized files are skipped.",
     "Stat": "A missing path is a normal result. Content hashes are returned only for ordinary files, not directories or symbolic links.",
     "MakeDirectory": "parents defaults to false, requiring the immediate parent to exist. Set parents=true to create every missing directory in the path. The target itself must not already exist; existing files, directories, and symbolic links return already_exists.",
     "Create": "The parent directory must already exist. encoding defaults to utf-8 because a new file has no bytes to inspect; bom defaults to false and is allowed only for UTF encodings. Creation fails if the destination exists.",
     "Edit": (
-        "Edit performs exactly one operation on a contiguous range of complete file lines. Line numbers are 1-based and replacement endpoints are inclusive. Read the current range first and pass the returned hash as expected_hash. For replacement or deletion, require 1 <= target_line_start <= target_line_end <= total_lines. For insertion, use the only empty-range form target_line_start = target_line_end + 1; it inserts before target_line_start. Thus 1/0 inserts at the beginning, N/N-1 inserts before line N, total_lines+1/total_lines inserts at the end, and 1/0 is also how an empty file receives its first content. Any larger reversed gap is invalid.\n"
+        "Edit atomically applies one or more operations to one text file. First use File.Read or File.Search to obtain the current numbered text and hash, then pass that hash as expected_hash. Every operation in edits is independently located against that one original pre-edit snapshot. Earlier array items never shift or otherwise change the meaning of later line numbers; array order is not execution order. The tool validates and locates every operation before writing, then commits the combined result once. If any operation is invalid, unencodable, overlapping, duplicated at the same insertion point, or otherwise ambiguous, the entire call fails and the file remains unchanged. A later operation cannot target text created by an earlier operation in the same call; perform that dependent work only after another Read or Search.\n"
+        "Line numbers are 1-based and replacement endpoints are inclusive. For replacement or deletion, require 1 <= target_line_start <= target_line_end <= total_lines. For insertion, use the only empty-range form target_line_start = target_line_end + 1; it inserts before target_line_start. Thus 1/0 inserts at the beginning, N/N-1 inserts before line N, total_lines+1/total_lines inserts at the end, and 1/0 is also how an empty file receives its first content. Any larger reversed gap is invalid. Replacement ranges must not share original lines. An insertion must not lie inside a replaced range, and one original insertion point may appear only once; insertion exactly at a replacement's outer boundary is allowed.\n"
         "new_text is inserted verbatim. It replaces the complete selected lines, including the line endings contained in those lines. Edit never adds, removes, converts, or guesses a newline. To replace a non-final line while keeping the following line separate, include the intended LF, CRLF, or CR in new_text. To delete selected lines and their line endings, use an empty string. To clear line text while retaining blank lines, provide only the corresponding line-ending strings. To remove a line ending while keeping its text, provide the full line text without that ending; this intentionally joins it to the following line. When appending after a final line without an ending, new_text needs a leading line ending; when the final source line already has an ending, it does not. Read reports exact line endings, including a missing final ending, so copy the required convention deliberately.\n"
-        "Edit does not search inside a line and does not accept a partial line fragment as a location. To change part of a line, provide that entire line as new_text with the unchanged surrounding characters and the intended ending. The existing encoding, BOM, permissions, and all bytes represented by unselected text are preserved through one atomic commit. Unrepresentable text, invalid ranges, stale hashes, uncertain encodings, oversized results, and all other failures leave the file unchanged. A successful result returns a new hash; use that new hash for the next mutation."
+        "Edit does not search inside a line and does not accept a partial line fragment as a location. To change part of a line, provide that entire line as new_text with the unchanged surrounding characters and the intended ending. The existing encoding, BOM, permissions, and all bytes represented by unselected text are preserved through one atomic commit. Unrepresentable text, invalid ranges, stale hashes, uncertain encodings, oversized results, and all other failures leave the file unchanged. The successful result reports every applied operation and always warns that the old line numbers are stale. Before another File.Edit on this file, call File.Read or File.Search again to refresh both its line numbers and hash; do not chain another Edit directly from the returned hash."
     ),
     "Append": "The file must exist and match expected_hash. Existing encoding and BOM are preserved. Content is appended exactly and no newline is added. Unrepresentable text returns encoding_error without modifying the file.",
     "Replace": "The file must exist and match expected_hash. Its detected encoding and BOM are preserved while the complete content is replaced atomically. Unrepresentable text returns encoding_error without modifying the file.",
@@ -597,44 +648,28 @@ EXAMPLES = {
     "MakeDirectory": '{"path":"build/generated/assets","parents":true}',
     "Create": '{"path":"notes.txt","content":"first line\\n","encoding":"utf-8"}',
     "Edit": (
-        "Assume File.Read returned lines 1=alpha\\n, 2=beta\\n, 3=gamma\\n, 4=omega with hash 0123abcd unless an example says otherwise. Every new_text value is exact.\n\n"
-        "Replace line 2 and retain its LF:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"updated\\n"}'
-        "\n\nReplace lines 2-3 with fewer lines:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":3,"new_text":"combined\\n"}'
-        "\n\nReplace one line with three lines:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"one\\ntwo\\nthree\\n"}'
-        "\n\nDelete complete lines 2-3, including their endings:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":3,"new_text":""}'
-        "\n\nClear the text of line 2 but retain one LF blank line:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"\\n"}'
-        "\n\nClear two CRLF lines but retain two blank CRLF lines:\n"
-        '{"path":"windows.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":3,"new_text":"\\r\\n\\r\\n"}'
-        "\n\nInsert before line 2 using the empty range 2/1:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":1,"new_text":"inserted\\n"}'
-        "\n\nInsert at the beginning using 1/0:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":1,"target_line_end":0,"new_text":"header\\n"}'
-        "\n\nInsert two lines before line 3:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":3,"target_line_end":2,"new_text":"inserted one\\ninserted two\\n"}'
-        "\n\nInsert into an empty file using 1/0:\n"
-        '{"path":"empty.txt","expected_hash":"e3b0c442","target_line_start":1,"target_line_end":0,"new_text":"first line\\n"}'
-        "\n\nAppend after a newline-terminated 4-line file using 5/4; no leading ending is needed:\n"
-        '{"path":"terminated.txt","expected_hash":"0123abcd","target_line_start":5,"target_line_end":4,"new_text":"appended\\n"}'
-        "\n\nAppend a new line after final line 4=omega with no ending; add the leading LF explicitly:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":5,"target_line_end":4,"new_text":"\\nappended"}'
-        "\n\nReplace final line 4 without adding an ending:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":4,"target_line_end":4,"new_text":"final"}'
-        "\n\nReplace final line 4 and add an ending:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":4,"target_line_end":4,"new_text":"final\\n"}'
-        "\n\nRemove line 1's ending while keeping its text; this intentionally produces alphabeta on one logical line:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":1,"target_line_end":1,"new_text":"alpha"}'
-        "\n\nDelete the entire four-line file:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","target_line_start":1,"target_line_end":4,"new_text":""}'
-        "\n\nPreserve a mixed file's CRLF on line 2:\n"
-        '{"path":"mixed.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"updated\\r\\n"}'
-        "\n\nJSON escaping for quotes, backslashes, and a tab:\n"
-        '{"path":"config.txt","expected_hash":"0123abcd","target_line_start":2,"target_line_end":2,"new_text":"path = \\"C:\\\\Program Files\\\\ME\\"\\nvalue\\t42\\n"}'
-        "\n\nInvalid forms: start=5/end=2 is not an insertion because the gap is larger than one; replacing line 999 is outside the file; and a partial phrase replaces the entire selected line rather than searching inside it. After success, never reuse 0123abcd: use the new hash returned by Edit."
+        "Assume File.Read returned 1=aaa\\n, 2=bbb\\n, 3=ccc\\n, 4=ddd\\n with hash 0123abcd unless stated otherwise. Every edit refers to those original lines, and every new_text value is exact.\n\n"
+        "Positive — both replacements use original coordinates even though the first adds a line. Result: 111\\n, aaa\\n, bbb\\n, 333\\n, ccc\\n, ddd\\n:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"target_line_start":1,"target_line_end":1,"new_text":"111\\naaa\\n"},{"target_line_start":3,"target_line_end":3,"new_text":"333\\nccc\\n"}]}'
+        "\n\nPositive — array order is irrelevant. This replaces original line 4, inserts before original line 2, and deletes original line 3 in one atomic call:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"target_line_start":4,"target_line_end":4,"new_text":"last\\n"},{"target_line_start":2,"target_line_end":1,"new_text":"inserted\\n"},{"target_line_start":3,"target_line_end":3,"new_text":""}]}'
+        "\n\nTricky but valid — insertion exactly before a replaced range is an allowed outer-boundary insertion; inserted appears before updated:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"target_line_start":2,"target_line_end":1,"new_text":"inserted\\n"},{"target_line_start":2,"target_line_end":2,"new_text":"updated\\n"}]}'
+        "\n\nReplace several lines with one and another original line with several, retaining every intended LF explicitly:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"target_line_start":1,"target_line_end":2,"new_text":"combined\\n"},{"target_line_start":4,"target_line_end":4,"new_text":"one\\ntwo\\nthree\\n"}]}'
+        "\n\nDelete complete lines and endings with an empty string; clear text but retain a blank LF line with \\n:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"target_line_start":1,"target_line_end":1,"new_text":""},{"target_line_start":3,"target_line_end":3,"new_text":"\\n"}]}'
+        "\n\nInsert at file start with 1/0 and after a newline-terminated four-line file with 5/4:\n"
+        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"target_line_start":1,"target_line_end":0,"new_text":"header\\n"},{"target_line_start":5,"target_line_end":4,"new_text":"footer\\n"}]}'
+        "\n\nInsert into an empty file with 1/0:\n"
+        '{"path":"empty.txt","expected_hash":"e3b0c442","edits":[{"target_line_start":1,"target_line_end":0,"new_text":"first line\\n"}]}'
+        "\n\nA final source line without an ending needs a leading LF when appending another logical line:\n"
+        '{"path":"unterminated.txt","expected_hash":"0123abcd","edits":[{"target_line_start":5,"target_line_end":4,"new_text":"\\nappended"}]}'
+        "\n\nPreserve CRLF explicitly and rewrite a partial phrase by supplying the complete resulting source line:\n"
+        '{"path":"windows.txt","expected_hash":"0123abcd","edits":[{"target_line_start":2,"target_line_end":2,"new_text":"complete changed line\\r\\n"}]}'
+        "\n\nEscaped quotes, backslashes, and a tab remain exact text:\n"
+        '{"path":"config.txt","expected_hash":"0123abcd","edits":[{"target_line_start":2,"target_line_end":2,"new_text":"path = \\"C:\\\\Program Files\\\\ME\\"\\nvalue\\t42\\n"}]}'
+        "\n\nCommon errors — these reject the entire call without writing: two replacement ranges share an original line; two insertions use the same original point; an insertion lies inside a replacement; start/end form a reversed gap larger than one; a target exceeds original total_lines; expected_hash is stale; or a later item tries to address lines created by an earlier item. Split dependent work into another call, but first use File.Read or File.Search again because every successful Edit invalidates the previous line numbers."
     ),
     "Append": '{"path":"notes.txt","expected_hash":"0123abcd","content":"next line\\n"}',
     "Replace": '{"path":"notes.txt","expected_hash":"0123abcd","content":"complete new content\\n"}',
@@ -1366,6 +1401,7 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
                 skipped_binary += 1
                 continue
             raw = path.read_bytes()
+            file_hash = sha256_bytes(raw)
             text = decode_text_bytes(raw, relative).text
         except (ToolError, OSError):
             skipped_binary += 1
@@ -1380,6 +1416,7 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
                 matches.append(
                     {
                         "path": relative,
+                        "hash": file_hash,
                         "column": found.start() + 1,
                         "match_length": found.end() - found.start(),
                         "before": {
@@ -1737,9 +1774,16 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
     logical = string_arg(data, "path")
     expected = validate_expected_hash(data.get("expected_hash"))
     encoding = encoding_arg(data)
-    target_start = int_arg(data, "target_line_start", 0, 1, 2**31 - 1)
-    target_end = int_arg(data, "target_line_end", -1, 0, 2**31 - 1)
-    new_text = string_arg(data, "new_text", "")
+    requested_edits = data.get("edits")
+    if (
+        not isinstance(requested_edits, list)
+        or not requested_edits
+        or len(requested_edits) > MAX_EDIT_OPERATIONS
+    ):
+        raise ToolError(
+            "invalid_arguments",
+            f"edits must contain 1..={MAX_EDIT_OPERATIONS} operation objects",
+        )
     with mutation_lock():
         path = existing_path(logical)
         require_regular_file(path, logical, True)
@@ -1747,24 +1791,98 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
         previous = verify_content_hash(document.raw, expected)
         lines = split_text_file_lines(document.text)
         total_lines = len(lines)
-        inserting = target_start == target_end + 1
-        replacing = 1 <= target_start <= target_end <= total_lines
-        insertion_in_bounds = inserting and target_start <= total_lines + 1
-        if not replacing and not insertion_in_bounds:
-            raise ToolError(
-                "invalid_range",
-                "target range must satisfy 1 <= start <= end <= total_lines for replacement, "
-                "or start = end + 1 with start <= total_lines + 1 for insertion; "
-                f"received start={target_start}, end={target_end}, total_lines={total_lines}",
+        line_offsets = [0]
+        for line in lines:
+            line_offsets.append(line_offsets[-1] + len(line))
+        resolved: list[ResolvedEdit] = []
+        required_fields = {"target_line_start", "target_line_end", "new_text"}
+        for index, value in enumerate(requested_edits):
+            item = validate_object(value)
+            unexpected = sorted(set(item) - required_fields)
+            missing = sorted(required_fields - set(item))
+            if unexpected or missing:
+                details = []
+                if missing:
+                    details.append(f"missing fields: {', '.join(missing)}")
+                if unexpected:
+                    details.append(f"unexpected fields: {', '.join(unexpected)}")
+                raise ToolError(
+                    "invalid_arguments",
+                    f"edits[{index}] " + "; ".join(details),
+                )
+            target_start = int_arg(
+                item, "target_line_start", 0, 1, 2**31 - 1
             )
-        source_start = target_start - 1
-        source_end = target_end
-        updated_text = (
-            "".join(lines[:source_start])
-            + new_text
-            + "".join(lines[source_end:])
+            target_end = int_arg(item, "target_line_end", -1, 0, 2**31 - 1)
+            new_text = string_arg(item, "new_text", "")
+            inserting = target_start == target_end + 1
+            replacing = 1 <= target_start <= target_end <= total_lines
+            insertion_in_bounds = inserting and target_start <= total_lines + 1
+            if not replacing and not insertion_in_bounds:
+                raise ToolError(
+                    "invalid_range",
+                    f"edits[{index}] must satisfy 1 <= start <= end <= total_lines for replacement, "
+                    "or start = end + 1 with start <= total_lines + 1 for insertion; "
+                    f"received start={target_start}, end={target_end}, total_lines={total_lines}",
+                )
+            source_start = line_offsets[target_start - 1]
+            source_end = line_offsets[target_end]
+            replacement = encode_text(new_text, document.encoding, b"", logical)
+            resolved.append(
+                ResolvedEdit(
+                    index=index,
+                    target_line_start=target_start,
+                    target_line_end=target_end,
+                    source_start=source_start,
+                    source_end=source_end,
+                    new_text=new_text,
+                    new_text_bytes=len(replacement),
+                    kind=(
+                        "insert"
+                        if inserting
+                        else "delete"
+                        if new_text == ""
+                        else "replace"
+                    ),
+                )
+            )
+        for left_index, left in enumerate(resolved):
+            for right in resolved[left_index + 1 :]:
+                left_inserting = left.source_start == left.source_end
+                right_inserting = right.source_start == right.source_end
+                conflict = False
+                if left_inserting and right_inserting:
+                    conflict = left.source_start == right.source_start
+                elif left_inserting:
+                    conflict = right.source_start < left.source_start < right.source_end
+                elif right_inserting:
+                    conflict = left.source_start < right.source_start < left.source_end
+                else:
+                    conflict = max(left.source_start, right.source_start) < min(
+                        left.source_end, right.source_end
+                    )
+                if conflict:
+                    raise ToolError(
+                        "overlapping_edits",
+                        f"edits[{left.index}] and edits[{right.index}] overlap or use the same original insertion point; all edit coordinates must be independent",
+                    )
+        ordered = sorted(
+            resolved,
+            key=lambda item: (
+                item.source_start,
+                0 if item.source_start == item.source_end else 1,
+                item.source_end,
+                item.index,
+            ),
         )
-        replacement = encode_text(new_text, document.encoding, b"", logical)
+        pieces: list[str] = []
+        cursor = 0
+        for item in ordered:
+            pieces.append(document.text[cursor : item.source_start])
+            pieces.append(item.new_text)
+            cursor = item.source_end
+        pieces.append(document.text[cursor:])
+        updated_text = "".join(pieces)
         updated = encode_text(
             updated_text, document.encoding, document.bom, logical
         )
@@ -1784,11 +1902,26 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
     )
     output.update(
         {
-            "target_line_start": target_start,
-            "target_line_end": target_end,
-            "selected_lines": 0 if inserting else target_end - target_start + 1,
-            "new_text_bytes": len(replacement),
+            "edit_results": [
+                {
+                    "index": item.index,
+                    "state": "succeeded",
+                    "kind": item.kind,
+                    "target_line_start": item.target_line_start,
+                    "target_line_end": item.target_line_end,
+                    "selected_lines": (
+                        0
+                        if item.source_start == item.source_end
+                        else item.target_line_end - item.target_line_start + 1
+                    ),
+                    "new_text_bytes": item.new_text_bytes,
+                }
+                for item in sorted(resolved, key=lambda item: item.index)
+            ],
+            "previous_total_lines": total_lines,
+            "total_lines": len(split_text_file_lines(updated_text)),
             "previous_size": len(document.raw),
+            "tip": EDIT_TIP,
         }
     )
     return output
@@ -1923,7 +2056,7 @@ def handle(request: Any) -> None:
     if command == "getBrief":
         result(
             request_id,
-            "Read, search, and safely mutate files and explicitly create directories inside the workspace. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. Mutations use an 8-character SHA-256-derived concurrency fingerprint and return the new value for chaining without another read. This short value detects stale edits; it is not a security integrity digest.",
+            "Read, search, and safely mutate files and explicitly create directories inside the workspace. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. Mutations use an 8-character SHA-256-derived concurrency fingerprint. File.Edit applies all requested ranges against one original snapshot and requires refreshed Read or Search line numbers before a later Edit call; other hash-based mutations may chain from the returned hash. This short value detects stale edits; it is not a security integrity digest.",
         )
         return
     tool = request.get("tool")

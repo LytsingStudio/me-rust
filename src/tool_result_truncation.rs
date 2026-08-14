@@ -2000,7 +2000,7 @@ mod tests {
             .map(|index| {
                 let line = index + 1;
                 json!({
-                    "path":"src/a.rs","column":1,"match_length":5,
+                    "path":"src/a.rs","hash":"0123abcd","column":1,"match_length":5,
                     "match_text":{line.to_string():format!("match-{index} {}", "x".repeat(100))},
                     "before":{},"after":{}
                 })
@@ -2024,11 +2024,9 @@ mod tests {
                 .unwrap()
                 > 1
         );
-        assert!(
-            retained
-                .iter()
-                .all(|item| item.get("path").is_some() && item.get("match_text").is_some())
-        );
+        assert!(retained.iter().all(|item| item.get("path").is_some()
+            && item.get("hash") == Some(&json!("0123abcd"))
+            && item.get("match_text").is_some()));
     }
 
     #[test]
@@ -2044,7 +2042,7 @@ mod tests {
         let result = truncate_for_model_with_limit(
             "File.Search",
             wrapper(json!({"matches":[{
-                "path":"a.txt","column":column,"match_length":6,
+                "path":"a.txt","hash":"0123abcd","column":column,"match_length":6,
                 "match_text":{"21":text},"before":before,"after":after
             }],"truncated":false})),
             850,
@@ -2073,7 +2071,7 @@ mod tests {
         let result = truncate_for_model_with_limit(
             "File.Search",
             wrapper(json!({"matches":[{
-                "path":"a.txt","column":11,"match_length":matched.chars().count(),
+                "path":"a.txt","hash":"0123abcd","column":11,"match_length":matched.chars().count(),
                 "match_text":{"1":text},"before":{},"after":{}
             }],"truncated":false})),
             1_000,
