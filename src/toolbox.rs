@@ -423,7 +423,11 @@ impl Drop for ToolboxRuntime {
 }
 
 fn native_catalog_parts() -> (Vec<ToolboxTool>, Vec<(String, String)>) {
-    let (mut tools, agent_brief) = agent_toolbox::catalog_parts();
+    // Agent.* is intentionally kept out of the model-facing catalog.  The
+    // underlying runtime remains available for the dedicated Worker surface
+    // and for replaying existing EDBs, but models cannot create or control
+    // general-purpose sub-Agents.
+    let mut tools = Vec::new();
     let (title_tools, title_brief) = agent_title::catalog_parts();
     let (workmap_tools, workmap_brief) = workmap::catalog_parts();
     let (compact_tools, compact_brief) = compact::catalog_parts();
@@ -434,13 +438,7 @@ fn native_catalog_parts() -> (Vec<ToolboxTool>, Vec<(String, String)>) {
     tools.extend(image_tools);
     (
         tools,
-        vec![
-            agent_brief,
-            title_brief,
-            workmap_brief,
-            compact_brief,
-            image_brief,
-        ],
+        vec![title_brief, workmap_brief, compact_brief, image_brief],
     )
 }
 
@@ -2246,31 +2244,21 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn catalog_can_hide_one_toolbox_without_breaking_name_resolution() {
+    fn native_catalog_does_not_expose_disabled_agent_toolbox() {
         let catalog = ToolboxCatalog::native_for_test();
         let agent_api_names = agent_toolbox::catalog_parts()
             .0
             .into_iter()
             .map(|tool| tool.api_name)
             .collect::<BTreeSet<_>>();
-        assert!(catalog.prompt().contains("# Toolbox Agent"));
-        let filtered_prompt = catalog
-            .prompt_excluding(agent_toolbox::AGENT_TOOLBOX_NAME)
-            .unwrap();
-        assert!(!filtered_prompt.contains("# Toolbox Agent"));
-        assert!(filtered_prompt.contains("# Toolbox WorkMap"));
-        assert!(filtered_prompt.contains("# Toolbox Compact"));
-        let filtered_definitions =
-            catalog.model_definitions_excluding(agent_toolbox::AGENT_TOOLBOX_NAME);
-        assert_eq!(
-            filtered_definitions.len() + agent_api_names.len(),
-            catalog.model_definitions().len()
-        );
-        assert!(filtered_definitions.iter().all(|definition| {
+        assert!(!catalog.prompt().contains("# Toolbox Agent"));
+        assert!(catalog.prompt().contains("# Toolbox WorkMap"));
+        assert!(catalog.prompt().contains("# Toolbox Compact"));
+        assert!(catalog.model_definitions().iter().all(|definition| {
             !agent_api_names.contains(definition["function"]["name"].as_str().unwrap())
         }));
         for api_name in agent_api_names {
-            assert!(catalog.resolve_api_name(&api_name).is_some());
+            assert!(catalog.resolve_api_name(&api_name).is_none());
         }
     }
 
@@ -2429,18 +2417,14 @@ for line in sys.stdin:
         let embedded_directory = python.path_directory.clone().unwrap();
         let runtime =
             Arc::new(ToolboxRuntime::load_with_python(&workspace, vec![script], python).unwrap());
-        assert_eq!(runtime.catalog().tools().len(), 24);
-        assert_eq!(
-            runtime.catalog().resolve_api_name("Agent_Create"),
-            Some("Agent.Create")
-        );
-        assert_eq!(
-            runtime.catalog().resolve_api_name("Agent_Stop"),
-            Some("Agent.Stop")
-        );
-        assert_eq!(
-            runtime.catalog().resolve_api_name("Agent_ClearContext"),
-            Some("Agent.ClearContext")
+        assert_eq!(runtime.catalog().tools().len(), 18);
+        assert!(runtime.catalog().resolve_api_name("Agent_Create").is_none());
+        assert!(runtime.catalog().resolve_api_name("Agent_Stop").is_none());
+        assert!(
+            runtime
+                .catalog()
+                .resolve_api_name("Agent_ClearContext")
+                .is_none()
         );
         assert_eq!(
             runtime.catalog().resolve_api_name("WorkMap_Read"),

@@ -2481,31 +2481,11 @@ impl MainAgent {
                     )
             }
         } else if agent_toolbox::is_agent_tool(&call.name) {
-            if self.profile != MainAgentProfile::Standard
-                || agent_kind_definition(edb.events())?.kind == AgentKind::SubAgent
-            {
-                Err(ToolboxExecutionError::Tool {
-                    code: "agent_tool_forbidden".into(),
-                    message: if self.profile == MainAgentProfile::Worker
-                        || agent_kind_definition(edb.events())?.kind == AgentKind::SubAgent
-                    {
-                        "Sub-Agents cannot call Agent tools or create or control other Agents. Complete the assigned task directly with the available non-Agent tools.".into()
-                    } else {
-                        "ManagerAgent cannot call Agent tools. Control its dedicated Worker through Worker tools.".into()
-                    },
-                    retryable: false,
-                })
-            } else {
-                let input_queue = self.input_queue.clone();
-                self.agent_toolbox.execute_cancellable_with_follow_up(
-                    &call.name,
-                    &call.arguments,
-                    models.active_model(),
-                    self.effort.as_deref().unwrap_or(UNSET_EFFORT),
-                    &mut || self.input_queue.abort_requested(call.prompt_id),
-                    &mut || input_queue.has_pending_user_prompt(),
-                )
-            }
+            Err(ToolboxExecutionError::Tool {
+                code: "agent_tool_disabled".into(),
+                message: "The Agent toolbox is disabled and cannot create or control sub-Agents. Continue with the other available tools.".into(),
+                retryable: false,
+            })
         } else if workmap::is_workmap_tool(&call.name) {
             let previous_len = edb.len();
             let execution = workmap::execute(&call.name, &call.arguments, call.id, edb);
@@ -8375,7 +8355,7 @@ data: [DONE]
     }
 
     #[test]
-    fn sub_agent_rejects_agent_tool_calls_at_execution() {
+    fn disabled_agent_toolbox_rejects_forged_calls_at_execution() {
         let mut edb = EventDataBase::new();
         let mut initializer = MainAgent::new(None);
         initializer
@@ -8417,8 +8397,8 @@ data: [DONE]
             Some(Event::ToolCallResult(result))
                 if result.tool_call_id == tool_call_id
                     && result.state == ToolResultState::Failed
-                    && result.detail.contains("agent_tool_forbidden")
-                    && result.detail.contains("Sub-Agents cannot call Agent tools")
+                    && result.detail.contains("agent_tool_disabled")
+                    && result.detail.contains("Agent toolbox is disabled")
         ));
     }
 
@@ -8947,7 +8927,15 @@ for line in sys.stdin:
             agent_toolbox::AGENT_CREATE,
             r#"{"prompt":"recursive"}"#,
         );
-        assert!(worker_error.contains("agent_tool_forbidden"));
+        assert!(worker_error.contains("agent_tool_disabled"));
+
+        let main_error = execute_forged(
+            MainAgent::new(None),
+            AgentDefinition::interactive(),
+            agent_toolbox::AGENT_CREATE,
+            r#"{"prompt":"recursive"}"#,
+        );
+        assert!(main_error.contains("agent_tool_disabled"));
 
         for image_tool in [image_toolbox::INFO_TOOL_NAME, image_toolbox::VIEW_TOOL_NAME] {
             let worker_image_error = execute_forged(

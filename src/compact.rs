@@ -8,14 +8,14 @@ use crate::{
 pub const TOOL_NAME: &str = "Compact";
 pub const TOOLBOX_NAME: &str = "Compact";
 
-const TOOLBOX_BRIEF: &str = r#"Compact replaces the conversation accumulated so far with one detailed continuation summary when context space is running low.
+const TOOLBOX_BRIEF: &str = r#"Compact replaces the conversation accumulated so far with a detailed continuation summary when context space is running low.
 
-Call Compact only after the runtime explicitly warns that context space is running low, and only at a safe point: finish the current atomic action, persist any valuable WorkMap state, and make Compact the only tool call in that model response. Compact has no arguments. The runtime rejects Compact when no warning is active and reports the current context usage. After accepting the request, the runtime will ask you for a text-only summary, activate it only after successful completion, then continue the same Agent turn. WorkMap survives compaction independently of the summary; after compaction succeeds, call WorkMap.Read before any further non-WorkMap action and repeat any final audit. Do not call Compact merely to shorten a healthy context, and do not narrate or imitate compaction in assistant text."#;
+Call Compact only after the runtime explicitly warns that context space is running low, and only at a safe point: finish the current atomic action, persist any valuable WorkMap state, and make Compact the only tool call in that model response. Compact has no arguments. The runtime rejects Compact when no warning is active and reports the current context usage. After accepting the request, the runtime will perform context compaction, activate the resulting continuation summary only after successful completion, then continue the same Agent turn. WorkMap survives compaction independently of the summary; after compaction succeeds, call WorkMap.Read before any further non-WorkMap action and repeat any final audit. Do not call Compact merely to shorten a healthy context, and do not narrate or imitate compaction in assistant text."#;
 
-const INSTRUCTIONS: &str = r#"Call with an empty object only after the runtime explicitly issues a context-low warning. Compact must be the sole tool call in the response. A call made without an active warning is rejected with the current context usage. After the tool is accepted, the runtime performs the summary request automatically; do not issue other tools in that response."#;
+const INSTRUCTIONS: &str = r#"Call with an empty object only after the runtime explicitly issues a context-low warning. Compact must be the sole tool call in the response. A call made without an active warning is rejected with the current context usage. After the tool is accepted, the runtime performs context compaction automatically; do not issue other tools in that response."#;
 const ROUTE: &str = "Compress the accumulated conversation at a safe point only after the runtime explicitly warns that context is running low. It must be the sole tool call in the response.";
 const EXAMPLES: &str = r#"Input: {}
-Meaning: request one context compaction at the current safe point."#;
+Meaning: request context compaction at the current safe point."#;
 
 pub const MULTI_TURN_ANALYSIS_PROMPT: &str = r#"CRITICAL: Respond with raw text only. Do not call any tools.
 
