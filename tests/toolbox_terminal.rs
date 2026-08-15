@@ -14,9 +14,6 @@ use serde_json::{Value, json};
 
 fn python_312() -> Option<(OsString, Vec<OsString>)> {
     let mut candidates = Vec::new();
-    if let Some(program) = env::var_os("ME_TOOLBOX_PYTHON") {
-        candidates.push((program, Vec::new()));
-    }
     candidates.push((OsString::from("python3.12"), Vec::new()));
     #[cfg(windows)]
     candidates.push((OsString::from("py"), vec![OsString::from("-3.12")]));

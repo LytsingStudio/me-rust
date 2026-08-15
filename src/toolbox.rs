@@ -854,13 +854,11 @@ impl ToolboxClient {
 impl ProcessTransport {
     fn spawn(spec: &ProcessSpec) -> std::result::Result<Self, ToolboxExecutionError> {
         let mut command = spec.python.command();
-        if let Some(path) = spec
+        let path = spec
             .python
             .augmented_path()
-            .map_err(|error| ToolboxExecutionError::Interrupted(error.to_string()))?
-        {
-            command.env("PATH", path);
-        }
+            .map_err(|error| ToolboxExecutionError::Interrupted(error.to_string()))?;
+        command.env("PATH", path);
         command
             .arg(&spec.script)
             .current_dir(&spec.workspace)
@@ -1270,8 +1268,7 @@ fn parse_update(output: Value) -> std::result::Result<ToolboxUpdate, ToolboxExec
 #[derive(Clone)]
 struct Python312 {
     program: PathBuf,
-    leading_args: Vec<OsString>,
-    path_directory: Option<PathBuf>,
+    path_directory: PathBuf,
 }
 
 impl Python312 {
@@ -1280,22 +1277,10 @@ impl Python312 {
     }
 
     fn resolve_at(config_home: &Path) -> Result<Self> {
-        if let Some(program) = env::var_os("ME_TOOLBOX_PYTHON") {
-            let candidate = Self {
-                program: program.into(),
-                leading_args: Vec::new(),
-                path_directory: None,
-            };
-            if candidate.is_python312() {
-                return Ok(candidate);
-            }
-            return Err("ME_TOOLBOX_PYTHON does not point to Python 3.12".into());
-        }
         let embedded = python_runtime::ensure(config_home)?;
         let candidate = Self {
             program: embedded.executable,
-            leading_args: Vec::new(),
-            path_directory: Some(embedded.path_directory),
+            path_directory: embedded.path_directory,
         };
         if !candidate.is_python312() {
             return Err("the Python 3.12 runtime embedded in me is unusable".into());
@@ -1304,9 +1289,7 @@ impl Python312 {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(&self.program);
-        command.args(&self.leading_args);
-        command
+        Command::new(&self.program)
     }
 
     fn is_python312(&self) -> bool {
@@ -1323,11 +1306,8 @@ impl Python312 {
             .is_ok_and(|status| status.success())
     }
 
-    fn augmented_path(&self) -> Result<Option<OsString>> {
-        self.path_directory
-            .as_deref()
-            .map(python_runtime::prepend_path)
-            .transpose()
+    fn augmented_path(&self) -> Result<OsString> {
+        python_runtime::prepend_path(&self.path_directory)
     }
 }
 
@@ -2439,7 +2419,7 @@ for line in sys.stdin:
         let python = Python312::resolve_at(&workspace.join("global"))
             .expect("embedded Python 3.12 must be available");
         let embedded_executable = python.program.clone();
-        let embedded_directory = python.path_directory.clone().unwrap();
+        let embedded_directory = python.path_directory.clone();
         let runtime =
             Arc::new(ToolboxRuntime::load_with_python(&workspace, vec![script], python).unwrap());
         assert_eq!(runtime.catalog().tools().len(), 18);
