@@ -110,15 +110,19 @@ fn numbered_lines(text: &str, first_line: usize) -> Value {
 
 macro_rules! single_edit_input {
     ($path:expr, $hash:expr, $start:expr, $end:expr, $new_lines:expr) => {
-        json!({
-            "path": $path,
-            "expected_hash": $hash,
-            "edits": [{
-                "target_line_start": $start,
-                "target_line_end": $end,
-                "new_lines": $new_lines
-            }]
-        })
+        {
+            let start = $start;
+            let end = $end;
+            let new_lines = $new_lines;
+            let edit = if start > end {
+                json!({"operation":"insert","before_line":start,"new_lines":new_lines})
+            } else if new_lines.as_array().is_some_and(|lines| lines.is_empty()) {
+                json!({"operation":"delete","start_line":start,"end_line":end})
+            } else {
+                json!({"operation":"replace","start_line":start,"end_line":end,"new_lines":new_lines})
+            };
+            json!({"path":$path,"expected_hash":$hash,"edits":[edit]})
+        }
     };
 }
 
@@ -255,34 +259,39 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
             .contains("File.Edit")
     );
     let edit_schema = toolbox.query("getInputSchema", Some("Edit"));
+    let edit_variants = edit_schema["output"]["properties"]["edits"]["items"]["oneOf"]
+        .as_array()
+        .unwrap();
+    assert_eq!(edit_variants.len(), 3);
     assert_eq!(
-        edit_schema["output"]["properties"]["edits"]["items"]["properties"]["target_line_start"]["minimum"],
-        1
+        edit_variants[0]["properties"]["operation"]["enum"],
+        json!(["replace"])
     );
+    assert_eq!(edit_variants[0]["properties"]["start_line"]["minimum"], 1);
     assert_eq!(
-        edit_schema["output"]["properties"]["edits"]["items"]["properties"]["target_line_end"]["minimum"],
-        0
+        edit_variants[1]["properties"]["operation"]["enum"],
+        json!(["delete"])
     );
     assert_eq!(edit_schema["output"]["properties"]["edits"]["minItems"], 1);
     assert_eq!(
-        edit_schema["output"]["properties"]["edits"]["items"]["properties"]["new_lines"]["type"],
-        "array"
+        edit_variants[2]["properties"]["operation"]["enum"],
+        json!(["insert"])
     );
+    assert_eq!(edit_variants[2]["properties"]["before_line"]["minimum"], 1);
+    assert_eq!(edit_variants[0]["properties"]["new_lines"]["type"], "array");
     assert!(
-        edit_schema["output"]["properties"]["edits"]["items"]["properties"]["new_lines"]
+        edit_variants[0]["properties"]["new_lines"]
             .get("maxItems")
             .is_none()
     );
     assert!(
-        edit_schema["output"]["properties"]["edits"]["items"]["properties"]["new_lines"]["items"]
+        edit_variants[0]["properties"]["new_lines"]["items"]
             .get("maxLength")
             .is_none()
     );
-    assert!(
-        edit_schema["output"]["properties"]["edits"]["items"]["properties"]
-            .get("new_text")
-            .is_none()
-    );
+    assert!(edit_variants[0]["properties"].get("new_text").is_none());
+    assert!(edit_variants[1]["properties"].get("new_lines").is_none());
+    assert!(edit_variants[2]["properties"].get("start_line").is_none());
     let edit_output_schema = toolbox.query("getOutputSchema", Some("Edit"));
     assert!(
         edit_output_schema["output"]["properties"]
@@ -302,18 +311,32 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     assert!(edit_instructions.contains("duplicated at the same insertion point"));
     assert!(edit_instructions.contains("must end in LF"));
     assert!(edit_instructions.contains("missing final line ending is a syntax error"));
-    assert!(edit_instructions.contains("does not return the new hash"));
-    assert!(edit_instructions.contains("call File.Read or File.Search again"));
+    assert!(edit_instructions.contains("deliberately omits the new hash"));
+    assert!(edit_instructions.contains("call File.Read again"));
+    assert!(edit_instructions.contains("File.Search is only a locator"));
     let edit_examples = toolbox.query("getExamples", Some("Edit"));
     let edit_examples = edit_examples["output"].as_str().unwrap();
-    assert!(edit_examples.contains("both replacements use original coordinates"));
+    assert!(edit_examples.contains("original lines 1 and 3 independently"));
     assert!(edit_examples.contains("array order is irrelevant"));
-    assert!(edit_examples.contains("Delete complete lines"));
+    assert!(edit_examples.contains("Deletion has no new_lines field"));
     assert!(edit_examples.contains("Insert into an empty file"));
-    assert!(edit_examples.contains("Common line-syntax errors"));
+    assert!(edit_examples.contains("Common errors"));
     for example in edit_examples.lines().filter(|line| line.starts_with('{')) {
         serde_json::from_str::<Value>(example).unwrap();
     }
+    let search_output = toolbox.query("getOutputSchema", Some("Search"));
+    assert!(
+        search_output["output"]["properties"]["matches"]["items"]["properties"]
+            .get("hash")
+            .is_none()
+    );
+    let search_instructions = toolbox.query("getInstructions", Some("Search"));
+    assert!(
+        search_instructions["output"]
+            .as_str()
+            .unwrap()
+            .contains("deliberately returns no hash")
+    );
     assert_eq!(
         toolbox.query("getInputSchema", Some("Read"))["output"]["properties"]["encoding"]["default"],
         "auto"
@@ -391,11 +414,12 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
             .contains(&json!("match_text"))
     );
     assert!(
-        search_match["required"]
+        !search_match["required"]
             .as_array()
             .unwrap()
             .contains(&json!("hash"))
     );
+    assert!(search_match["properties"].get("hash").is_none());
     assert!(search_match["properties"].get("line").is_none());
     assert!(search_match["properties"].get("text").is_none());
     assert_eq!(search_match["properties"]["match_text"]["maxProperties"], 1);
@@ -403,6 +427,7 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     let search_instructions = search_instructions["output"].as_str().unwrap();
     assert!(search_instructions.contains("before, match_text, and after"));
     assert!(search_instructions.contains("no separate line field"));
+    assert!(search_instructions.contains("never establishes a File.Edit baseline"));
     assert!(search_instructions.contains("top-level truncate:true"));
     assert!(search_instructions.contains("text_fragments"));
     assert!(search_instructions.contains("Source file size is not artificially capped"));
@@ -683,15 +708,29 @@ fn edit_replaces_deletes_inserts_and_preserves_exact_line_endings() {
         );
         let edited = toolbox.execute(
             "Edit",
-            single_edit_input!(path, created["output"]["hash"], start, end, new_lines),
+            single_edit_input!(
+                path,
+                created["output"]["hash"],
+                start,
+                end,
+                new_lines.clone()
+            ),
         );
         assert_eq!(edited["type"], "result", "edit failed for {path}: {edited}");
         assert_eq!(edited["output"]["operation"], "edited");
-        assert_eq!(
-            edited["output"]["edit_results"][0]["target_line_start"],
-            start
-        );
-        assert_eq!(edited["output"]["edit_results"][0]["target_line_end"], end);
+        let edit_result = &edited["output"]["edit_results"][0];
+        if start > end {
+            assert_eq!(edit_result["operation"], "insert");
+            assert_eq!(edit_result["before_line"], start);
+        } else if new_lines.as_array().is_some_and(|lines| lines.is_empty()) {
+            assert_eq!(edit_result["operation"], "delete");
+            assert_eq!(edit_result["start_line"], start);
+            assert_eq!(edit_result["end_line"], end);
+        } else {
+            assert_eq!(edit_result["operation"], "replace");
+            assert_eq!(edit_result["start_line"], start);
+            assert_eq!(edit_result["end_line"], end);
+        }
         assert_eq!(edited["output"]["edit_results"][0]["state"], "succeeded");
         assert_eq!(edited["output"]["previous_size"], initial.len());
         assert!(edited["output"].get("hash").is_none());
@@ -699,7 +738,7 @@ fn edit_replaces_deletes_inserts_and_preserves_exact_line_endings() {
             edited["output"]["tip"]
                 .as_str()
                 .unwrap()
-                .contains("use File.Read or File.Search")
+                .contains("use File.Read")
         );
         assert_eq!(fs::read_to_string(workspace.join(path)).unwrap(), expected);
         assert!(
@@ -728,8 +767,8 @@ fn edit_locates_every_operation_on_one_snapshot_and_reports_each_result() {
             "path":"batch.txt",
             "expected_hash":created["output"]["hash"],
             "edits":[
-                {"target_line_start":1,"target_line_end":1,"new_lines":["111\n","aaa\n"]},
-                {"target_line_start":3,"target_line_end":3,"new_lines":["333\n","ccc\n"]}
+                {"operation":"replace","start_line":1,"end_line":1,"new_lines":["111\n","aaa\n"]},
+                {"operation":"replace","start_line":3,"end_line":3,"new_lines":["333\n","ccc\n"]}
             ]
         }),
     );
@@ -746,9 +785,9 @@ fn edit_locates_every_operation_on_one_snapshot_and_reports_each_result() {
     );
     assert_eq!(edited["output"]["edit_results"][0]["index"], 0);
     assert_eq!(edited["output"]["edit_results"][0]["state"], "succeeded");
-    assert_eq!(edited["output"]["edit_results"][0]["kind"], "replace");
+    assert_eq!(edited["output"]["edit_results"][0]["operation"], "replace");
     assert_eq!(edited["output"]["edit_results"][0]["new_line_count"], 2);
-    assert_eq!(edited["output"]["edit_results"][1]["target_line_start"], 3);
+    assert_eq!(edited["output"]["edit_results"][1]["start_line"], 3);
     assert!(edited["output"].get("hash").is_none());
     assert!(
         edited["output"]["tip"]
@@ -762,7 +801,7 @@ fn edit_locates_every_operation_on_one_snapshot_and_reports_each_result() {
         json!({"path":"batch.txt", "query":"333", "context_before":1, "context_after":1}),
     );
     let matched = &search["output"]["matches"][0];
-    assert_eq!(matched["hash"].as_str().unwrap().len(), 8);
+    assert!(matched.get("hash").is_none());
     assert_eq!(matched["before"], json!({"3":"bbb\n"}));
     assert_eq!(matched["match_text"], json!({"4":"333\n"}));
     assert_eq!(matched["after"], json!({"5":"ccc\n"}));
@@ -787,22 +826,22 @@ fn edit_accepts_unordered_independent_ranges_and_rejects_every_ambiguous_batch_a
         (
             "overlapping replacements",
             json!([
-                {"target_line_start":1,"target_line_end":2,"new_lines":["left\n"]},
-                {"target_line_start":2,"target_line_end":3,"new_lines":["right\n"]}
+                {"operation":"replace","start_line":1,"end_line":2,"new_lines":["left\n"]},
+                {"operation":"replace","start_line":2,"end_line":3,"new_lines":["right\n"]}
             ]),
         ),
         (
             "duplicate insertion point",
             json!([
-                {"target_line_start":2,"target_line_end":1,"new_lines":["first\n"]},
-                {"target_line_start":2,"target_line_end":1,"new_lines":["second\n"]}
+                {"operation":"insert","before_line":2,"new_lines":["first\n"]},
+                {"operation":"insert","before_line":2,"new_lines":["second\n"]}
             ]),
         ),
         (
             "insertion inside replacement",
             json!([
-                {"target_line_start":1,"target_line_end":3,"new_lines":["block\n"]},
-                {"target_line_start":2,"target_line_end":1,"new_lines":["inside\n"]}
+                {"operation":"replace","start_line":1,"end_line":3,"new_lines":["block\n"]},
+                {"operation":"insert","before_line":2,"new_lines":["inside\n"]}
             ]),
         ),
     ] {
@@ -827,8 +866,9 @@ fn edit_accepts_unordered_independent_ranges_and_rejects_every_ambiguous_batch_a
             "path":"atomic.txt",
             "expected_hash":original_hash,
             "edits":[{
-                "target_line_start":1,
-                "target_line_end":1,
+                "operation":"replace",
+                "start_line":1,
+                "end_line":1,
                 "new_lines":["changed\n"],
                 "find":"aaa"
             }]
@@ -846,10 +886,10 @@ fn edit_accepts_unordered_independent_ranges_and_rejects_every_ambiguous_batch_a
             "path":"atomic.txt",
             "expected_hash":original_hash,
             "edits":[
-                {"target_line_start":4,"target_line_end":4,"new_lines":["last\n"]},
-                {"target_line_start":2,"target_line_end":1,"new_lines":["inserted\n"]},
-                {"target_line_start":3,"target_line_end":3,"new_lines":[]},
-                {"target_line_start":2,"target_line_end":2,"new_lines":["updated\n"]}
+                {"operation":"replace","start_line":4,"end_line":4,"new_lines":["last\n"]},
+                {"operation":"insert","before_line":2,"new_lines":["inserted\n"]},
+                {"operation":"delete","start_line":3,"end_line":3},
+                {"operation":"replace","start_line":2,"end_line":2,"new_lines":["updated\n"]}
             ]
         }),
     );
@@ -872,7 +912,7 @@ fn edit_accepts_unordered_independent_ranges_and_rejects_every_ambiguous_batch_a
             .as_array()
             .unwrap()
             .iter()
-            .map(|result| result["kind"].as_str().unwrap())
+            .map(|result| result["operation"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec!["replace", "insert", "delete", "replace"]
     );
@@ -896,34 +936,34 @@ fn edit_rejects_malformed_physical_lines_and_unterminated_append_atomically() {
     for (name, edits) in [
         (
             "missing line ending",
-            json!([{"target_line_start":1,"target_line_end":1,"new_lines":["changed"]}]),
+            json!([{"operation":"replace","start_line":1,"end_line":1,"new_lines":["changed"]}]),
         ),
         (
             "two physical lines in one item",
-            json!([{"target_line_start":1,"target_line_end":1,"new_lines":["one\ntwo\n"]}]),
+            json!([{"operation":"replace","start_line":1,"end_line":1,"new_lines":["one\ntwo\n"]}]),
         ),
         (
             "non-string physical line",
-            json!([{"target_line_start":1,"target_line_end":1,"new_lines":[42]}]),
+            json!([{"operation":"replace","start_line":1,"end_line":1,"new_lines":[42]}]),
         ),
         (
             "NUL in physical line",
-            json!([{"target_line_start":1,"target_line_end":1,"new_lines":["bad\u{0}\n"]}]),
+            json!([{"operation":"replace","start_line":1,"end_line":1,"new_lines":["bad\u{0}\n"]}]),
         ),
         (
             "later item missing line ending",
             json!([
-                {"target_line_start":1,"target_line_end":1,"new_lines":["valid\n"]},
-                {"target_line_start":2,"target_line_end":2,"new_lines":["invalid"]}
+                {"operation":"replace","start_line":1,"end_line":1,"new_lines":["valid\n"]},
+                {"operation":"replace","start_line":2,"end_line":2,"new_lines":["invalid"]}
             ]),
         ),
         (
             "empty insertion",
-            json!([{"target_line_start":2,"target_line_end":1,"new_lines":[]}]),
+            json!([{"operation":"insert","before_line":2,"new_lines":[]}]),
         ),
         (
             "append after unterminated final line",
-            json!([{"target_line_start":3,"target_line_end":2,"new_lines":["appended\n"]}]),
+            json!([{"operation":"insert","before_line":3,"new_lines":["appended\n"]}]),
         ),
     ] {
         let rejected = toolbox.execute(
@@ -946,7 +986,7 @@ fn edit_rejects_malformed_physical_lines_and_unterminated_append_atomically() {
         json!({
             "path":"physical.txt",
             "expected_hash":hash,
-            "edits":[{"target_line_start":1,"target_line_end":1,"new_text":"changed\n"}]
+            "edits":[{"operation":"replace","start_line":1,"end_line":1,"new_text":"changed\n"}]
         }),
     );
     assert_eq!(obsolete["error"]["code"], "invalid_arguments");
@@ -954,6 +994,38 @@ fn edit_rejects_malformed_physical_lines_and_unterminated_append_atomically() {
         fs::read_to_string(workspace.join("physical.txt")).unwrap(),
         original
     );
+
+    for (name, edit) in [
+        (
+            "replace cannot encode delete",
+            json!({"operation":"replace","start_line":1,"end_line":1,"new_lines":[]}),
+        ),
+        (
+            "delete rejects replacement data",
+            json!({"operation":"delete","start_line":1,"end_line":1,"new_lines":["x\n"]}),
+        ),
+        (
+            "insert rejects range fields",
+            json!({"operation":"insert","before_line":1,"start_line":1,"end_line":1,"new_lines":["x\n"]}),
+        ),
+        (
+            "operation is mandatory",
+            json!({"start_line":1,"end_line":1,"new_lines":["x\n"]}),
+        ),
+    ] {
+        let rejected = toolbox.execute(
+            "Edit",
+            json!({"path":"physical.txt","expected_hash":hash,"edits":[edit]}),
+        );
+        assert_eq!(
+            rejected["error"]["code"], "invalid_arguments",
+            "case={name}: {rejected}"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("physical.txt")).unwrap(),
+            original
+        );
+    }
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
@@ -992,7 +1064,7 @@ fn edit_rejects_bad_ranges_stale_hashes_and_lossy_text_atomically() {
         json!({
             "path":"safe.txt",
             "expected_hash":hash,
-            "edits":[{"target_line_start":2,"target_line_end":2,"new_lines":["changed\n"]}],
+            "edits":[{"operation":"replace","start_line":2,"end_line":2,"new_lines":["changed\n"]}],
             "find":"beta"
         }),
     );
@@ -1046,8 +1118,8 @@ fn edit_rejects_bad_ranges_stale_hashes_and_lossy_text_atomically() {
             "path":"western-batch.txt",
             "expected_hash":western_batch["output"]["hash"],
             "edits":[
-                {"target_line_start":1,"target_line_end":1,"new_lines":["Cafe\n"]},
-                {"target_line_start":2,"target_line_end":2,"new_lines":["中文\n"]}
+                {"operation":"replace","start_line":1,"end_line":1,"new_lines":["Cafe\n"]},
+                {"operation":"replace","start_line":2,"end_line":2,"new_lines":["中文\n"]}
             ]
         }),
     );
@@ -1270,24 +1342,8 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     );
     assert_eq!(search["output"]["matches"].as_array().unwrap().len(), 2);
     assert_eq!(search["output"]["matches"][0]["column"], 1);
-    assert_eq!(
-        search["output"]["matches"][0]["hash"]
-            .as_str()
-            .unwrap()
-            .len(),
-        8
-    );
-    assert_eq!(
-        search["output"]["matches"][0]["hash"],
-        read["output"]["hash"]
-    );
-    assert_eq!(
-        search["output"]["matches"][1]["hash"]
-            .as_str()
-            .unwrap()
-            .len(),
-        8
-    );
+    assert!(search["output"]["matches"][0].get("hash").is_none());
+    assert!(search["output"]["matches"][1].get("hash").is_none());
     assert_eq!(
         search["output"]["matches"][0]["before"],
         json!({"1":"zero\n"})
