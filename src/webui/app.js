@@ -435,16 +435,22 @@ async function syncAgentEvents(meta) {
 function observeInputDraft(meta, store) {
   const revision = Number(meta.input_draft_revision || 0);
   if (revision <= store.inputDraftRevision) return false;
-  const sync = state.draftSync.get(meta.id);
-  if (sync?.sending || sync?.paused) return false;
-  if (sync?.desired !== sync?.sent) {
-    store.inputDraftRevision = revision;
-    return false;
-  }
-  store.inputDraftRevision = revision;
+  if (state.draftSync.get(meta.id)?.paused) return false;
   const content = String(meta.input_draft || "");
-  state.drafts.set(meta.id, content);
-  if (state.selectedAgent === meta.id && elements.input.value !== content) {
+  adoptInputDraft(meta.id, store, revision, content);
+  return true;
+}
+
+function adoptInputDraft(agentId, store, revision, content) {
+  if (revision < store.inputDraftRevision) return false;
+  store.inputDraftRevision = revision;
+  const sync = state.draftSync.get(agentId);
+  if (sync) {
+    sync.desired = content;
+    sync.sent = content;
+  }
+  state.drafts.set(agentId, content);
+  if (state.selectedAgent === agentId && elements.input.value !== content) {
     elements.input.value = content;
     state.slashIndex = 0;
     autoSizeInput();
@@ -2546,8 +2552,12 @@ async function submitPrompt() {
   try {
     const response = await sendCommand({ command: "submit_user_prompt", agent_id: agentId, content });
     const revision = Number(response?.receipt?.prompt_submission_revision);
-    if (!Number.isSafeInteger(revision)) throw new Error("消息发送失败：服务返回了无效结果");
+    const inputDraftRevision = Number(response?.receipt?.input_draft_revision);
+    if (!Number.isSafeInteger(revision) || !Number.isSafeInteger(inputDraftRevision)) {
+      throw new Error("消息发送失败：服务返回了无效结果");
+    }
     store.promptSubmissionRevision = Math.max(store.promptSubmissionRevision, revision);
+    store.inputDraftRevision = Math.max(store.inputDraftRevision, inputDraftRevision);
   } catch (error) {
     if (state.selectedAgent === agentId && !elements.input.value) {
       elements.input.value = content;
@@ -2604,14 +2614,25 @@ async function runDraftSync(agentId, sync) {
   try {
     while (!sync.paused && sync.sent !== sync.desired) {
       const content = sync.desired;
-      sync.sent = content;
-      const response = await sendCommand({ command: "update_input_draft", agent_id: agentId, content });
-      const revision = Number(response?.receipt?.input_draft_revision);
       const store = state.stores.get(agentId);
-      if (store && Number.isSafeInteger(revision)) {
-        store.inputDraftRevision = Math.max(store.inputDraftRevision, revision);
+      if (!store) return;
+      const expectedRevision = store.inputDraftRevision;
+      const response = await sendCommand({
+        command: "update_input_draft",
+        agent_id: agentId,
+        expected_revision: expectedRevision,
+        content,
+      });
+      const revision = Number(response?.receipt?.input_draft_revision);
+      const accepted = response?.receipt?.accepted === true;
+      if (!Number.isSafeInteger(revision)) throw new Error("输入同步返回了无效结果");
+      if (revision < store.inputDraftRevision) continue;
+      if (!accepted) {
+        sync.sent = sync.desired;
+        break;
       }
-      state.drafts.set(agentId, content);
+      store.inputDraftRevision = revision;
+      sync.sent = content;
     }
   } catch (error) {
     sync.sent = null;
@@ -2664,7 +2685,13 @@ function flushDraftBeforePageCloses() {
     drafts.set(state.selectedAgent, elements.input.value);
   }
   for (const [agentId, content] of drafts) {
-    const body = JSON.stringify({ command: "update_input_draft", agent_id: agentId, content });
+    const expectedRevision = state.stores.get(agentId)?.inputDraftRevision ?? 0;
+    const body = JSON.stringify({
+      command: "update_input_draft",
+      agent_id: agentId,
+      expected_revision: expectedRevision,
+      content,
+    });
     if (navigator.sendBeacon
       && navigator.sendBeacon("/api/command", new Blob([body], { type: "application/json" }))) continue;
     void fetch("/api/command", {

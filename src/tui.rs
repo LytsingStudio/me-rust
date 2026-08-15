@@ -1543,15 +1543,18 @@ fn sync_input_draft(
     agent_id: &AgentId,
     ui: &mut TuiSession,
 ) -> Result<()> {
-    let UiCommandReceipt::InputDraftUpdated(revision) =
+    let UiCommandReceipt::InputDraftUpdated { accepted, revision } =
         commands.submit(UiCommand::UpdateInputDraft {
             agent_id: agent_id.clone(),
+            expected_revision: ui.input_draft_revision,
             content: ui.input.clone(),
         })?
     else {
         return Err("UpdateInputDraft did not return its revision".into());
     };
-    ui.input_draft_revision = revision;
+    if accepted {
+        ui.input_draft_revision = revision;
+    }
     Ok(())
 }
 
@@ -2503,17 +2506,20 @@ pub fn run(
                             ui.redraw(&mut stdout, &[], RedrawCause::InputChanged, view)?;
                             continue;
                         };
-                        let UiCommandReceipt::UserPromptSubmitted(revision) =
-                            commands.submit(UiCommand::SubmitUserPrompt {
-                                agent_id: agent_id.clone(),
-                                content: prompt,
-                            })?
+                        let UiCommandReceipt::UserPromptSubmitted {
+                            prompt_revision,
+                            input_draft_revision,
+                        } = commands.submit(UiCommand::SubmitUserPrompt {
+                            agent_id: agent_id.clone(),
+                            content: prompt,
+                        })?
                         else {
                             return Err(
                                 "SubmitUserPrompt did not return its submission revision".into()
                             );
                         };
-                        observed_prompt_submission_revision = revision;
+                        observed_prompt_submission_revision = prompt_revision;
+                        ui.input_draft_revision = input_draft_revision;
                         ui.redraw(
                             &mut stdout,
                             current_events(&snapshot, current_agent.as_ref())?,

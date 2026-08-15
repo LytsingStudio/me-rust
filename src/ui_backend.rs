@@ -151,6 +151,7 @@ pub struct UiAgentDraft {
 pub enum UiCommand {
     UpdateInputDraft {
         agent_id: AgentId,
+        expected_revision: u64,
         content: String,
     },
     SubmitUserPrompt {
@@ -198,8 +199,14 @@ pub enum UiCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiCommandReceipt {
     Accepted,
-    InputDraftUpdated(u64),
-    UserPromptSubmitted(u64),
+    InputDraftUpdated {
+        accepted: bool,
+        revision: u64,
+    },
+    UserPromptSubmitted {
+        prompt_revision: u64,
+        input_draft_revision: u64,
+    },
     AbortRequested(bool),
     AgentCreated(UiAgentDraft),
 }
@@ -348,15 +355,24 @@ impl UiBackend for WorkflowUiBackend {
 impl UiCommandGateway for WorkflowUiCommandGateway {
     fn submit(&self, command: UiCommand) -> Result<UiCommandReceipt> {
         match command {
-            UiCommand::UpdateInputDraft { agent_id, content } => {
-                Ok(UiCommandReceipt::InputDraftUpdated(
-                    self.handle.update_input_draft(&agent_id, content)?,
-                ))
+            UiCommand::UpdateInputDraft {
+                agent_id,
+                expected_revision,
+                content,
+            } => {
+                let (revision, accepted) =
+                    self.handle
+                        .update_input_draft(&agent_id, expected_revision, content)?;
+                Ok(UiCommandReceipt::InputDraftUpdated { accepted, revision })
             }
             UiCommand::SubmitUserPrompt { agent_id, content } => {
-                Ok(UiCommandReceipt::UserPromptSubmitted(
-                    self.handle.submit_user_prompt(&agent_id, content)?,
-                ))
+                let (prompt_revision, input_draft_revision) = self
+                    .handle
+                    .submit_user_prompt_with_draft_revision(&agent_id, content)?;
+                Ok(UiCommandReceipt::UserPromptSubmitted {
+                    prompt_revision,
+                    input_draft_revision,
+                })
             }
             UiCommand::ChangeEffort { agent_id, effort } => {
                 self.handle.submit_effort_change(&agent_id, effort)?;
@@ -396,10 +412,15 @@ impl UiCommandGateway for WorkflowUiCommandGateway {
             UiCommand::Regenerate {
                 agent_id,
                 final_answer_event_id,
-            } => Ok(UiCommandReceipt::UserPromptSubmitted(
-                self.handle
-                    .regenerate_final_answer(&agent_id, final_answer_event_id)?,
-            )),
+            } => {
+                let (prompt_revision, input_draft_revision) = self
+                    .handle
+                    .regenerate_final_answer(&agent_id, final_answer_event_id)?;
+                Ok(UiCommandReceipt::UserPromptSubmitted {
+                    prompt_revision,
+                    input_draft_revision,
+                })
+            }
             UiCommand::AbortTurn { agent_id } => Ok(UiCommandReceipt::AbortRequested(
                 self.handle.submit_turn_abort(&agent_id)?,
             )),
@@ -568,15 +589,20 @@ mod tests {
             &after_b.agent(&draft.id).unwrap().events,
         ));
 
-        let UiCommandReceipt::InputDraftUpdated(draft_revision) = commands
+        let UiCommandReceipt::InputDraftUpdated {
+            accepted,
+            revision: draft_revision,
+        } = commands
             .submit(UiCommand::UpdateInputDraft {
                 agent_id: draft.id.clone(),
+                expected_revision: 0,
                 content: "shared draft\nfrom reader A".into(),
             })
             .unwrap()
         else {
             panic!("UpdateInputDraft did not return its revision");
         };
+        assert!(accepted);
         let draft_a = reader_a.snapshot().unwrap();
         let draft_b = reader_b.snapshot().unwrap();
         for snapshot in [&draft_a, &draft_b] {
@@ -584,6 +610,27 @@ mod tests {
             assert_eq!(agent.input_draft, "shared draft\nfrom reader A");
             assert_eq!(agent.input_draft_revision, draft_revision);
         }
+        let UiCommandReceipt::InputDraftUpdated { accepted, revision } = commands
+            .submit(UiCommand::UpdateInputDraft {
+                agent_id: draft.id.clone(),
+                expected_revision: 0,
+                content: String::new(),
+            })
+            .unwrap()
+        else {
+            panic!("UpdateInputDraft did not return the authoritative draft");
+        };
+        assert!(!accepted);
+        assert_eq!(revision, draft_revision);
+        assert_eq!(
+            reader_a
+                .snapshot()
+                .unwrap()
+                .agent(&draft.id)
+                .unwrap()
+                .input_draft,
+            "shared draft\nfrom reader A"
+        );
         assert_eq!(after_a.agent(&draft.id).unwrap().input_draft, "");
         assert!(Arc::ptr_eq(
             &draft_a.agent(&draft.id).unwrap().events,

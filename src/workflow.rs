@@ -1108,15 +1108,29 @@ impl WorkflowHandle {
     }
 
     pub fn submit_user_prompt(&self, id: &AgentId, content: String) -> Result<u64> {
-        let (revision, _) = self.with_runtime(id, |runtime| {
-            runtime.submit_user_prompt_with_draft_revision(content)
-        })?;
+        let (revision, _) = self.submit_user_prompt_with_draft_revision(id, content)?;
         Ok(revision)
     }
 
-    pub(crate) fn update_input_draft(&self, id: &AgentId, content: String) -> Result<u64> {
-        let (revision, _) = self.with_runtime(id, |runtime| runtime.update_input_draft(content))?;
-        Ok(revision)
+    pub(crate) fn submit_user_prompt_with_draft_revision(
+        &self,
+        id: &AgentId,
+        content: String,
+    ) -> Result<(u64, u64)> {
+        self.with_runtime(id, |runtime| {
+            runtime.submit_user_prompt_with_draft_revision(content)
+        })
+    }
+
+    pub(crate) fn update_input_draft(
+        &self,
+        id: &AgentId,
+        expected_revision: u64,
+        content: String,
+    ) -> Result<(u64, bool)> {
+        self.with_runtime(id, |runtime| {
+            runtime.update_input_draft(expected_revision, content)
+        })
     }
 
     pub(crate) fn submit_manager_prompt(&self, id: &AgentId, content: String) -> Result<u64> {
@@ -1152,7 +1166,7 @@ impl WorkflowHandle {
         &self,
         id: &AgentId,
         final_answer_event_id: EventId,
-    ) -> Result<u64> {
+    ) -> Result<(u64, u64)> {
         self.ensure_history_writable(id)?;
         self.with_runtime_mut(id, |runtime| {
             runtime.regenerate_final_answer(final_answer_event_id)

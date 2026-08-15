@@ -921,13 +921,20 @@ impl AgentRuntime {
             .map_err(|_| "Agent input draft lock is poisoned".into())
     }
 
-    pub fn update_input_draft(&self, content: String) -> Result<(u64, bool)> {
+    pub fn update_input_draft(
+        &self,
+        expected_revision: u64,
+        content: String,
+    ) -> Result<(u64, bool)> {
         let mut draft = self
             .input_draft
             .lock()
             .map_err(|_| "Agent input draft lock is poisoned")?;
-        if draft.content == content {
+        if draft.revision != expected_revision {
             return Ok((draft.revision, false));
+        }
+        if draft.content == content {
+            return Ok((draft.revision, true));
         }
         draft.revision = draft
             .revision
@@ -935,6 +942,19 @@ impl AgentRuntime {
             .ok_or("Agent input draft revision exhausted")?;
         draft.content = content;
         Ok((draft.revision, true))
+    }
+
+    fn replace_input_draft(&self, content: String) -> Result<u64> {
+        let mut draft = self
+            .input_draft
+            .lock()
+            .map_err(|_| "Agent input draft lock is poisoned")?;
+        draft.revision = draft
+            .revision
+            .checked_add(1)
+            .ok_or("Agent input draft revision exhausted")?;
+        draft.content = content;
+        Ok(draft.revision)
     }
 
     fn clear_input_draft(&self) -> Result<u64> {
@@ -1168,7 +1188,10 @@ impl AgentRuntime {
             .map_err(Into::into)
     }
 
-    pub fn regenerate_final_answer(&mut self, final_answer_event_id: EventId) -> Result<u64> {
+    pub fn regenerate_final_answer(
+        &mut self,
+        final_answer_event_id: EventId,
+    ) -> Result<(u64, u64)> {
         self.ensure_conversation_edit_idle()?;
         let (reply, result) = mpsc::channel();
         self.commands
@@ -1183,14 +1206,14 @@ impl AgentRuntime {
         if let Err(error) = result {
             return Err(error.into());
         }
-        self.clear_input_draft()?;
+        let input_draft_revision = self.clear_input_draft()?;
         let previous = self
             .prompt_submission_revision
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
                 revision.checked_add(1)
             })
             .map_err(|_| "prompt submission revision exhausted")?;
-        Ok(previous + 1)
+        Ok((previous + 1, input_draft_revision))
     }
 
     fn ensure_conversation_edit_idle(&mut self) -> Result<()> {
@@ -1247,7 +1270,7 @@ impl AgentRuntime {
                     ..
                 }) = &self.last_edb_mutation
             {
-                self.update_input_draft(content.clone())?;
+                self.replace_input_draft(content.clone())?;
             }
         }
         Ok(changed)
@@ -5825,19 +5848,17 @@ mod tests {
         let runtime = AgentRuntime::new(edb, Box::new(Chatbot::new(None)), unused_model_api());
 
         assert_eq!(runtime.input_draft().unwrap(), InputDraft::default());
-        assert_eq!(
-            runtime
-                .update_input_draft("unfinished\ntext".into())
-                .unwrap(),
-            (1, true)
-        );
+        let (revision, accepted) = runtime
+            .update_input_draft(0, "unfinished\ntext".into())
+            .unwrap();
+        assert!(accepted);
+        assert_eq!(revision, 1);
         assert_eq!(runtime.input_draft().unwrap().content, "unfinished\ntext");
-        assert_eq!(
-            runtime
-                .update_input_draft("unfinished\ntext".into())
-                .unwrap(),
-            (1, false)
-        );
+        let (revision, accepted) = runtime
+            .update_input_draft(1, "unfinished\ntext".into())
+            .unwrap();
+        assert!(accepted);
+        assert_eq!(revision, 1);
         assert_eq!(runtime.submit_user_prompt("sent".into()).unwrap(), 1);
         let cleared = runtime.input_draft().unwrap();
         assert_eq!(cleared.content, "");
@@ -5868,7 +5889,10 @@ mod tests {
             unused_model_api(),
         );
 
-        assert_eq!(runtime.regenerate_final_answer(final_answer).unwrap(), 1);
+        assert_eq!(
+            runtime.regenerate_final_answer(final_answer).unwrap(),
+            (1, 1)
+        );
         wait_for_runtime_events(&mut runtime, 4);
         let new_prompt = runtime
             .edb_events()
@@ -6830,6 +6854,13 @@ mod tests {
             }
         );
         assert_eq!(runtime.input_draft().unwrap().content, "stream");
+        let restored = runtime.input_draft().unwrap();
+        let (current_revision, accepted) = runtime
+            .update_input_draft(restored.revision - 1, String::new())
+            .unwrap();
+        assert!(!accepted, "a pre-rewind UI write must be rejected");
+        assert_eq!(current_revision, restored.revision);
+        assert_eq!(runtime.input_draft().unwrap(), restored);
         assert_eq!(runtime.edb_events().len(), 3);
         assert!(runtime.edb_events().iter().all(|event| event.id() < 3));
     }

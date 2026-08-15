@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::{
     Result,
-    event::{EdbMutation, Event, EventId},
+    event::{Event, EventId},
     turn_history,
     ui_backend::{
         CHAT_ACTIVITY_TOOL_NAMES, CHAT_HIDDEN_TOOL_NAMES, CHAT_HIDDEN_TOOL_PREFIXES, UiBackend,
@@ -443,35 +443,9 @@ struct EventsResponse<'a> {
     reset: bool,
     event_count: usize,
     mutation_revision: u64,
-    rewind: Option<RewindEffect<'a>>,
     turn_history_updated: bool,
     turn_history: Option<String>,
     events: &'a [Event],
-}
-
-#[derive(Serialize)]
-struct RewindEffect<'a> {
-    target_event_id: EventId,
-    restored_prompt_content: Option<&'a str>,
-}
-
-fn rewind_effect(
-    mutation: Option<&EdbMutation>,
-    mutation_changed: bool,
-) -> Option<RewindEffect<'_>> {
-    if !mutation_changed {
-        return None;
-    }
-    match mutation? {
-        EdbMutation::Rewind {
-            target_event_id,
-            restored_prompt_content,
-        } => Some(RewindEffect {
-            target_event_id: *target_event_id,
-            restored_prompt_content: restored_prompt_content.as_deref(),
-        }),
-        EdbMutation::DeleteTurn { .. } | EdbMutation::Regenerate { .. } => None,
-    }
 }
 
 fn events_response(
@@ -493,7 +467,6 @@ fn events_response(
         .transpose()
         .map_err(|_| "invalid mutation revision")?;
     let reset = known_mutation != Some(agent.mutation_revision) || after > agent.events.len();
-    let mutation_changed = known_mutation.is_some_and(|known| known != agent.mutation_revision);
     let start = if reset { 0 } else { after };
     let events = &agent.events[start..];
     let turn_history_updated = reset
@@ -514,7 +487,6 @@ fn events_response(
             reset,
             event_count: agent.events.len(),
             mutation_revision: agent.mutation_revision,
-            rewind: rewind_effect(agent.last_mutation.as_ref(), mutation_changed),
             turn_history_updated,
             turn_history,
             events,
@@ -544,6 +516,7 @@ fn terminal_frame_response(backend: &dyn UiBackend, path: &str) -> Result<HttpRe
 enum WebCommand {
     UpdateInputDraft {
         agent_id: String,
+        expected_revision: u64,
         content: String,
     },
     SubmitUserPrompt {
@@ -641,13 +614,18 @@ fn command_response(
 fn receipt_json(receipt: UiCommandReceipt) -> serde_json::Value {
     match receipt {
         UiCommandReceipt::Accepted => json!({"kind": "accepted"}),
-        UiCommandReceipt::InputDraftUpdated(revision) => json!({
+        UiCommandReceipt::InputDraftUpdated { accepted, revision } => json!({
             "kind": "input_draft_updated",
+            "accepted": accepted,
             "input_draft_revision": revision,
         }),
-        UiCommandReceipt::UserPromptSubmitted(revision) => json!({
+        UiCommandReceipt::UserPromptSubmitted {
+            prompt_revision,
+            input_draft_revision,
+        } => json!({
             "kind": "user_prompt_submitted",
-            "prompt_submission_revision": revision,
+            "prompt_submission_revision": prompt_revision,
+            "input_draft_revision": input_draft_revision,
         }),
         UiCommandReceipt::AbortRequested(requested) => {
             json!({"kind": "abort_requested", "requested": requested})
@@ -662,8 +640,13 @@ fn receipt_json(receipt: UiCommandReceipt) -> serde_json::Value {
 
 fn into_ui_command(command: WebCommand) -> Result<UiCommand> {
     Ok(match command {
-        WebCommand::UpdateInputDraft { agent_id, content } => UiCommand::UpdateInputDraft {
+        WebCommand::UpdateInputDraft {
+            agent_id,
+            expected_revision,
+            content,
+        } => UiCommand::UpdateInputDraft {
             agent_id: AgentId::new(agent_id)?,
+            expected_revision,
             content,
         },
         WebCommand::SubmitUserPrompt { agent_id, content } => UiCommand::SubmitUserPrompt {
@@ -940,9 +923,18 @@ mod tests {
                 event_id: 42,
             }
         );
+        assert!(
+            serde_json::from_value::<WebCommand>(json!({
+                "command": "update_input_draft",
+                "agent_id": "main",
+                "content": "stale"
+            }))
+            .is_err()
+        );
         let parsed: WebCommand = serde_json::from_value(json!({
             "command": "update_input_draft",
             "agent_id": "main",
+            "expected_revision": 7,
             "content": "line one\nline two"
         }))
         .unwrap();
@@ -950,6 +942,7 @@ mod tests {
             into_ui_command(parsed).unwrap(),
             UiCommand::UpdateInputDraft {
                 agent_id: AgentId::new("main").unwrap(),
+                expected_revision: 7,
                 content: "line one\nline two".into(),
             }
         );
@@ -1006,16 +999,24 @@ mod tests {
         );
 
         assert_eq!(
-            receipt_json(UiCommandReceipt::UserPromptSubmitted(7)),
+            receipt_json(UiCommandReceipt::UserPromptSubmitted {
+                prompt_revision: 7,
+                input_draft_revision: 11,
+            }),
             json!({
                 "kind": "user_prompt_submitted",
                 "prompt_submission_revision": 7,
+                "input_draft_revision": 11,
             })
         );
         assert_eq!(
-            receipt_json(UiCommandReceipt::InputDraftUpdated(9)),
+            receipt_json(UiCommandReceipt::InputDraftUpdated {
+                accepted: false,
+                revision: 9,
+            }),
             json!({
                 "kind": "input_draft_updated",
+                "accepted": false,
                 "input_draft_revision": 9,
             })
         );
@@ -1344,6 +1345,9 @@ mod tests {
         assert!(APP_JS.contains("function observePromptSubmission(meta, store)"));
         assert!(APP_JS.contains("store.pendingPromptSubmissions > 0"));
         assert!(APP_JS.contains("function observeInputDraft(meta, store)"));
+        assert!(APP_JS.contains("function adoptInputDraft(agentId, store, revision, content)"));
+        assert!(APP_JS.contains("expected_revision: expectedRevision"));
+        assert!(APP_JS.contains("if (!accepted)"));
         assert!(APP_JS.contains("command: \"update_input_draft\""));
         assert!(APP_JS.contains("function queueDraftUpdate(agentId, content)"));
         assert!(APP_JS.contains("async function pauseDraftSyncForSubmission(agentId)"));
@@ -1509,19 +1513,6 @@ mod tests {
         assert!(STYLE_CSS.contains(".message-block.turn-toolbar"));
         assert!(STYLE_CSS.contains(".message-block.turn-toolbar span"));
         assert!(STYLE_CSS.contains("font-variant-numeric: tabular-nums"));
-    }
-
-    #[test]
-    fn rewind_effect_exposes_prompt_content_only_for_a_new_mutation() {
-        let mutation = EdbMutation::Rewind {
-            target_event_id: 42,
-            restored_prompt_content: Some("重新编辑这条消息".into()),
-        };
-        let effect = serde_json::to_value(rewind_effect(Some(&mutation), true).unwrap()).unwrap();
-        assert_eq!(effect["target_event_id"], 42);
-        assert_eq!(effect["restored_prompt_content"], "重新编辑这条消息");
-        assert!(rewind_effect(Some(&mutation), false).is_none());
-        assert!(rewind_effect(None, true).is_none());
     }
 
     #[test]
@@ -1721,6 +1712,7 @@ mod tests {
             .json(&json!({
                 "command": "update_input_draft",
                 "agent_id": id,
+                "expected_revision": 0,
                 "content": "unfinished\nshared draft",
             }))
             .send()
@@ -1730,6 +1722,29 @@ mod tests {
             .json()
             .unwrap();
         assert_eq!(draft_update["receipt"]["kind"], "input_draft_updated");
+        assert_eq!(draft_update["receipt"]["accepted"], true);
+        let draft_revision = draft_update["receipt"]["input_draft_revision"]
+            .as_u64()
+            .unwrap();
+        let stale_update: serde_json::Value = reqwest::blocking::Client::new()
+            .post(format!("{address}/api/command"))
+            .json(&json!({
+                "command": "update_input_draft",
+                "agent_id": id,
+                "expected_revision": 0,
+                "content": "stale empty draft",
+            }))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(stale_update["receipt"]["accepted"], false);
+        assert_eq!(
+            stale_update["receipt"]["input_draft_revision"],
+            draft_revision
+        );
         let reconnected: serde_json::Value =
             reqwest::blocking::get(format!("{address}/api/snapshot"))
                 .unwrap()
@@ -1840,8 +1855,6 @@ mod tests {
             .expect("rewind mutation should become visible");
         assert_eq!(after_rewind["reset"], true);
         assert_eq!(after_rewind["event_count"], initial_count);
-        assert_eq!(after_rewind["rewind"]["target_event_id"], clear_id);
-        assert!(after_rewind["rewind"]["restored_prompt_content"].is_null());
         assert_eq!(
             after_rewind["events"].as_array().unwrap().len(),
             initial_count
