@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import fnmatch
 import hashlib
@@ -46,11 +45,18 @@ HUNK_PATTERN = re.compile(
 MAX_TEXT_BYTES = 64 * 1024 * 1024
 MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024
 MAX_EDIT_OPERATIONS = 128
+MAX_BYTE_EDIT_DATA_CHARACTERS = MAX_TEXT_BYTES * 3
 EDIT_TIP = (
     "The file was edited. Its previous line numbers and hash are now stale, "
     "and the new hash is intentionally not returned. Before editing this file "
     "again, you MUST use File.Read or File.Search to obtain refreshed numbered "
     "lines and the latest hash."
+)
+EDIT_BYTES_TIP = (
+    "The file was edited. Its previous byte offsets and hash are now stale, "
+    "and the new hash is intentionally not returned. Before editing this file "
+    "again, you MUST use File.ReadBytes to obtain refreshed bytes and the "
+    "latest hash."
 )
 TEXT_ENCODINGS = [
     "auto",
@@ -103,6 +109,7 @@ CREATE_ENCODING_SCHEMA = {"type": "string", "enum": TEXT_ENCODINGS[1:]}
 TOOLS = [
     "Read",
     "ReadBytes",
+    "EditBytes",
     "List",
     "Find",
     "Search",
@@ -169,6 +176,17 @@ class ResolvedEdit:
     kind: str
 
 
+@dataclass(frozen=True)
+class ResolvedByteEdit:
+    index: int
+    target_offset: int
+    target_length: int
+    source_start: int
+    source_end: int
+    data: bytes
+    kind: str
+
+
 def object_schema(
     properties: dict[str, Any], required: list[str] | None = None
 ) -> dict[str, Any]:
@@ -217,6 +235,41 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
         ["path"],
+    ),
+    "EditBytes": object_schema(
+        {
+            "path": PATH_SCHEMA,
+            "expected_hash": HASH_SCHEMA,
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_EDIT_OPERATIONS,
+                "description": "Atomic byte edit operations whose offsets all refer to the same original file identified by expected_hash.",
+                "items": object_schema(
+                    {
+                        "target_offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 2**63 - 1,
+                            "description": "Zero-based original byte offset at which the selected half-open range begins.",
+                        },
+                        "target_length": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 2**63 - 1,
+                            "description": "Number of original bytes selected. Zero denotes an insertion point.",
+                        },
+                        "data": {
+                            "type": "string",
+                            "maxLength": MAX_BYTE_EDIT_DATA_CHARACTERS,
+                            "description": "Replacement bytes as lowercase two-digit hexadecimal values separated by one space. An empty string deletes a non-empty selected range.",
+                        },
+                    },
+                    ["target_offset", "target_length", "data"],
+                ),
+            },
+        },
+        ["path", "expected_hash", "edits"],
     ),
     "List": object_schema(
         {
@@ -423,27 +476,62 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "ReadBytes": object_schema(
         {
             "path": PATH_SCHEMA,
-            "base64": {"type": ["string", "null"]},
-            "chunks": {
-                "type": "array",
-                "items": object_schema(
-                    {
-                        "offset": {"type": "integer"},
-                        "length": {"type": "integer"},
-                        "base64": {"type": "string"},
-                    },
-                    ["offset", "length", "base64"],
-                ),
-                "description": "Exact non-contiguous byte ranges present only after model-context safety truncation.",
+            "data": {
+                "type": "string",
+                "description": "Bytes as lowercase two-digit hexadecimal values separated by one space.",
             },
-            "returned_length": {"type": "integer"},
             "offset": {"type": "integer"},
             "length": {"type": "integer"},
             "size": {"type": "integer"},
             "eof": {"type": "boolean"},
             "hash": HASH_SCHEMA,
         },
-        ["path", "base64", "offset", "length", "size", "eof", "hash"],
+        ["path", "data", "offset", "length", "size", "eof", "hash"],
+    ),
+    "EditBytes": object_schema(
+        {
+            "path": PATH_SCHEMA,
+            "operation": {"type": "string", "enum": ["bytes_edited"]},
+            "previous_hash": HASH_SCHEMA,
+            "edit_results": {
+                "type": "array",
+                "items": object_schema(
+                    {
+                        "index": {"type": "integer"},
+                        "state": {"type": "string", "enum": ["succeeded"]},
+                        "kind": {
+                            "type": "string",
+                            "enum": ["replace", "delete", "insert"],
+                        },
+                        "target_offset": {"type": "integer"},
+                        "target_length": {"type": "integer"},
+                        "selected_bytes": {"type": "integer"},
+                        "replacement_bytes": {"type": "integer"},
+                    },
+                    [
+                        "index",
+                        "state",
+                        "kind",
+                        "target_offset",
+                        "target_length",
+                        "selected_bytes",
+                        "replacement_bytes",
+                    ],
+                ),
+            },
+            "previous_size": {"type": "integer"},
+            "size": {"type": "integer"},
+            "tip": {"type": "string"},
+        },
+        [
+            "path",
+            "operation",
+            "previous_hash",
+            "edit_results",
+            "previous_size",
+            "size",
+            "tip",
+        ],
     ),
     "List": object_schema(
         {
@@ -614,7 +702,8 @@ OUTPUT_SCHEMAS["Delete"] = object_schema(
 
 ROUTES = {
     "Read": "Read a bounded text range with conservative automatic encoding detection when exact file content is needed.",
-    "ReadBytes": "Read a bounded byte range for binary data or text whose encoding cannot be determined safely.",
+    "ReadBytes": "Read a bounded byte range for binary data, text whose encoding cannot be determined safely, or a File.EditBytes baseline.",
+    "EditBytes": "Atomically replace, delete, or insert one or more independently located byte ranges after inspecting them with File.ReadBytes.",
     "List": "Inspect directory contents without invoking a shell.",
     "Find": "Find workspace paths by glob patterns.",
     "Search": "Search text across workspace files by literal text or regular expression.",
@@ -630,7 +719,12 @@ ROUTES = {
 
 INSTRUCTIONS = {
     "Read": "Line numbers are 1-based. The lines object maps each actual file line number to its exact text, including that line's original LF, CRLF, CR, or absent final line ending. Keys are minimally zero-padded to the digit width of total_lines solely to preserve numeric order in serialized JSON; interpret them as decimal line numbers. Missing numeric keys in a safely truncated model-visible result are omitted lines, not empty lines. Auto detection checks BOM, Unicode encodings, strict UTF-8, then common legacy encodings conservatively. The result reports encoding, confidence, BOM presence, and the file's current 8-character concurrency fingerprint. If auto detection is uncertain, retry only when the encoding is known by setting encoding explicitly; otherwise use ReadBytes.",
-    "ReadBytes": "The result is base64 and includes the 8-character concurrency fingerprint of the complete file, not only the returned range.",
+    "ReadBytes": "Offsets are zero-based. The result data contains lowercase two-digit hexadecimal bytes separated by one space, without a 0x prefix. length is the number of bytes represented by data, and hash identifies the complete file rather than only the returned range. Use the returned bytes and hash as the baseline for File.EditBytes. If the model-context safety envelope reports truncate:true, data retains only the earliest complete bytes from the requested range; read another range before editing bytes that are not visible. truncate_info.ranges.bytes reports retained_offset_start, retained_offset_end_exclusive, removed_offset_start, and removed_offset_end_exclusive as absolute half-open byte ranges.",
+    "EditBytes": (
+        "EditBytes atomically applies one or more operations to one file. First use File.ReadBytes to inspect every target range and obtain the complete file hash, then pass that hash as expected_hash. target_offset is a zero-based original byte offset, and target_length selects the half-open original range [target_offset, target_offset + target_length). Every operation is independently located against the same original pre-edit snapshot. Earlier array items never shift later offsets, and array order is not execution order. The tool validates every operation before writing and commits the combined result once. A later operation cannot target bytes created by another operation in the same call; perform dependent work only after another ReadBytes.\n"
+        "Use target_length > 0 with non-empty data to replace the selected bytes, target_length > 0 with data=\"\" to delete them, and target_length=0 with non-empty data to insert before target_offset. Offset 0 is the beginning; target_offset equal to the original file size is the only insertion point after the final byte and also inserts into an empty file. An empty insertion is invalid. Replacement ranges must not overlap. One original insertion point may appear only once. An insertion strictly inside a replaced range conflicts, while insertion exactly at either outer boundary is allowed. Every selected range must stay within the original file.\n"
+        "data is exact binary content written as lowercase two-digit hexadecimal bytes separated by one space, without 0x prefixes; use an empty string only for deletion. Unselected bytes and file permissions are preserved. Malformed hexadecimal data, invalid or overlapping ranges, duplicate insertion points, a stale hash, oversized input, and all other failures leave the file unchanged. A successful result deliberately does not return the new hash. Its old byte offsets and hash are stale: before every later File.EditBytes on this file, call File.ReadBytes again and use the refreshed bytes and hash."
+    ),
     "List": "Depth counts levels below path. Results are stable and symbolic-link directories are never traversed.",
     "Find": "Patterns and exclusions match workspace-relative POSIX paths. Results are stable and symbolic-link directories are never traversed.",
     "Search": "Literal search is the default. Each match returns the file's current hash plus before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and exact line text as File.Read. The sole key in match_text is the matching file line; column is 1-based within that line, so no separate line field is returned. Example: {\"path\":\"src/main.rs\",\"hash\":\"0123abcd\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\\n\"},\"match_text\":{\"042\":\"    runtime.start();\\n\"},\"after\":{\"043\":\"}\\n\"}}. The hash and numbered lines form a current File.Edit baseline. With top-level truncate:true, missing before or after keys are omitted context lines; the sole match_text value may instead be a text_fragments object, while its line key, hash, and match metadata remain intact. Text encoding is detected conservatively per file; binary, uncertain, and oversized files are skipped.",
@@ -652,6 +746,20 @@ INSTRUCTIONS = {
 EXAMPLES = {
     "Read": '{"path":"src/main.rs","start_line":1,"max_lines":200}',
     "ReadBytes": '{"path":"assets/data.bin","offset":0,"length":65536}',
+    "EditBytes": (
+        "Assume File.ReadBytes returned offset=0, data=\"00 11 22 33 44 55\", size=6, and hash=0123abcd. Every edit below refers to those six original bytes.\n\n"
+        "Replace original bytes 11 22 at [1,3) with aa bb:\n"
+        '{"path":"assets/data.bin","expected_hash":"0123abcd","edits":[{"target_offset":1,"target_length":2,"data":"aa bb"}]}'
+        "\n\nDelete original bytes 22 33 at [2,4):\n"
+        '{"path":"assets/data.bin","expected_hash":"0123abcd","edits":[{"target_offset":2,"target_length":2,"data":""}]}'
+        "\n\nInsert de ad before the first byte, and insert ff after the original final byte:\n"
+        '{"path":"assets/data.bin","expected_hash":"0123abcd","edits":[{"target_offset":0,"target_length":0,"data":"de ad"},{"target_offset":6,"target_length":0,"data":"ff"}]}'
+        "\n\nMultiple edits still use original offsets even when an earlier-position edit changes the length. This replaces original 11 with aa bb and original 44 with cc; result is 00 aa bb 22 33 cc 55:\n"
+        '{"path":"assets/data.bin","expected_hash":"0123abcd","edits":[{"target_offset":1,"target_length":1,"data":"aa bb"},{"target_offset":4,"target_length":1,"data":"cc"}]}'
+        "\n\nArray order is irrelevant. An insertion at offset 2 and a replacement beginning at offset 2 share an allowed outer boundary; the inserted byte appears before the replacement:\n"
+        '{"path":"assets/data.bin","expected_hash":"0123abcd","edits":[{"target_offset":2,"target_length":1,"data":"bb"},{"target_offset":2,"target_length":0,"data":"aa"}]}'
+        "\n\nCommon errors that reject the entire call include a range past size, target_length=0 with empty data, malformed or incomplete hexadecimal bytes, overlapping replacement ranges, duplicate insertion points, insertion strictly inside a replacement, a stale expected_hash, or attempting to target data inserted by another item. A successful result has no new hash; always call File.ReadBytes again before another EditBytes."
+    ),
     "List": '{"path":"src","depth":2,"include_hidden":false}',
     "Find": '{"path":".","patterns":["**/*.rs"],"exclude":["target/**"]}',
     "Search": '{"path":"src","query":"ToolboxRuntime","globs":["**/*.rs"]}',
@@ -767,6 +875,30 @@ def physical_lines_arg(data: dict[str, Any], edit_index: int) -> tuple[str, ...]
             )
         result.append(line)
     return tuple(result)
+
+
+def hex_data_arg(data: dict[str, Any], edit_index: int) -> bytes:
+    value = data.get("data")
+    if not isinstance(value, str):
+        raise ToolError(
+            "invalid_byte_syntax", f"edits[{edit_index}].data must be a string"
+        )
+    if len(value) > MAX_BYTE_EDIT_DATA_CHARACTERS:
+        raise ToolError(
+            "content_too_large",
+            f"edits[{edit_index}].data exceeds the byte-edit input limit",
+        )
+    tokens = [token for token in value.split(" ") if token]
+    if any(
+        len(token) != 2
+        or any(character not in "0123456789abcdefABCDEF" for character in token)
+        for token in tokens
+    ):
+        raise ToolError(
+            "invalid_byte_syntax",
+            f"edits[{edit_index}].data must contain complete two-digit hexadecimal bytes",
+        )
+    return bytes(int(token, 16) for token in tokens)
 
 
 def int_arg(
@@ -1360,7 +1492,7 @@ def execute_read_bytes(data: dict[str, Any]) -> dict[str, Any]:
     actual_offset = min(offset, size)
     return {
         "path": relative_path(path),
-        "base64": base64.b64encode(chunk).decode("ascii"),
+        "data": " ".join(f"{byte:02x}" for byte in chunk),
         "offset": actual_offset,
         "length": len(chunk),
         "size": size,
@@ -2001,6 +2133,151 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
+def execute_edit_bytes(data: dict[str, Any]) -> dict[str, Any]:
+    logical = string_arg(data, "path")
+    expected = validate_expected_hash(data.get("expected_hash"))
+    requested_edits = data.get("edits")
+    if (
+        not isinstance(requested_edits, list)
+        or not requested_edits
+        or len(requested_edits) > MAX_EDIT_OPERATIONS
+    ):
+        raise ToolError(
+            "invalid_arguments",
+            f"edits must contain 1..={MAX_EDIT_OPERATIONS} operation objects",
+        )
+    with mutation_lock():
+        path = existing_path(logical)
+        require_regular_file(path, logical, True)
+        with path.open("rb") as source:
+            raw = source.read(MAX_TEXT_BYTES + 1)
+        if len(raw) > MAX_TEXT_BYTES:
+            raise ToolError(
+                "content_too_large",
+                f"binary file exceeds the {MAX_TEXT_BYTES}-byte edit limit: {logical}",
+            )
+        previous = verify_content_hash(raw, expected)
+        original_size = len(raw)
+        resolved: list[ResolvedByteEdit] = []
+        required_fields = {"target_offset", "target_length", "data"}
+        total_replacement_bytes = 0
+        for index, value in enumerate(requested_edits):
+            item = validate_object(value)
+            unexpected = sorted(set(item) - required_fields)
+            missing = sorted(required_fields - set(item))
+            if unexpected or missing:
+                details = []
+                if missing:
+                    details.append(f"missing fields: {', '.join(missing)}")
+                if unexpected:
+                    details.append(f"unexpected fields: {', '.join(unexpected)}")
+                raise ToolError(
+                    "invalid_arguments", f"edits[{index}] " + "; ".join(details)
+                )
+            target_offset = int_arg(item, "target_offset", -1, 0, 2**63 - 1)
+            target_length = int_arg(item, "target_length", -1, 0, 2**63 - 1)
+            replacement = hex_data_arg(item, index)
+            if target_offset > original_size or target_length > original_size - target_offset:
+                raise ToolError(
+                    "invalid_range",
+                    f"edits[{index}] range [{target_offset}, {target_offset + target_length}) "
+                    f"must fit within the original {original_size}-byte file",
+                )
+            if target_length == 0 and not replacement:
+                raise ToolError(
+                    "invalid_byte_syntax",
+                    f"edits[{index}].data cannot be empty for an insertion",
+                )
+            total_replacement_bytes += len(replacement)
+            if total_replacement_bytes > MAX_TEXT_BYTES:
+                raise ToolError(
+                    "content_too_large",
+                    f"combined replacement data exceeds {MAX_TEXT_BYTES} bytes",
+                )
+            resolved.append(
+                ResolvedByteEdit(
+                    index=index,
+                    target_offset=target_offset,
+                    target_length=target_length,
+                    source_start=target_offset,
+                    source_end=target_offset + target_length,
+                    data=replacement,
+                    kind=(
+                        "insert"
+                        if target_length == 0
+                        else "delete"
+                        if not replacement
+                        else "replace"
+                    ),
+                )
+            )
+        for left_index, left in enumerate(resolved):
+            for right in resolved[left_index + 1 :]:
+                left_inserting = left.source_start == left.source_end
+                right_inserting = right.source_start == right.source_end
+                conflict = False
+                if left_inserting and right_inserting:
+                    conflict = left.source_start == right.source_start
+                elif left_inserting:
+                    conflict = right.source_start < left.source_start < right.source_end
+                elif right_inserting:
+                    conflict = left.source_start < right.source_start < left.source_end
+                else:
+                    conflict = max(left.source_start, right.source_start) < min(
+                        left.source_end, right.source_end
+                    )
+                if conflict:
+                    raise ToolError(
+                        "overlapping_edits",
+                        f"edits[{left.index}] and edits[{right.index}] overlap or use the same original insertion point; all byte edit coordinates must be independent",
+                    )
+        ordered = sorted(
+            resolved,
+            key=lambda item: (
+                item.source_start,
+                0 if item.source_start == item.source_end else 1,
+                item.source_end,
+                item.index,
+            ),
+        )
+        pieces: list[bytes] = []
+        cursor = 0
+        for item in ordered:
+            pieces.append(raw[cursor : item.source_start])
+            pieces.append(item.data)
+            cursor = item.source_end
+        pieces.append(raw[cursor:])
+        updated = b"".join(pieces)
+        if len(updated) > MAX_TEXT_BYTES:
+            raise ToolError(
+                "content_too_large",
+                f"edited file exceeds {MAX_TEXT_BYTES} bytes",
+            )
+        mode = path.stat().st_mode
+        verify_hash(path, expected)
+        atomic_replace(path, updated, mode)
+    return {
+        "path": relative_path(path),
+        "operation": "bytes_edited",
+        "previous_hash": previous,
+        "edit_results": [
+            {
+                "index": item.index,
+                "state": "succeeded",
+                "kind": item.kind,
+                "target_offset": item.target_offset,
+                "target_length": item.target_length,
+                "selected_bytes": item.target_length,
+                "replacement_bytes": len(item.data),
+            }
+            for item in sorted(resolved, key=lambda item: item.index)
+        ],
+        "previous_size": original_size,
+        "size": len(updated),
+        "tip": EDIT_BYTES_TIP,
+    }
+
+
 def execute_append(data: dict[str, Any]) -> dict[str, Any]:
     logical = string_arg(data, "path")
     expected = validate_expected_hash(data.get("expected_hash"))
@@ -2105,6 +2382,7 @@ def execute_delete(data: dict[str, Any]) -> dict[str, Any]:
 EXECUTORS = {
     "Read": execute_read,
     "ReadBytes": execute_read_bytes,
+    "EditBytes": execute_edit_bytes,
     "List": execute_list,
     "Find": execute_find,
     "Search": execute_search,
@@ -2130,7 +2408,7 @@ def handle(request: Any) -> None:
     if command == "getBrief":
         result(
             request_id,
-            "Read, search, and safely mutate files and explicitly create directories inside the workspace. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. Mutations use an 8-character SHA-256-derived concurrency fingerprint. File.Edit accepts exact newline-terminated physical lines, applies all requested ranges against one original snapshot, deliberately omits the new hash, and requires refreshed Read or Search results before a later Edit call; other hash-based mutations may chain from the returned hash. This short value detects stale edits; it is not a security integrity digest.",
+            "Read, search, and safely mutate files and explicitly create directories inside the workspace. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. Binary operations use zero-based byte ranges and canonical hexadecimal data. Mutations use an 8-character SHA-256-derived concurrency fingerprint. File.Edit and File.EditBytes apply all requested ranges against one original snapshot, deliberately omit the new hash, and require a refreshed matching read before another edit; other hash-based mutations may chain from the returned hash. This short value detects stale edits; it is not a security integrity digest.",
         )
         return
     tool = request.get("tool")

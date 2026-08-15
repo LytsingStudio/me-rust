@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
 use tiktoken_rs::o200k_base_singleton;
 use unicode_segmentation::UnicodeSegmentation;
@@ -199,54 +198,42 @@ impl TruncationState {
     }
 
     fn truncate_file_read_bytes(&mut self, root: &mut Value) -> bool {
+        let previous_removed_end = self
+            .details
+            .get("bytes")
+            .and_then(|range| range.get("removed_offset_end_exclusive"))
+            .and_then(Value::as_u64);
         let Some(detail) = detail_object_mut(root) else {
             return false;
         };
-        if detail.get("chunks").and_then(Value::as_array).is_some() {
-            let changed = detail
-                .get_mut("chunks")
-                .and_then(Value::as_array_mut)
-                .is_some_and(shrink_byte_chunks);
-            if !changed {
-                return false;
-            }
-            let retained = detail
-                .get("chunks")
-                .and_then(Value::as_array)
-                .map_or(0, |chunks| byte_chunks_len(chunks));
-            let range = detail
-                .get("chunks")
-                .and_then(Value::as_array)
-                .map_or_else(|| json!({}), |chunks| byte_chunk_range(chunks));
-            detail.insert("returned_length".into(), json!(retained));
-            self.removed_units += 1;
-            self.details.insert("bytes".into(), range);
-            return true;
-        }
-        let Some(encoded) = detail.get("base64").and_then(Value::as_str) else {
+        let Some(data) = detail.get("data").and_then(Value::as_str) else {
             return false;
         };
-        let Ok(bytes) = STANDARD.decode(encoded) else {
+        let Some(bytes) = hex_byte_tokens(data) else {
             return false;
         };
-        if bytes.len() < 3 {
+        if bytes.len() < 2 {
             return false;
         }
         let offset = detail.get("offset").and_then(Value::as_u64).unwrap_or(0);
-        let Some((left, right)) = middle_gap_keep_ends(bytes.len()) else {
-            return false;
-        };
-        let chunks = vec![
-            byte_chunk(offset, &bytes[..left]),
-            byte_chunk(offset + right as u64, &bytes[right..]),
-        ];
-        detail.insert("base64".into(), Value::Null);
-        detail.insert("chunks".into(), Value::Array(chunks));
-        detail.insert("returned_length".into(), json!(left + bytes.len() - right));
-        self.removed_units += right - left;
+        let remove = batch_size(bytes.len()).min(bytes.len() - 1);
+        let retained = bytes.len() - remove;
+        let retained_data = bytes[..retained].join(" ");
+        let removed_end = previous_removed_end.unwrap_or(offset + bytes.len() as u64);
+        detail.insert("data".into(), Value::String(retained_data));
+        detail.insert("length".into(), json!(retained));
+        if let Some(size) = detail.get("size").and_then(Value::as_u64) {
+            detail.insert("eof".into(), json!(offset + retained as u64 >= size));
+        }
+        self.removed_units += remove;
         self.details.insert(
             "bytes".into(),
-            json!({"removed_offset_start": offset + left as u64, "removed_offset_end": offset + right as u64}),
+            json!({
+                "retained_offset_start": offset,
+                "retained_offset_end_exclusive": offset + retained as u64,
+                "removed_offset_start": offset + retained as u64,
+                "removed_offset_end_exclusive": removed_end,
+            }),
         );
         true
     }
@@ -609,7 +596,8 @@ fn standard_error_is_croppable(root: &Value) -> bool {
 
 fn strategy_name(tool_name: &str) -> &'static str {
     match tool_name {
-        "File.Read" | "File.ReadBytes" | "WebBrowser.Snapshot" => "middle",
+        "File.Read" | "WebBrowser.Snapshot" => "middle",
+        "File.ReadBytes" => "keep_prefix",
         "File.List"
         | "File.Find"
         | "File.Search"
@@ -1029,77 +1017,20 @@ fn numbered_lines_range(lines: &Map<String, Value>) -> Value {
     })
 }
 
-fn byte_chunk(offset: u64, bytes: &[u8]) -> Value {
-    json!({
-        "offset": offset,
-        "length": bytes.len(),
-        "base64": STANDARD.encode(bytes),
-    })
-}
-
-fn shrink_byte_chunks(chunks: &mut Vec<Value>) -> bool {
-    let total = byte_chunks_len(chunks);
-    if total < 2 {
-        return false;
+fn hex_byte_tokens(data: &str) -> Option<Vec<&str>> {
+    if data.is_empty() {
+        return Some(Vec::new());
     }
-    let before = total;
-    let mut remove = batch_size(total).min(total.saturating_sub(chunks.len()));
-    if remove == 0 {
-        return false;
-    }
-    if let Some(first) = chunks.first_mut().and_then(Value::as_object_mut) {
-        let amount = remove.div_ceil(2);
-        remove -= shrink_byte_chunk(first, amount, false);
-    }
-    if remove > 0
-        && let Some(last) = chunks.last_mut().and_then(Value::as_object_mut)
-    {
-        shrink_byte_chunk(last, remove, true);
-    }
-    chunks.retain(|chunk| chunk.get("length").and_then(Value::as_u64).unwrap_or(0) > 0);
-    byte_chunks_len(chunks) < before
-}
-
-fn shrink_byte_chunk(chunk: &mut Map<String, Value>, amount: usize, from_start: bool) -> usize {
-    let Some(encoded) = chunk.get("base64").and_then(Value::as_str) else {
-        return 0;
-    };
-    let Ok(bytes) = STANDARD.decode(encoded) else {
-        return 0;
-    };
-    let remove = amount.min(bytes.len().saturating_sub(1));
-    if remove == 0 {
-        return 0;
-    }
-    let offset = chunk.get("offset").and_then(Value::as_u64).unwrap_or(0);
-    let retained = if from_start {
-        chunk.insert("offset".into(), json!(offset + remove as u64));
-        &bytes[remove..]
-    } else {
-        &bytes[..bytes.len() - remove]
-    };
-    chunk.insert("length".into(), json!(retained.len()));
-    chunk.insert("base64".into(), Value::String(STANDARD.encode(retained)));
-    remove
-}
-
-fn byte_chunks_len(chunks: &[Value]) -> usize {
-    chunks
+    let bytes = data.split(' ').collect::<Vec<_>>();
+    bytes
         .iter()
-        .filter_map(|chunk| chunk.get("length").and_then(Value::as_u64))
-        .map(|length| length as usize)
-        .sum()
-}
-
-fn byte_chunk_range(chunks: &[Value]) -> Value {
-    let head_end = chunks
-        .first()
-        .and_then(|chunk| Some(chunk.get("offset")?.as_u64()? + chunk.get("length")?.as_u64()?));
-    let tail_start = chunks
-        .last()
-        .and_then(|chunk| chunk.get("offset"))
-        .and_then(Value::as_u64);
-    json!({"retained_head_end_offset": head_end, "retained_tail_start_offset": tail_start})
+        .all(|byte| {
+            byte.len() == 2
+                && byte
+                    .bytes()
+                    .all(|digit| digit.is_ascii_digit() || (b'a'..=b'f').contains(&digit))
+        })
+        .then_some(bytes)
 }
 
 fn retain_referenced_terminal_styles(patch: &mut Map<String, Value>) {
@@ -1713,28 +1644,51 @@ mod tests {
     }
 
     #[test]
-    fn read_bytes_reencodes_complete_chunks() {
+    fn read_bytes_keeps_only_complete_prefix_bytes() {
         let bytes = (0..=255).cycle().take(20_000).collect::<Vec<u8>>();
+        let data = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let result = truncate_for_model_with_limit(
             "File.ReadBytes",
-            wrapper(json!({"base64":STANDARD.encode(&bytes),"offset":10,"length":bytes.len()})),
+            wrapper(json!({"data":data,"offset":10,"length":bytes.len(),"size":20_010,"eof":true})),
             600,
         );
         assert_eq!(result["truncate"], true);
-        for chunk in result["result"]["detail"]["chunks"].as_array().unwrap() {
-            let decoded = STANDARD.decode(chunk["base64"].as_str().unwrap()).unwrap();
-            assert_eq!(decoded.len() as u64, chunk["length"].as_u64().unwrap());
+        assert_eq!(result["truncate_info"]["strategy"], "keep_prefix");
+        let retained = result["result"]["detail"]["data"]
+            .as_str()
+            .unwrap()
+            .split(' ')
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained.len() as u64,
+            result["result"]["detail"]["length"].as_u64().unwrap()
+        );
+        assert!(retained.len() < bytes.len());
+        assert_eq!(retained.first().copied(), Some("00"));
+        assert_eq!(retained.get(1).copied(), Some("01"));
+        for (actual, expected) in retained.iter().zip(&bytes) {
+            assert_eq!(*actual, format!("{expected:02x}"));
         }
-        let chunks = result["result"]["detail"]["chunks"].as_array().unwrap();
-        let head = STANDARD
-            .decode(chunks.first().unwrap()["base64"].as_str().unwrap())
-            .unwrap();
-        let tail = STANDARD
-            .decode(chunks.last().unwrap()["base64"].as_str().unwrap())
-            .unwrap();
-        assert_eq!(head.first(), bytes.first());
-        assert_eq!(tail.last(), bytes.last());
+        assert!(result["result"]["detail"].get("base64").is_none());
+        assert!(result["result"]["detail"].get("chunks").is_none());
         assert_eq!(result["result"]["detail"]["offset"], 10);
+        assert_eq!(
+            result["truncate_info"]["ranges"]["bytes"]["retained_offset_end_exclusive"],
+            10 + retained.len() as u64
+        );
+        assert_eq!(
+            result["truncate_info"]["ranges"]["bytes"]["removed_offset_start"],
+            10 + retained.len() as u64
+        );
+        assert_eq!(
+            result["truncate_info"]["ranges"]["bytes"]["removed_offset_end_exclusive"],
+            20_010
+        );
+        assert_eq!(result["result"]["detail"]["eof"], false);
     }
 
     #[test]

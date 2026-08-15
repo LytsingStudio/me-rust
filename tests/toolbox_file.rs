@@ -210,10 +210,11 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     let mut toolbox = ToolboxProcess::start(&workspace, &script);
     let tools = toolbox.query("getTools", None);
     assert_eq!(tools["type"], "result");
-    assert_eq!(tools["output"].as_array().unwrap().len(), 13);
+    assert_eq!(tools["output"].as_array().unwrap().len(), 14);
     assert_eq!(tools["output"][0], "Read");
-    assert_eq!(tools["output"][6], "MakeDirectory");
-    assert_eq!(tools["output"][12], "Delete");
+    assert_eq!(tools["output"][2], "EditBytes");
+    assert_eq!(tools["output"][7], "MakeDirectory");
+    assert_eq!(tools["output"][13], "Delete");
     let tool_names = tools["output"]
         .as_array()
         .unwrap()
@@ -315,6 +316,56 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
         "object"
     );
     assert!(read_output["output"]["properties"].get("content").is_none());
+    let read_bytes_output = toolbox.query("getOutputSchema", Some("ReadBytes"));
+    assert_eq!(
+        read_bytes_output["output"]["properties"]["data"]["type"],
+        "string"
+    );
+    assert!(
+        read_bytes_output["output"]["properties"]
+            .get("base64")
+            .is_none()
+    );
+    assert!(
+        read_bytes_output["output"]["properties"]
+            .get("chunks")
+            .is_none()
+    );
+    let read_bytes_instructions = toolbox.query("getInstructions", Some("ReadBytes"));
+    let read_bytes_instructions = read_bytes_instructions["output"].as_str().unwrap();
+    assert!(read_bytes_instructions.contains("lowercase two-digit hexadecimal"));
+    assert!(read_bytes_instructions.contains("retains only the earliest complete bytes"));
+    assert!(read_bytes_instructions.contains("removed_offset_end_exclusive"));
+    assert!(read_bytes_instructions.contains("baseline for File.EditBytes"));
+    let edit_bytes_input = toolbox.query("getInputSchema", Some("EditBytes"));
+    let byte_edit = &edit_bytes_input["output"]["properties"]["edits"]["items"];
+    assert_eq!(byte_edit["properties"]["target_offset"]["minimum"], 0);
+    assert_eq!(byte_edit["properties"]["target_length"]["minimum"], 0);
+    assert_eq!(byte_edit["properties"]["data"]["type"], "string");
+    let edit_bytes_output = toolbox.query("getOutputSchema", Some("EditBytes"));
+    assert!(
+        edit_bytes_output["output"]["properties"]
+            .get("hash")
+            .is_none()
+    );
+    let edit_bytes_instructions = toolbox.query("getInstructions", Some("EditBytes"));
+    let edit_bytes_instructions = edit_bytes_instructions["output"].as_str().unwrap();
+    assert!(edit_bytes_instructions.contains("same original pre-edit snapshot"));
+    assert!(edit_bytes_instructions.contains("half-open original range"));
+    assert!(edit_bytes_instructions.contains("call File.ReadBytes again"));
+    assert!(!edit_bytes_instructions.contains("uppercase"));
+    assert!(!edit_bytes_instructions.contains("multiple spaces"));
+    let edit_bytes_examples = toolbox.query("getExamples", Some("EditBytes"));
+    let edit_bytes_examples = edit_bytes_examples["output"].as_str().unwrap();
+    assert!(edit_bytes_examples.contains("Multiple edits still use original offsets"));
+    assert!(edit_bytes_examples.contains("Array order is irrelevant"));
+    assert!(edit_bytes_examples.contains("Common errors"));
+    for example in edit_bytes_examples
+        .lines()
+        .filter(|line| line.starts_with('{'))
+    {
+        serde_json::from_str::<Value>(example).unwrap();
+    }
     let search_output = toolbox.query("getOutputSchema", Some("Search"));
     let search_match = &search_output["output"]["properties"]["matches"]["items"];
     assert!(
@@ -1137,9 +1188,27 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
         "ReadBytes",
         json!({"path":"src/blob.bin", "offset":1, "length":2}),
     );
-    assert_eq!(bytes["output"]["base64"], "AQI=");
+    assert_eq!(bytes["output"]["data"], "01 02");
+    assert!(bytes["output"].get("base64").is_none());
     assert_eq!(bytes["output"]["length"], 2);
     assert_eq!(bytes["output"]["eof"], false);
+
+    let all_bytes = toolbox.execute("ReadBytes", json!({"path":"src/blob.bin"}));
+    assert_eq!(all_bytes["output"]["data"], "00 01 02 ff");
+    assert_eq!(all_bytes["output"]["offset"], 0);
+    assert_eq!(all_bytes["output"]["length"], 4);
+    assert_eq!(all_bytes["output"]["size"], 4);
+    assert_eq!(all_bytes["output"]["eof"], true);
+    assert_eq!(all_bytes["output"]["hash"].as_str().unwrap().len(), 8);
+
+    let past_eof = toolbox.execute(
+        "ReadBytes",
+        json!({"path":"src/blob.bin", "offset":99, "length":10}),
+    );
+    assert_eq!(past_eof["output"]["data"], "");
+    assert_eq!(past_eof["output"]["offset"], 4);
+    assert_eq!(past_eof["output"]["length"], 0);
+    assert_eq!(past_eof["output"]["eof"], true);
 
     let list = toolbox.execute(
         "List",
@@ -1263,6 +1332,200 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     assert_eq!(padded_match["after"], json!({"11":"line 11\n"}));
     assert!(padded_match.get("line").is_none());
     assert!(padded_match.get("text").is_none());
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn edit_bytes_uses_one_original_snapshot_and_returns_no_chainable_hash() {
+    let workspace = temporary_workspace();
+    fs::write(
+        workspace.join("data.bin"),
+        [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+    )
+    .unwrap();
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+
+    let baseline = toolbox.execute("ReadBytes", json!({"path":"data.bin"}));
+    let hash = baseline["output"]["hash"].as_str().unwrap().to_owned();
+    let edited = toolbox.execute(
+        "EditBytes",
+        json!({
+            "path":"data.bin",
+            "expected_hash":hash,
+            "edits":[
+                {"target_offset":4,"target_length":1,"data":"  AA   bb  "},
+                {"target_offset":1,"target_length":2,"data":"   "},
+                {"target_offset":3,"target_length":0,"data":"CC"}
+            ]
+        }),
+    );
+    assert_eq!(edited["type"], "result");
+    assert_eq!(
+        fs::read(workspace.join("data.bin")).unwrap(),
+        [0x00, 0xcc, 0x33, 0xaa, 0xbb, 0x55]
+    );
+    assert_eq!(edited["output"]["operation"], "bytes_edited");
+    assert_eq!(edited["output"]["previous_size"], 6);
+    assert_eq!(edited["output"]["size"], 6);
+    assert!(edited["output"].get("hash").is_none());
+    assert_eq!(edited["output"]["edit_results"][0]["kind"], "replace");
+    assert_eq!(edited["output"]["edit_results"][0]["replacement_bytes"], 2);
+    assert_eq!(edited["output"]["edit_results"][1]["kind"], "delete");
+    assert_eq!(edited["output"]["edit_results"][2]["kind"], "insert");
+    assert!(
+        edited["output"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("MUST use File.ReadBytes")
+    );
+
+    let stale = toolbox.execute(
+        "EditBytes",
+        json!({
+            "path":"data.bin",
+            "expected_hash":hash,
+            "edits":[{"target_offset":6,"target_length":0,"data":"ff"}]
+        }),
+    );
+    assert_eq!(stale["error"]["code"], "conflict");
+    assert_eq!(
+        fs::read(workspace.join("data.bin")).unwrap(),
+        [0x00, 0xcc, 0x33, 0xaa, 0xbb, 0x55]
+    );
+
+    let refreshed = toolbox.execute("ReadBytes", json!({"path":"data.bin"}));
+    assert_eq!(refreshed["output"]["data"], "00 cc 33 aa bb 55");
+    let appended = toolbox.execute(
+        "EditBytes",
+        json!({
+            "path":"data.bin",
+            "expected_hash":refreshed["output"]["hash"],
+            "edits":[{"target_offset":6,"target_length":0,"data":"ff"}]
+        }),
+    );
+    assert_eq!(appended["type"], "result");
+    assert_eq!(
+        fs::read(workspace.join("data.bin")).unwrap(),
+        [0x00, 0xcc, 0x33, 0xaa, 0xbb, 0x55, 0xff]
+    );
+
+    fs::write(workspace.join("boundary.bin"), [0x00, 0x11, 0x22, 0x33]).unwrap();
+    let boundary_read = toolbox.execute("ReadBytes", json!({"path":"boundary.bin"}));
+    let boundary = toolbox.execute(
+        "EditBytes",
+        json!({
+            "path":"boundary.bin",
+            "expected_hash":boundary_read["output"]["hash"],
+            "edits":[
+                {"target_offset":2,"target_length":1,"data":"bb"},
+                {"target_offset":2,"target_length":0,"data":"aa"}
+            ]
+        }),
+    );
+    assert_eq!(boundary["type"], "result");
+    assert_eq!(
+        fs::read(workspace.join("boundary.bin")).unwrap(),
+        [0x00, 0x11, 0xaa, 0xbb, 0x33]
+    );
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn edit_bytes_rejects_invalid_batches_without_mutating_the_file() {
+    let workspace = temporary_workspace();
+    let original = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+    fs::write(workspace.join("data.bin"), original).unwrap();
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+    let baseline = toolbox.execute("ReadBytes", json!({"path":"data.bin"}));
+    let hash = baseline["output"]["hash"].as_str().unwrap().to_owned();
+
+    let invalid = [
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[
+                {"target_offset":1,"target_length":3,"data":"aa"},
+                {"target_offset":2,"target_length":2,"data":"bb"}
+            ]
+        }),
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[
+                {"target_offset":2,"target_length":0,"data":"aa"},
+                {"target_offset":2,"target_length":0,"data":"bb"}
+            ]
+        }),
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[
+                {"target_offset":1,"target_length":3,"data":"aa"},
+                {"target_offset":2,"target_length":0,"data":"bb"}
+            ]
+        }),
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[{"target_offset":5,"target_length":2,"data":"aa"}]
+        }),
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[{"target_offset":2,"target_length":0,"data":""}]
+        }),
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[{"target_offset":2,"target_length":1,"data":"0g"}]
+        }),
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[{"target_offset":2,"target_length":1,"data":"a"}]
+        }),
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[{"target_offset":2,"target_length":1,"data":"aabb"}]
+        }),
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[{"target_offset":2,"target_length":1}]
+        }),
+        json!({
+            "path":"data.bin","expected_hash":hash,
+            "edits":[{"target_offset":2,"target_length":1,"data":"aa","unexpected":true}]
+        }),
+    ];
+    for input in invalid {
+        let rejected = toolbox.execute("EditBytes", input);
+        assert_eq!(rejected["type"], "error", "unexpected result: {rejected}");
+        assert_eq!(fs::read(workspace.join("data.bin")).unwrap(), original);
+    }
+
+    let empty = workspace.join("empty.bin");
+    fs::write(&empty, []).unwrap();
+    let empty_read = toolbox.execute("ReadBytes", json!({"path":"empty.bin"}));
+    let inserted = toolbox.execute(
+        "EditBytes",
+        json!({
+            "path":"empty.bin",
+            "expected_hash":empty_read["output"]["hash"],
+            "edits":[{"target_offset":0,"target_length":0,"data":"00 ff"}]
+        }),
+    );
+    assert_eq!(inserted["type"], "result");
+    assert_eq!(fs::read(&empty).unwrap(), [0x00, 0xff]);
+    let inserted_read = toolbox.execute("ReadBytes", json!({"path":"empty.bin"}));
+    let deleted = toolbox.execute(
+        "EditBytes",
+        json!({
+            "path":"empty.bin",
+            "expected_hash":inserted_read["output"]["hash"],
+            "edits":[{"target_offset":0,"target_length":2,"data":""}]
+        }),
+    );
+    assert_eq!(deleted["type"], "result");
+    assert!(fs::read(&empty).unwrap().is_empty());
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
