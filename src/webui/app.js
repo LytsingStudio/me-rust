@@ -435,8 +435,27 @@ async function syncAgentEvents(meta) {
 function observeInputDraft(meta, store) {
   const revision = Number(meta.input_draft_revision || 0);
   if (revision <= store.inputDraftRevision) return false;
-  if (state.draftSync.get(meta.id)?.paused) return false;
+  const sync = state.draftSync.get(meta.id);
+  if (sync?.paused) return false;
   const content = String(meta.input_draft || "");
+
+  // A snapshot can observe this page's write before the POST response arrives.
+  // Advance the shared baseline without replacing newer text still being typed.
+  const flight = sync?.inFlight;
+  if (flight && revision === flight.expectedRevision + 1 && content === flight.content) {
+    store.inputDraftRevision = revision;
+    sync.sent = content;
+    return false;
+  }
+
+  // IME composition is one logical edit. Remember concurrent remote state so the
+  // completed local composition can be written against its latest revision.
+  if (sync && state.composing && state.selectedAgent === meta.id) {
+    if (!sync.pendingRemote || revision > sync.pendingRemote.revision) {
+      sync.pendingRemote = { revision, content };
+    }
+    return false;
+  }
   adoptInputDraft(meta.id, store, revision, content);
   return true;
 }
@@ -448,6 +467,7 @@ function adoptInputDraft(agentId, store, revision, content) {
   if (sync) {
     sync.desired = content;
     sync.sent = content;
+    if (sync.pendingRemote?.revision <= revision) sync.pendingRemote = null;
   }
   state.drafts.set(agentId, content);
   if (state.selectedAgent === agentId && elements.input.value !== content) {
@@ -2594,15 +2614,58 @@ async function escapeAction() {
 
 function saveDraft() {
   if (!state.selectedAgent) return;
+  const agentId = state.selectedAgent;
   const content = elements.input.value;
-  state.drafts.set(state.selectedAgent, content);
-  queueDraftUpdate(state.selectedAgent, content);
+  const previous = state.drafts.get(agentId) || "";
+  state.drafts.set(agentId, content);
+  if (state.composing) {
+    let sync = state.draftSync.get(agentId);
+    if (!sync) {
+      sync = {
+        desired: content, sent: previous, sending: false, paused: false,
+        inFlight: null, pendingRemote: null, waiters: [],
+      };
+      state.draftSync.set(agentId, sync);
+    } else sync.desired = content;
+    return;
+  }
+  queueDraftUpdate(agentId, content);
+}
+
+function beginInputComposition() {
+  state.composing = true;
+  const agentId = state.selectedAgent;
+  if (!agentId || state.draftSync.has(agentId)) return;
+  const content = elements.input.value;
+  state.draftSync.set(agentId, {
+    desired: content, sent: content, sending: false, paused: false,
+    inFlight: null, pendingRemote: null, waiters: [],
+  });
+}
+
+function endInputComposition() {
+  state.composing = false;
+  state.lastInputAt = performance.now();
+  const agentId = state.selectedAgent;
+  const sync = state.draftSync.get(agentId);
+  const store = state.stores.get(agentId);
+  if (sync?.pendingRemote) {
+    if (store && sync.pendingRemote.revision > store.inputDraftRevision) {
+      store.inputDraftRevision = sync.pendingRemote.revision;
+      sync.sent = sync.pendingRemote.content;
+    }
+    sync.pendingRemote = null;
+  }
+  saveDraft();
 }
 
 function queueDraftUpdate(agentId, content) {
   let sync = state.draftSync.get(agentId);
   if (!sync) {
-    sync = { desired: content, sent: null, sending: false, paused: false, waiters: [] };
+    sync = {
+      desired: content, sent: null, sending: false, paused: false,
+      inFlight: null, pendingRemote: null, waiters: [],
+    };
     state.draftSync.set(agentId, sync);
   } else sync.desired = content;
   void runDraftSync(agentId, sync);
@@ -2612,17 +2675,26 @@ async function runDraftSync(agentId, sync) {
   if (sync.sending || sync.paused) return;
   sync.sending = true;
   try {
-    while (!sync.paused && sync.sent !== sync.desired) {
+    while (!sync.paused
+        && !(state.composing && state.selectedAgent === agentId)
+        && sync.sent !== sync.desired) {
       const content = sync.desired;
       const store = state.stores.get(agentId);
       if (!store) return;
       const expectedRevision = store.inputDraftRevision;
-      const response = await sendCommand({
-        command: "update_input_draft",
-        agent_id: agentId,
-        expected_revision: expectedRevision,
-        content,
-      });
+      const flight = { expectedRevision, content };
+      sync.inFlight = flight;
+      let response;
+      try {
+        response = await sendCommand({
+          command: "update_input_draft",
+          agent_id: agentId,
+          expected_revision: expectedRevision,
+          content,
+        });
+      } finally {
+        if (sync.inFlight === flight) sync.inFlight = null;
+      }
       const revision = Number(response?.receipt?.input_draft_revision);
       const accepted = response?.receipt?.accepted === true;
       if (!Number.isSafeInteger(revision)) throw new Error("输入同步返回了无效结果");
@@ -2642,14 +2714,19 @@ async function runDraftSync(agentId, sync) {
     sync.sending = false;
     const waiters = sync.waiters.splice(0);
     waiters.forEach((resolve) => resolve());
-    if (!sync.paused && shouldRetry) void runDraftSync(agentId, sync);
+    if (!sync.paused && !(state.composing && state.selectedAgent === agentId) && shouldRetry) {
+      void runDraftSync(agentId, sync);
+    }
   }
 }
 
 async function pauseDraftSyncForSubmission(agentId) {
   let sync = state.draftSync.get(agentId);
   if (!sync) {
-    sync = { desired: "", sent: null, sending: false, paused: true, waiters: [] };
+    sync = {
+      desired: "", sent: null, sending: false, paused: true,
+      inFlight: null, pendingRemote: null, waiters: [],
+    };
     state.draftSync.set(agentId, sync);
   } else {
     sync.desired = "";
@@ -2837,11 +2914,8 @@ elements.input.addEventListener("input", () => {
   state.lastInputAt = performance.now();
   saveDraft(); state.slashIndex = 0; autoSizeInput(); renderSlashMenu();
 });
-elements.input.addEventListener("compositionstart", () => { state.composing = true; });
-elements.input.addEventListener("compositionend", () => {
-  state.composing = false;
-  state.lastInputAt = performance.now();
-});
+elements.input.addEventListener("compositionstart", beginInputComposition);
+elements.input.addEventListener("compositionend", endInputComposition);
 function enterSubmitsInCurrentLayout(event) {
   return event.key === "Enter" && !event.shiftKey && !PORTRAIT_LAYOUT.matches;
 }
