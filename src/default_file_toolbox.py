@@ -42,10 +42,7 @@ HASH_PATTERN = re.compile(r"^[0-9a-f]{8}$")
 HUNK_PATTERN = re.compile(
     r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
 )
-MAX_TEXT_BYTES = 64 * 1024 * 1024
-MAX_SEARCH_FILE_BYTES = 8 * 1024 * 1024
 MAX_EDIT_OPERATIONS = 128
-MAX_BYTE_EDIT_DATA_CHARACTERS = MAX_TEXT_BYTES * 3
 EDIT_TIP = (
     "The file was edited. Its previous line numbers and hash are now stale, "
     "and the new hash is intentionally not returned. Before editing this file "
@@ -261,7 +258,6 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                         },
                         "data": {
                             "type": "string",
-                            "maxLength": MAX_BYTE_EDIT_DATA_CHARACTERS,
                             "description": "Replacement bytes as lowercase two-digit hexadecimal values separated by one space. An empty string deletes a non-empty selected range.",
                         },
                     },
@@ -390,11 +386,9 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                         },
                         "new_lines": {
                             "type": "array",
-                            "maxItems": MAX_TEXT_BYTES,
                             "items": {
                                 "type": "string",
                                 "minLength": 1,
-                                "maxLength": MAX_TEXT_BYTES,
                             },
                             "description": "Exact replacement physical lines. Every item must contain exactly one line and end in LF, CRLF, or CR. An empty array deletes the selected lines.",
                         },
@@ -718,16 +712,16 @@ ROUTES = {
 }
 
 INSTRUCTIONS = {
-    "Read": "Line numbers are 1-based. The lines object maps each actual file line number to its exact text, including that line's original LF, CRLF, CR, or absent final line ending. Keys are minimally zero-padded to the digit width of total_lines solely to preserve numeric order in serialized JSON; interpret them as decimal line numbers. Missing numeric keys in a safely truncated model-visible result are omitted lines, not empty lines. Auto detection checks BOM, Unicode encodings, strict UTF-8, then common legacy encodings conservatively. The result reports encoding, confidence, BOM presence, and the file's current 8-character concurrency fingerprint. If auto detection is uncertain, retry only when the encoding is known by setting encoding explicitly; otherwise use ReadBytes.",
-    "ReadBytes": "Offsets are zero-based. The result data contains lowercase two-digit hexadecimal bytes separated by one space, without a 0x prefix. length is the number of bytes represented by data, and hash identifies the complete file rather than only the returned range. Use the returned bytes and hash as the baseline for File.EditBytes. If the model-context safety envelope reports truncate:true, data retains only the earliest complete bytes from the requested range; read another range before editing bytes that are not visible. truncate_info.ranges.bytes reports retained_offset_start, retained_offset_end_exclusive, removed_offset_start, and removed_offset_end_exclusive as absolute half-open byte ranges.",
+    "Read": "Line numbers are 1-based. The lines object maps each actual file line number to its exact text, including that line's original LF, CRLF, CR, or absent final line ending. Keys are minimally zero-padded to the digit width of total_lines solely to preserve numeric order in serialized JSON; interpret them as decimal line numbers. Missing numeric keys in a safely truncated model-visible result are omitted lines, not empty lines. Source file size is not artificially capped: the complete file is loaded into memory to detect its encoding, count lines, and compute its hash, while max_lines bounds the returned range. Auto detection checks BOM, Unicode encodings, strict UTF-8, then common legacy encodings conservatively. The result reports encoding, confidence, BOM presence, and the file's current 8-character concurrency fingerprint. If auto detection is uncertain, retry only when the encoding is known by setting encoding explicitly; otherwise use ReadBytes.",
+    "ReadBytes": "Offsets are zero-based, and source file size is not artificially capped. The result data contains lowercase two-digit hexadecimal bytes separated by one space, without a 0x prefix. length is the number of bytes represented by data, and hash identifies the complete file rather than only the returned range. Use the returned bytes and hash as the baseline for File.EditBytes. If the model-context safety envelope reports truncate:true, data retains only the earliest complete bytes from the requested range; read another range before editing bytes that are not visible. truncate_info.ranges.bytes reports retained_offset_start, retained_offset_end_exclusive, removed_offset_start, and removed_offset_end_exclusive as absolute half-open byte ranges.",
     "EditBytes": (
         "EditBytes atomically applies one or more operations to one file. First use File.ReadBytes to inspect every target range and obtain the complete file hash, then pass that hash as expected_hash. target_offset is a zero-based original byte offset, and target_length selects the half-open original range [target_offset, target_offset + target_length). Every operation is independently located against the same original pre-edit snapshot. Earlier array items never shift later offsets, and array order is not execution order. The tool validates every operation before writing and commits the combined result once. A later operation cannot target bytes created by another operation in the same call; perform dependent work only after another ReadBytes.\n"
         "Use target_length > 0 with non-empty data to replace the selected bytes, target_length > 0 with data=\"\" to delete them, and target_length=0 with non-empty data to insert before target_offset. Offset 0 is the beginning; target_offset equal to the original file size is the only insertion point after the final byte and also inserts into an empty file. An empty insertion is invalid. Replacement ranges must not overlap. One original insertion point may appear only once. An insertion strictly inside a replaced range conflicts, while insertion exactly at either outer boundary is allowed. Every selected range must stay within the original file.\n"
-        "data is exact binary content written as lowercase two-digit hexadecimal bytes separated by one space, without 0x prefixes; use an empty string only for deletion. Unselected bytes and file permissions are preserved. Malformed hexadecimal data, invalid or overlapping ranges, duplicate insertion points, a stale hash, oversized input, and all other failures leave the file unchanged. A successful result deliberately does not return the new hash. Its old byte offsets and hash are stale: before every later File.EditBytes on this file, call File.ReadBytes again and use the refreshed bytes and hash."
+        "data is exact binary content written as lowercase two-digit hexadecimal bytes separated by one space, without 0x prefixes; use an empty string only for deletion. Source file size is not artificially capped; the complete file is loaded into memory for the atomic edit. Unselected bytes and file permissions are preserved. Malformed hexadecimal data, invalid or overlapping ranges, duplicate insertion points, a stale hash, and all other failures leave the file unchanged. A successful result deliberately does not return the new hash. Its old byte offsets and hash are stale: before every later File.EditBytes on this file, call File.ReadBytes again and use the refreshed bytes and hash."
     ),
     "List": "Depth counts levels below path. Results are stable and symbolic-link directories are never traversed.",
     "Find": "Patterns and exclusions match workspace-relative POSIX paths. Results are stable and symbolic-link directories are never traversed.",
-    "Search": "Literal search is the default. Each match returns the file's current hash plus before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and exact line text as File.Read. The sole key in match_text is the matching file line; column is 1-based within that line, so no separate line field is returned. Example: {\"path\":\"src/main.rs\",\"hash\":\"0123abcd\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\\n\"},\"match_text\":{\"042\":\"    runtime.start();\\n\"},\"after\":{\"043\":\"}\\n\"}}. The hash and numbered lines form a current File.Edit baseline. With top-level truncate:true, missing before or after keys are omitted context lines; the sole match_text value may instead be a text_fragments object, while its line key, hash, and match metadata remain intact. Text encoding is detected conservatively per file; binary, uncertain, and oversized files are skipped.",
+    "Search": "Literal search is the default. Source file size is not artificially capped; each candidate file is loaded into memory, and max_matches bounds the returned result. Each match returns the file's current hash plus before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and exact line text as File.Read. The sole key in match_text is the matching file line; column is 1-based within that line, so no separate line field is returned. Example: {\"path\":\"src/main.rs\",\"hash\":\"0123abcd\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\\n\"},\"match_text\":{\"042\":\"    runtime.start();\\n\"},\"after\":{\"043\":\"}\\n\"}}. The hash and numbered lines form a current File.Edit baseline. With top-level truncate:true, missing before or after keys are omitted context lines; the sole match_text value may instead be a text_fragments object, while its line key, hash, and match metadata remain intact. Text encoding is detected conservatively per file; binary and uncertain files are skipped.",
     "Stat": "A missing path is a normal result. Content hashes are returned only for ordinary files, not directories or symbolic links.",
     "MakeDirectory": "parents defaults to false, requiring the immediate parent to exist. Set parents=true to create every missing directory in the path. The target itself must not already exist; existing files, directories, and symbolic links return already_exists.",
     "Create": "The parent directory must already exist. encoding defaults to utf-8 because a new file has no bytes to inspect; bom defaults to false and is allowed only for UTF encodings. Creation fails if the destination exists.",
@@ -735,7 +729,7 @@ INSTRUCTIONS = {
         "Edit atomically applies one or more operations to one text file. First use File.Read or File.Search to obtain the current numbered text and hash, then pass that hash as expected_hash. Every operation in edits is independently located against that one original pre-edit snapshot. Earlier array items never shift or otherwise change the meaning of later line numbers; array order is not execution order. The tool validates and locates every operation before writing, then commits the combined result once. If any operation is invalid, unencodable, overlapping, duplicated at the same insertion point, or otherwise ambiguous, the entire call fails and the file remains unchanged. A later operation cannot target text created by an earlier operation in the same call; perform that dependent work only after another Read or Search.\n"
         "Line numbers are 1-based and replacement endpoints are inclusive. For replacement or deletion, require 1 <= target_line_start <= target_line_end <= total_lines. For insertion, use the only empty-range form target_line_start = target_line_end + 1; it inserts before target_line_start. Thus 1/0 inserts at the beginning, N/N-1 inserts before line N, total_lines+1/total_lines inserts at the end, and 1/0 is also how an empty file receives its first content. Any larger reversed gap is invalid. Replacement ranges must not share original lines. An insertion must not lie inside a replaced range, and one original insertion point may appear only once; insertion exactly at a replacement's outer boundary is allowed.\n"
         "new_lines is an array of exact physical lines, deliberately matching the line values returned by File.Read and File.Search. Every item must contain exactly one line and must end in LF (\\n), CRLF (\\r\\n), or CR (\\r); an embedded line ending or a missing final line ending is a syntax error. Edit never adds, removes, converts, or guesses line endings. Use new_lines=[] to delete the selected complete lines and their endings. Use new_lines=[\"\\n\"] (or the matching CRLF/CR form) to retain one blank line. To merge several selected source lines, replace their whole range with one complete physical line. File.Edit intentionally cannot create an unterminated line. Insertion after an existing unterminated final line is rejected; include that final source line in a replacement instead.\n"
-        "Edit does not search inside a line and does not accept a partial line fragment as a location. To change part of a line, provide that entire resulting physical line in new_lines, including unchanged surrounding characters and its ending. The existing encoding, BOM, permissions, and all bytes represented by unselected text are preserved through one atomic commit. Unrepresentable text, malformed physical lines, invalid ranges, stale hashes, uncertain encodings, oversized results, and all other failures leave the file unchanged. A successful File.Edit result deliberately does not return the new hash. Its old line numbers and hash are invalid for further editing: before every later File.Edit on this file, you must call File.Read or File.Search again and use the refreshed numbered lines and hash."
+        "Edit does not search inside a line and does not accept a partial line fragment as a location. To change part of a line, provide that entire resulting physical line in new_lines, including unchanged surrounding characters and its ending. Source file size is not artificially capped; the complete file is loaded into memory for the atomic edit. The existing encoding, BOM, permissions, and all bytes represented by unselected text are preserved through one atomic commit. Unrepresentable text, malformed physical lines, invalid ranges, stale hashes, uncertain encodings, and all other failures leave the file unchanged. A successful File.Edit result deliberately does not return the new hash. Its old line numbers and hash are invalid for further editing: before every later File.Edit on this file, you must call File.Read or File.Search again and use the refreshed numbered lines and hash."
     ),
     "Append": "The file must exist and match expected_hash. Existing encoding and BOM are preserved. Content is appended exactly and no newline is added. Unrepresentable text returns encoding_error without modifying the file.",
     "Replace": "The file must exist and match expected_hash. Its detected encoding and BOM are preserved while the complete content is replaced atomically. Unrepresentable text returns encoding_error without modifying the file.",
@@ -842,11 +836,6 @@ def physical_lines_arg(data: dict[str, Any], edit_index: int) -> tuple[str, ...]
             "invalid_line_syntax",
             f"edits[{edit_index}].new_lines must be an array of complete physical lines",
         )
-    if len(value) > MAX_TEXT_BYTES:
-        raise ToolError(
-            "invalid_line_syntax",
-            f"edits[{edit_index}].new_lines contains too many lines",
-        )
     result: list[str] = []
     for line_index, line in enumerate(value):
         if not isinstance(line, str):
@@ -882,11 +871,6 @@ def hex_data_arg(data: dict[str, Any], edit_index: int) -> bytes:
     if not isinstance(value, str):
         raise ToolError(
             "invalid_byte_syntax", f"edits[{edit_index}].data must be a string"
-        )
-    if len(value) > MAX_BYTE_EDIT_DATA_CHARACTERS:
-        raise ToolError(
-            "content_too_large",
-            f"edits[{edit_index}].data exceeds the byte-edit input limit",
         )
     tokens = [token for token in value.split(" ") if token]
     if any(
@@ -1277,12 +1261,7 @@ def create_bom(encoding: str, enabled: bool) -> bytes:
 
 
 def read_text_file(path: Path, logical: str, encoding: str = "auto") -> TextDocument:
-    size = path.stat().st_size
-    if size > MAX_TEXT_BYTES:
-        raise ToolError("content_too_large", f"text file exceeds {MAX_TEXT_BYTES} bytes: {logical}")
     content = path.read_bytes()
-    if len(content) > MAX_TEXT_BYTES:
-        raise ToolError("content_too_large", f"text file exceeds {MAX_TEXT_BYTES} bytes: {logical}")
     return decode_text_bytes(content, logical, encoding)
 
 
@@ -1582,9 +1561,6 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
         if globs and not (matches_any(relative, globs) or matches_any(path.name, globs)):
             continue
         try:
-            if path.stat().st_size > MAX_SEARCH_FILE_BYTES:
-                skipped_binary += 1
-                continue
             raw = path.read_bytes()
             file_hash = sha256_bytes(raw)
             text = decode_text_bytes(raw, relative).text
@@ -1710,8 +1686,6 @@ def execute_create(data: dict[str, Any]) -> dict[str, Any]:
     encoding = encoding_arg(data, default="utf-8", allow_auto=False)
     bom = create_bom(encoding, bool_arg(data, "bom", False))
     content = encode_text(text, encoding, bom, logical)
-    if len(content) > MAX_TEXT_BYTES:
-        raise ToolError("content_too_large", f"content exceeds {MAX_TEXT_BYTES} bytes")
     path = lexical_path(logical)
     with mutation_lock():
         if path.exists() or path.is_symlink():
@@ -1721,8 +1695,6 @@ def execute_create(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def split_patch_lines(patch: str) -> list[str]:
-    if len(patch.encode("utf-8")) > MAX_TEXT_BYTES:
-        raise ToolError("patch_too_large", f"patch exceeds {MAX_TEXT_BYTES} UTF-8 bytes")
     lines = patch.split("\n")
     if lines and lines[-1] == "":
         lines.pop()
@@ -1935,8 +1907,6 @@ def execute_apply_patch(data: dict[str, Any]) -> dict[str, Any]:
         hunks = parse_unified_diff(patch, relative_path(path))
         text, added, removed = apply_unified_diff(document.text, hunks)
         updated = encode_text(text, document.encoding, document.bom, logical)
-        if len(updated) > MAX_TEXT_BYTES:
-            raise ToolError("content_too_large", f"patched file exceeds {MAX_TEXT_BYTES} bytes")
         verify_hash(path, expected)
         atomic_replace(path, updated, path.stat().st_mode)
     output = mutation_result(
@@ -2090,8 +2060,6 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
         updated = encode_text(
             updated_text, document.encoding, document.bom, logical
         )
-        if len(updated) > MAX_TEXT_BYTES:
-            raise ToolError("content_too_large", f"edited file exceeds {MAX_TEXT_BYTES} bytes")
         mode = path.stat().st_mode
         verify_hash(path, expected)
         atomic_replace(path, updated, mode)
@@ -2150,17 +2118,11 @@ def execute_edit_bytes(data: dict[str, Any]) -> dict[str, Any]:
         path = existing_path(logical)
         require_regular_file(path, logical, True)
         with path.open("rb") as source:
-            raw = source.read(MAX_TEXT_BYTES + 1)
-        if len(raw) > MAX_TEXT_BYTES:
-            raise ToolError(
-                "content_too_large",
-                f"binary file exceeds the {MAX_TEXT_BYTES}-byte edit limit: {logical}",
-            )
+            raw = source.read()
         previous = verify_content_hash(raw, expected)
         original_size = len(raw)
         resolved: list[ResolvedByteEdit] = []
         required_fields = {"target_offset", "target_length", "data"}
-        total_replacement_bytes = 0
         for index, value in enumerate(requested_edits):
             item = validate_object(value)
             unexpected = sorted(set(item) - required_fields)
@@ -2187,12 +2149,6 @@ def execute_edit_bytes(data: dict[str, Any]) -> dict[str, Any]:
                 raise ToolError(
                     "invalid_byte_syntax",
                     f"edits[{index}].data cannot be empty for an insertion",
-                )
-            total_replacement_bytes += len(replacement)
-            if total_replacement_bytes > MAX_TEXT_BYTES:
-                raise ToolError(
-                    "content_too_large",
-                    f"combined replacement data exceeds {MAX_TEXT_BYTES} bytes",
                 )
             resolved.append(
                 ResolvedByteEdit(
@@ -2248,11 +2204,6 @@ def execute_edit_bytes(data: dict[str, Any]) -> dict[str, Any]:
             cursor = item.source_end
         pieces.append(raw[cursor:])
         updated = b"".join(pieces)
-        if len(updated) > MAX_TEXT_BYTES:
-            raise ToolError(
-                "content_too_large",
-                f"edited file exceeds {MAX_TEXT_BYTES} bytes",
-            )
         mode = path.stat().st_mode
         verify_hash(path, expected)
         atomic_replace(path, updated, mode)
@@ -2290,8 +2241,6 @@ def execute_append(data: dict[str, Any]) -> dict[str, Any]:
         previous = verify_content_hash(document.raw, expected)
         appended = encode_text(appended_text, document.encoding, b"", logical)
         updated = document.raw + appended
-        if len(updated) > MAX_TEXT_BYTES:
-            raise ToolError("content_too_large", f"appended file exceeds {MAX_TEXT_BYTES} bytes")
         verify_hash(path, expected)
         atomic_replace(path, updated, path.stat().st_mode)
     output = mutation_result(
@@ -2318,8 +2267,6 @@ def execute_replace(data: dict[str, Any]) -> dict[str, Any]:
         document = read_text_file(path, logical, encoding)
         previous = verify_content_hash(document.raw, expected)
         updated = encode_text(text, document.encoding, document.bom, logical)
-        if len(updated) > MAX_TEXT_BYTES:
-            raise ToolError("content_too_large", f"replacement exceeds {MAX_TEXT_BYTES} bytes")
         mode = path.stat().st_mode
         verify_hash(path, expected)
         atomic_replace(path, updated, mode)
@@ -2408,7 +2355,7 @@ def handle(request: Any) -> None:
     if command == "getBrief":
         result(
             request_id,
-            "Read, search, and safely mutate files and explicitly create directories inside the workspace. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. Binary operations use zero-based byte ranges and canonical hexadecimal data. Mutations use an 8-character SHA-256-derived concurrency fingerprint. File.Edit and File.EditBytes apply all requested ranges against one original snapshot, deliberately omit the new hash, and require a refreshed matching read before another edit; other hash-based mutations may chain from the returned hash. This short value detects stale edits; it is not a security integrity digest.",
+            "Read, search, and safely mutate files and explicitly create directories inside the workspace. Source file size is not artificially capped; operations that need complete contents load them into memory, while bounded query parameters limit model-visible results. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. Binary operations use zero-based byte ranges and canonical hexadecimal data. Mutations use an 8-character SHA-256-derived concurrency fingerprint. File.Edit and File.EditBytes apply all requested ranges against one original snapshot, deliberately omit the new hash, and require a refreshed matching read before another edit; other hash-based mutations may chain from the returned hash. This short value detects stale edits; it is not a security integrity digest.",
         )
         return
     tool = request.get("tool")

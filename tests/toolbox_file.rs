@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -221,12 +221,10 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
         .iter()
         .map(|value| value.as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    assert!(
-        toolbox.query("getBrief", None)["output"]
-            .as_str()
-            .unwrap()
-            .contains("8-character")
-    );
+    let brief = toolbox.query("getBrief", None);
+    let brief = brief["output"].as_str().unwrap();
+    assert!(brief.contains("8-character"));
+    assert!(brief.contains("Source file size is not artificially capped"));
     for tool in &tool_names {
         for command in [
             "getInputSchema",
@@ -271,6 +269,16 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
         "array"
     );
     assert!(
+        edit_schema["output"]["properties"]["edits"]["items"]["properties"]["new_lines"]
+            .get("maxItems")
+            .is_none()
+    );
+    assert!(
+        edit_schema["output"]["properties"]["edits"]["items"]["properties"]["new_lines"]["items"]
+            .get("maxLength")
+            .is_none()
+    );
+    assert!(
         edit_schema["output"]["properties"]["edits"]["items"]["properties"]
             .get("new_text")
             .is_none()
@@ -310,6 +318,13 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
         toolbox.query("getInputSchema", Some("Read"))["output"]["properties"]["encoding"]["default"],
         "auto"
     );
+    let read_instructions = toolbox.query("getInstructions", Some("Read"));
+    assert!(
+        read_instructions["output"]
+            .as_str()
+            .unwrap()
+            .contains("Source file size is not artificially capped")
+    );
     let read_output = toolbox.query("getOutputSchema", Some("Read"));
     assert_eq!(
         read_output["output"]["properties"]["lines"]["type"],
@@ -342,6 +357,7 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     assert_eq!(byte_edit["properties"]["target_offset"]["minimum"], 0);
     assert_eq!(byte_edit["properties"]["target_length"]["minimum"], 0);
     assert_eq!(byte_edit["properties"]["data"]["type"], "string");
+    assert!(byte_edit["properties"]["data"].get("maxLength").is_none());
     let edit_bytes_output = toolbox.query("getOutputSchema", Some("EditBytes"));
     assert!(
         edit_bytes_output["output"]["properties"]
@@ -389,6 +405,8 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     assert!(search_instructions.contains("no separate line field"));
     assert!(search_instructions.contains("top-level truncate:true"));
     assert!(search_instructions.contains("text_fragments"));
+    assert!(search_instructions.contains("Source file size is not artificially capped"));
+    assert!(!search_instructions.contains("oversized files are skipped"));
     let create_encodings = toolbox.query("getInputSchema", Some("Create"))["output"]["properties"]
         ["encoding"]["enum"]
         .as_array()
@@ -1332,6 +1350,78 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     assert_eq!(padded_match["after"], json!({"11":"line 11\n"}));
     assert!(padded_match.get("line").is_none());
     assert!(padded_match.get("text").is_none());
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn large_source_files_are_not_rejected_by_an_artificial_size_limit() {
+    let workspace = temporary_workspace();
+    let path = workspace.join("large.txt");
+    let mut file = fs::File::create(&path).unwrap();
+    file.write_all(b"head\n").unwrap();
+    let full_mebibyte_line = vec![b'x'; 1024 * 1024 - 1];
+    for _ in 0..65 {
+        file.write_all(&full_mebibyte_line).unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+    let tail = b"unique-large-file-needle\n";
+    let tail_offset = file.stream_position().unwrap();
+    file.write_all(tail).unwrap();
+    file.flush().unwrap();
+    drop(file);
+    assert!(fs::metadata(&path).unwrap().len() > 64 * 1024 * 1024);
+
+    let script = generated_file_toolbox(&workspace);
+    let script_text = fs::read_to_string(&script).unwrap();
+    assert!(!script_text.contains("MAX_TEXT_BYTES"));
+    assert!(!script_text.contains("MAX_SEARCH_FILE_BYTES"));
+    assert!(!script_text.contains("content_too_large"));
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+
+    let read = toolbox.execute(
+        "Read",
+        json!({"path":"large.txt", "start_line":67, "max_lines":1}),
+    );
+    assert_eq!(read["type"], "result", "unexpected result: {read}");
+    assert_eq!(
+        read["output"]["lines"],
+        json!({"67":"unique-large-file-needle\n"})
+    );
+    assert_eq!(read["output"]["total_lines"], 67);
+
+    let search = toolbox.execute(
+        "Search",
+        json!({"path":"large.txt", "query":"unique-large-file-needle"}),
+    );
+    assert_eq!(search["type"], "result", "unexpected result: {search}");
+    assert_eq!(search["output"]["skipped_binary"], 0);
+    assert_eq!(search["output"]["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        search["output"]["matches"][0]["match_text"],
+        json!({"67":"unique-large-file-needle\n"})
+    );
+
+    let bytes = toolbox.execute(
+        "ReadBytes",
+        json!({"path":"large.txt", "offset":tail_offset, "length":tail.len()}),
+    );
+    assert_eq!(bytes["type"], "result", "unexpected result: {bytes}");
+    let edited = toolbox.execute(
+        "EditBytes",
+        json!({
+            "path":"large.txt",
+            "expected_hash":bytes["output"]["hash"],
+            "edits":[{"target_offset":tail_offset,"target_length":1,"data":"55"}]
+        }),
+    );
+    assert_eq!(edited["type"], "result", "unexpected result: {edited}");
+    let mut changed = fs::File::open(&path).unwrap();
+    changed.seek(SeekFrom::Start(tail_offset)).unwrap();
+    let mut first = [0_u8; 1];
+    changed.read_exact(&mut first).unwrap();
+    assert_eq!(first, [b'U']);
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
