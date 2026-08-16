@@ -376,6 +376,12 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "exclude": STRING_ARRAY,
             "include_hidden": {"type": "boolean", "default": False},
+            "depth": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 32,
+                "description": "Maximum levels below path to traverse. 1 includes only direct children. Omit for unlimited recursion.",
+            },
             "max_results": {
                 "type": "integer",
                 "minimum": 1,
@@ -392,6 +398,12 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "regex": {"type": "boolean", "default": False},
             "case_sensitive": {"type": "boolean", "default": True},
             "globs": STRING_ARRAY,
+            "depth": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 32,
+                "description": "Maximum levels below a directory path to search. 1 searches only direct child files. Omit for unlimited recursion.",
+            },
             "context_before": {
                 "type": "integer",
                 "minimum": 0,
@@ -835,8 +847,8 @@ ROUTES = {
     "ReadBytes": "Read a bounded byte range for binary data, text whose encoding cannot be determined safely, or a File.EditBytes baseline.",
     "EditBytes": "Atomically replace, delete, or insert one or more independently located byte ranges after inspecting them with File.ReadBytes.",
     "List": "Inspect directory contents without invoking a shell.",
-    "Find": "Find workspace paths by glob patterns.",
-    "Search": "Search text across workspace files by literal text or regular expression.",
+    "Find": "Find workspace paths by glob patterns with optional recursion depth.",
+    "Search": "Search text across workspace files by literal text or regular expression with optional recursion depth.",
     "Stat": "Inspect existence, type, metadata, and current content hashes.",
     "MakeDirectory": "Create one explicit directory, optionally including its missing parent chain.",
     "Create": "Create a new text file in an explicit encoding, defaulting to UTF-8; never overwrite an existing file.",
@@ -856,8 +868,8 @@ INSTRUCTIONS = {
         "data is exact binary content written as lowercase two-digit hexadecimal bytes separated by one space, without 0x prefixes; use an empty string only for deletion. Source file size is not artificially capped; the complete file is loaded into memory for the atomic edit. Unselected bytes and file permissions are preserved. Malformed hexadecimal data, invalid or overlapping ranges, duplicate insertion points, a stale hash, and all other failures leave the file unchanged. A successful result deliberately does not return the new hash. Its old byte offsets and hash are stale: before every later File.EditBytes on this file, call File.ReadBytes again and use the refreshed bytes and hash."
     ),
     "List": "Depth counts levels below path. Results are stable and symbolic-link directories are never traversed.",
-    "Find": "Patterns and exclusions match workspace-relative POSIX paths. Results are stable and symbolic-link directories are never traversed.",
-    "Search": "Literal search is the default. Source file size is not artificially capped; each candidate file is loaded into memory, and max_matches bounds the returned result. Each match returns before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and logical line text as File.Read; values never contain line terminators. The sole key in match_text is the matching file line; column is 1-based within that line. Example: {\"path\":\"src/main.rs\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\"},\"match_text\":{\"042\":\"    runtime.start();\"},\"after\":{\"043\":\"}\"}}. Search is only a locator: it never establishes editable_ranges. Before editing a located file, call File.Read for every target range. Never infer unseen edit boundaries from Search results. With top-level truncate:true, missing before or after keys are omitted context lines, and the sole match_text value may instead be a text_fragments object while its line key and match metadata remain intact. Text encoding is detected conservatively per file; binary and uncertain files are skipped.",
+    "Find": "Patterns and exclusions match workspace-relative POSIX paths. depth counts levels below path: 1 visits only direct children and 2 visits direct children plus their children. Omit depth for unlimited recursion. If path is a file, it alone is considered. Results are stable and symbolic-link directories are never traversed.",
+    "Search": "Literal search is the default. For a directory path, depth counts levels below it: 1 searches only direct child files and 2 also searches files in direct child directories. Omit depth for unlimited recursion. If path is a file, it alone is searched. Hidden entries and symbolic-link directories are always skipped. Source file size is not artificially capped; each candidate file is loaded into memory, and max_matches bounds the returned result. Each match returns before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and logical line text as File.Read; values never contain line terminators. The sole key in match_text is the matching file line; column is 1-based within that line. Example: {\"path\":\"src/main.rs\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\"},\"match_text\":{\"042\":\"    runtime.start();\"},\"after\":{\"043\":\"}\"}}. Search is only a locator: it never establishes editable_ranges. Before editing a located file, call File.Read for every target range. Never infer unseen edit boundaries from Search results. With top-level truncate:true, missing before or after keys are omitted context lines, and the sole match_text value may instead be a text_fragments object while its line key and match metadata remain intact. Text encoding is detected conservatively per file; binary and uncertain files are skipped.",
     "Stat": "A missing path is a normal result. Content hashes are returned only for ordinary files, not directories or symbolic links.",
     "MakeDirectory": "parents defaults to false, requiring the immediate parent to exist. Set parents=true to create every missing directory in the path. The target itself must not already exist; existing files, directories, and symbolic links return already_exists.",
     "Create": "The parent directory must already exist. encoding defaults to utf-8 because a new file has no bytes to inspect; bom defaults to false and is allowed only for UTF encodings. Creation fails if the destination exists.",
@@ -891,8 +903,8 @@ EXAMPLES = {
         "\n\nCommon errors that reject the entire call include a range past size, target_length=0 with empty data, malformed or incomplete hexadecimal bytes, overlapping replacement ranges, duplicate insertion points, insertion strictly inside a replacement, a stale expected_hash, or attempting to target data inserted by another item. A successful result has no new hash; always call File.ReadBytes again before another EditBytes."
     ),
     "List": '{"path":"src","depth":2,"include_hidden":false}',
-    "Find": '{"path":".","patterns":["**/*.rs"],"exclude":["target/**"]}',
-    "Search": '{"path":"src","query":"ToolboxRuntime","globs":["**/*.rs"]}',
+    "Find": 'Unlimited recursion (depth omitted):\n{"path":".","patterns":["**/*.rs"],"exclude":["target/**"]}\n\nOnly direct children:\n{"path":"src","patterns":["*.rs"],"depth":1}',
+    "Search": 'Unlimited recursion (depth omitted):\n{"path":"src","query":"ToolboxRuntime","globs":["**/*.rs"]}\n\nOnly files directly inside src:\n{"path":"src","query":"ToolboxRuntime","globs":["*.rs"],"depth":1}',
     "Stat": '{"paths":["Cargo.toml","src/main.rs","missing.txt"]}',
     "MakeDirectory": '{"path":"build/generated/assets","parents":true}',
     "Create": '{"path":"notes.txt","content":"first line\\n","encoding":"utf-8"}',
@@ -1014,6 +1026,19 @@ def int_arg(
     data: dict[str, Any], name: str, default: int, minimum: int, maximum: int
 ) -> int:
     value = data.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+        raise ToolError(
+            "invalid_arguments", f"{name} must be an integer in {minimum}..={maximum}"
+        )
+    return value
+
+
+def optional_int_arg(
+    data: dict[str, Any], name: str, minimum: int, maximum: int
+) -> int | None:
+    if name not in data:
+        return None
+    value = data[name]
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise ToolError(
             "invalid_arguments", f"{name} must be an integer in {minimum}..={maximum}"
@@ -1480,37 +1505,53 @@ def matches_any(path: str, patterns: list[str]) -> bool:
     return False
 
 
-def walk_files(start: Path, include_hidden: bool) -> Iterator[Path]:
+def walk_files(
+    start: Path, include_hidden: bool, depth: int | None = None
+) -> Iterator[Path]:
     if start.is_file():
         yield start
         return
     if not start.is_dir():
         raise ToolError("unsupported_file_type", f"search root is not a file or directory: {relative_path(start)}")
     for directory, names, files in os.walk(start, followlinks=False):
-        names[:] = sorted(
+        current_depth = len(Path(directory).relative_to(start).parts)
+        descendable_directories = sorted(
             name
             for name in names
             if (include_hidden or not name.startswith("."))
             and not (Path(directory) / name).is_symlink()
+        )
+        names[:] = (
+            []
+            if depth is not None and current_depth + 1 >= depth
+            else descendable_directories
         )
         for name in sorted(files):
             if include_hidden or not name.startswith("."):
                 yield Path(directory) / name
 
 
-def walk_entries(start: Path, include_hidden: bool) -> Iterator[Path]:
+def walk_entries(
+    start: Path, include_hidden: bool, depth: int | None = None
+) -> Iterator[Path]:
     if not start.is_dir():
         yield start
         return
     for directory, names, files in os.walk(start, followlinks=False):
+        current_depth = len(Path(directory).relative_to(start).parts)
         visible_directories = sorted(
             name for name in names if include_hidden or not name.startswith(".")
         )
-        names[:] = [
+        descendable_directories = [
             name
             for name in visible_directories
             if not (Path(directory) / name).is_symlink()
         ]
+        names[:] = (
+            []
+            if depth is not None and current_depth + 1 >= depth
+            else descendable_directories
+        )
         for name in visible_directories:
             yield Path(directory) / name
         for name in sorted(files):
@@ -1664,10 +1705,11 @@ def execute_find(data: dict[str, Any]) -> dict[str, Any]:
     patterns = string_list(data, "patterns", required=True, max_items=64)
     exclude = string_list(data, "exclude")
     include_hidden = bool_arg(data, "include_hidden", False)
+    depth = optional_int_arg(data, "depth", 1, 32)
     max_results = int_arg(data, "max_results", 1000, 1, 10000)
     start = existing_path(logical)
     results: list[str] = []
-    for path in walk_entries(start, include_hidden):
+    for path in walk_entries(start, include_hidden, depth):
         relative = relative_path(path)
         if matches_any(relative, exclude):
             continue
@@ -1684,6 +1726,7 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
     use_regex = bool_arg(data, "regex", False)
     case_sensitive = bool_arg(data, "case_sensitive", True)
     globs = string_list(data, "globs")
+    depth = optional_int_arg(data, "depth", 1, 32)
     context_before = int_arg(data, "context_before", 0, 0, 20)
     context_after = int_arg(data, "context_after", 0, 0, 20)
     max_matches = int_arg(data, "max_matches", 500, 1, 5000)
@@ -1695,7 +1738,7 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
     start = existing_path(logical)
     matches: list[dict[str, Any]] = []
     skipped_binary = 0
-    for path in walk_files(start, False):
+    for path in walk_files(start, False, depth):
         relative = relative_path(path)
         if globs and not (matches_any(relative, globs) or matches_any(path.name, globs)):
             continue

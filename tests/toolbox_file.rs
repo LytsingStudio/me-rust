@@ -409,6 +409,46 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
             .unwrap()
             .contains("never establishes editable_ranges")
     );
+    let find_input = toolbox.query("getInputSchema", Some("Find"));
+    assert_eq!(find_input["output"]["properties"]["depth"]["minimum"], 1);
+    assert_eq!(find_input["output"]["properties"]["depth"]["maximum"], 32);
+    assert!(
+        find_input["output"]["properties"]["depth"]
+            .get("default")
+            .is_none()
+    );
+    let find_instructions = toolbox.query("getInstructions", Some("Find"));
+    assert!(
+        find_instructions["output"]
+            .as_str()
+            .unwrap()
+            .contains("Omit depth for unlimited recursion")
+    );
+    let search_input = toolbox.query("getInputSchema", Some("Search"));
+    assert_eq!(search_input["output"]["properties"]["depth"]["minimum"], 1);
+    assert_eq!(search_input["output"]["properties"]["depth"]["maximum"], 32);
+    assert!(
+        search_input["output"]["properties"]["depth"]
+            .get("default")
+            .is_none()
+    );
+    assert!(
+        search_instructions["output"]
+            .as_str()
+            .unwrap()
+            .contains("Omit depth for unlimited recursion")
+    );
+    for tool in ["Find", "Search"] {
+        let examples = toolbox.query("getExamples", Some(tool));
+        for example in examples["output"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with('{'))
+        {
+            serde_json::from_str::<Value>(example).unwrap();
+        }
+    }
     assert_eq!(
         toolbox.query("getInputSchema", Some("Read"))["output"]["properties"]["encoding"]["default"],
         "auto"
@@ -1508,6 +1548,130 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     assert_eq!(padded_match["after"], json!({"11":"line 11"}));
     assert!(padded_match.get("line").is_none());
     assert!(padded_match.get("text").is_none());
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn find_and_search_have_optional_bounded_recursion_depth() {
+    let workspace = temporary_workspace();
+    fs::create_dir_all(workspace.join("root/one/two")).unwrap();
+    fs::write(workspace.join("root/direct.txt"), "needle direct\n").unwrap();
+    fs::write(workspace.join("root/one/nested.txt"), "needle nested\n").unwrap();
+    fs::write(workspace.join("root/one/two/deep.txt"), "needle deep\n").unwrap();
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+
+    let unlimited_find = toolbox.execute("Find", json!({"path":"root", "patterns":["*.txt"]}));
+    assert_eq!(
+        unlimited_find["output"]["results"],
+        json!([
+            "root/direct.txt",
+            "root/one/nested.txt",
+            "root/one/two/deep.txt"
+        ])
+    );
+    let direct_find = toolbox.execute(
+        "Find",
+        json!({"path":"root", "patterns":["*.txt"], "depth":1}),
+    );
+    assert_eq!(direct_find["output"]["results"], json!(["root/direct.txt"]));
+    let two_level_find = toolbox.execute(
+        "Find",
+        json!({"path":"root", "patterns":["*.txt"], "depth":2}),
+    );
+    assert_eq!(
+        two_level_find["output"]["results"],
+        json!(["root/direct.txt", "root/one/nested.txt"])
+    );
+    let maximum_depth_find = toolbox.execute(
+        "Find",
+        json!({"path":"root", "patterns":["*.txt"], "depth":32}),
+    );
+    assert_eq!(
+        maximum_depth_find["output"]["results"],
+        unlimited_find["output"]["results"]
+    );
+    let file_find = toolbox.execute(
+        "Find",
+        json!({"path":"root/one/two/deep.txt", "patterns":["*.txt"], "depth":1}),
+    );
+    assert_eq!(
+        file_find["output"]["results"],
+        json!(["root/one/two/deep.txt"])
+    );
+
+    let unlimited_search = toolbox.execute("Search", json!({"path":"root", "query":"needle"}));
+    assert_eq!(
+        unlimited_search["output"]["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let direct_search = toolbox.execute(
+        "Search",
+        json!({"path":"root", "query":"needle", "depth":1}),
+    );
+    assert_eq!(
+        direct_search["output"]["matches"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        direct_search["output"]["matches"][0]["path"],
+        "root/direct.txt"
+    );
+    let two_level_search = toolbox.execute(
+        "Search",
+        json!({"path":"root", "query":"needle", "depth":2}),
+    );
+    assert_eq!(
+        two_level_search["output"]["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        two_level_search["output"]["matches"][1]["path"],
+        "root/one/nested.txt"
+    );
+    let maximum_depth_search = toolbox.execute(
+        "Search",
+        json!({"path":"root", "query":"needle", "depth":32}),
+    );
+    assert_eq!(
+        maximum_depth_search["output"]["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let file_search = toolbox.execute(
+        "Search",
+        json!({"path":"root/one/two/deep.txt", "query":"needle", "depth":1}),
+    );
+    assert_eq!(
+        file_search["output"]["matches"].as_array().unwrap().len(),
+        1
+    );
+
+    for (tool, input) in [
+        (
+            "Find",
+            json!({"path":"root", "patterns":["*.txt"], "depth":0}),
+        ),
+        (
+            "Search",
+            json!({"path":"root", "query":"needle", "depth":33}),
+        ),
+    ] {
+        let invalid = toolbox.execute(tool, input);
+        assert_eq!(invalid["type"], "error");
+        assert_eq!(invalid["error"]["code"], "invalid_arguments");
+    }
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
