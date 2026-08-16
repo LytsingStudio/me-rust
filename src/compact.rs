@@ -282,12 +282,14 @@ pub fn execute(
             code: "invalid_arguments".into(),
             message: error.to_string(),
             retryable: false,
+            tip: None,
         })?;
     if value.as_object().is_none_or(|object| !object.is_empty()) {
         return Err(ToolboxExecutionError::Tool {
             code: "invalid_arguments".into(),
             message: "Compact accepts only an empty object".into(),
             retryable: false,
+            tip: None,
         });
     }
     if !warning_active {
@@ -319,6 +321,7 @@ pub fn execute(
             code: "compact_not_needed".into(),
             message,
             retryable: false,
+            tip: None,
         });
     }
     Ok(json!({"status": "accepted"}))
@@ -454,6 +457,7 @@ mod tests {
                 code,
                 message,
                 retryable: false,
+                ..
             } if code == "compact_not_needed"
                 && message.contains("52000/100000")
                 && message.contains("52.0%")

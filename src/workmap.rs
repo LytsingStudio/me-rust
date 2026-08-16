@@ -2166,6 +2166,7 @@ fn tool_error(code: impl Into<String>, message: impl Into<String>) -> ToolboxExe
         code: code.into(),
         message: message.into(),
         retryable: false,
+        tip: None,
     }
 }
 

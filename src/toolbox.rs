@@ -402,6 +402,7 @@ impl ToolboxRuntime {
                 code: "tool_disabled".into(),
                 message: "File.ApplyPatch is disabled. Use File.Edit instead.".into(),
                 retryable: false,
+                tip: None,
             });
         }
         let tool = self
@@ -413,12 +414,14 @@ impl ToolboxRuntime {
                 code: "unknown_tool".into(),
                 message: format!("tool {full_name} is not loaded"),
                 retryable: false,
+                tip: None,
             })?;
         let input =
             serde_json::from_str(arguments).map_err(|error| ToolboxExecutionError::Tool {
                 code: "invalid_arguments".into(),
                 message: error.to_string(),
                 retryable: false,
+                tip: None,
             })?;
         let program =
             self.programs
@@ -427,6 +430,7 @@ impl ToolboxRuntime {
                     code: "toolbox_unavailable".into(),
                     message: format!("toolbox {} is not running", tool.toolbox),
                     retryable: true,
+                    tip: None,
                 })?;
         program.execute_cancellable(&tool.local_name, input, &mut on_update, &mut should_cancel)
     }
@@ -597,6 +601,7 @@ pub enum ToolboxExecutionError {
         code: String,
         message: String,
         retryable: bool,
+        tip: Option<String>,
     },
     Protocol(String),
 }
@@ -609,9 +614,13 @@ impl std::fmt::Display for ToolboxExecutionError {
                 code,
                 message,
                 retryable,
+                tip,
             } => write!(
                 formatter,
-                "tool error {code}: {message} (retryable={retryable})"
+                "tool error {code}: {message} (retryable={retryable}){}",
+                tip.as_ref()
+                    .map(|tip| format!("; tip: {tip}"))
+                    .unwrap_or_default()
             ),
             Self::Protocol(message) => write!(formatter, "toolbox protocol error: {message}"),
         }
@@ -678,6 +687,8 @@ struct ToolboxErrorFrame {
     message: String,
     #[serde(default)]
     retryable: bool,
+    #[serde(default)]
+    tip: Option<String>,
 }
 
 impl ToolboxClient {
@@ -1228,6 +1239,7 @@ fn receive_response(
                         code: error.code,
                         message: error.message,
                         retryable: error.retryable,
+                        tip: error.tip,
                     });
                 }
                 kind => {
@@ -2406,6 +2418,14 @@ def execute(request):
     if tool == "WrongId":
         send({"id": request["id"] + 1000, "type": "result", "output": {}})
         return
+    if tool == "ErrorWithTip":
+        send({"id": request["id"], "type": "error", "error": {
+            "code": "guided_error",
+            "message": "something recoverable happened",
+            "retryable": True,
+            "tip": "Please inspect the target and try again."
+        }})
+        return
     value = request["input"]["value"]
     time.sleep(request["input"].get("delay_ms", 0) / 1000)
     send({"id": request["id"], "type": "update", "output": {"stream": "stdout", "content": "update:" + value}})
@@ -2422,7 +2442,7 @@ for line in sys.stdin:
     request = json.loads(line)
     cmd = request["cmd"]
     if cmd == "getTools":
-        send({"id": request["id"], "type": "result", "output": ["Echo", "Exit", "BadJson", "WrongId"]})
+        send({"id": request["id"], "type": "result", "output": ["Echo", "Exit", "BadJson", "WrongId", "ErrorWithTip"]})
     elif cmd == "getBrief":
         send({"id": request["id"], "type": "result", "output": "Probe toolbox"})
     elif cmd in ("getInputSchema", "getOutputSchema"):
@@ -2441,7 +2461,7 @@ for line in sys.stdin:
         let embedded_directory = python.path_directory.clone();
         let runtime =
             Arc::new(ToolboxRuntime::load_with_python(&workspace, vec![script], python).unwrap());
-        assert_eq!(runtime.catalog().tools().len(), 18);
+        assert_eq!(runtime.catalog().tools().len(), 19);
         assert!(runtime.catalog().resolve_api_name("Agent_Create").is_none());
         assert!(runtime.catalog().resolve_api_name("Agent_Stop").is_none());
         assert!(
@@ -2463,7 +2483,20 @@ for line in sys.stdin:
                 ref code,
                 ref message,
                 retryable: false,
+                ..
             } if code == "tool_disabled" && message.contains("File.Edit")
+        ));
+        let guided = runtime
+            .execute("Probe.ErrorWithTip", "{}", |_| Ok(()))
+            .unwrap_err();
+        assert!(matches!(
+            guided,
+            ToolboxExecutionError::Tool {
+                ref code,
+                retryable: true,
+                tip: Some(ref tip),
+                ..
+            } if code == "guided_error" && tip == "Please inspect the target and try again."
         ));
 
         let first_runtime = Arc::clone(&runtime);

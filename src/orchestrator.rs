@@ -2517,6 +2517,7 @@ impl MainAgent {
                 code: "worker_image_forbidden".into(),
                 message: "Worker cannot inspect images. Return the image path or URL to the Manager for direct inspection with Image.".into(),
                 retryable: false,
+                tip: None,
             })
         } else if call.name == image_toolbox::INFO_TOOL_NAME {
             image_toolbox::load(&call.arguments, &self.workspace)
@@ -2530,6 +2531,7 @@ impl MainAgent {
                         models.active_model().name
                     ),
                     retryable: false,
+                    tip: None,
                 })
             } else {
                 image_toolbox::load(&call.arguments, &self.workspace).and_then(|loaded| {
@@ -2556,6 +2558,7 @@ impl MainAgent {
                     code: "worker_tool_forbidden".into(),
                     message: "Worker tools are available only to ManagerAgent.".into(),
                     retryable: false,
+                    tip: None,
                 })
             } else {
                 let input_queue = self.input_queue.clone();
@@ -2572,6 +2575,7 @@ impl MainAgent {
                 code: "agent_tool_disabled".into(),
                 message: "The Agent toolbox is disabled and cannot create or control sub-Agents. Continue with the other available tools.".into(),
                 retryable: false,
+                tip: None,
             })
         } else if workmap::is_workmap_tool(&call.name) {
             let previous_len = edb.len();
@@ -2677,8 +2681,17 @@ impl MainAgent {
                 code,
                 message,
                 retryable,
+                tip,
             }) => {
-                append_tool_failure(edb, call.id, &code, &message, retryable, on_event)?;
+                append_tool_failure(
+                    edb,
+                    call.id,
+                    &code,
+                    &message,
+                    retryable,
+                    tip.as_deref(),
+                    on_event,
+                )?;
                 Ok(ToolExecutionOutcome::Completed)
             }
             Err(ToolboxExecutionError::Protocol(_)) => {
@@ -2737,18 +2750,23 @@ fn append_tool_failure(
     code: &str,
     message: &str,
     retryable: bool,
+    tip: Option<&str>,
     on_event: &mut dyn FnMut(&EventDataBase) -> Result<()>,
 ) -> Result<()> {
+    let mut error = json!({
+        "code": code,
+        "message": message,
+        "retryable": retryable
+    });
+    if let Some(tip) = tip {
+        error["tip"] = Value::String(tip.into());
+    }
     edb.append_tool_result(
         tool_call_id,
         ToolResultState::Failed,
         None,
         serde_json::to_string(&json!({
-            "error": {
-                "code": code,
-                "message": message,
-                "retryable": retryable
-            }
+            "error": error
         }))?,
     )?;
     on_event(edb)
@@ -5627,7 +5645,9 @@ impl FileEditScopeProjection {
         {
             self.files.remove(&path);
         }
-        if succeeded_mutation && call.name == "File.Move" {
+        if result.state == ToolResultState::Succeeded
+            && matches!(call.name.as_str(), "File.Move" | "File.Copy")
+        {
             let destination = detail
                 .as_ref()
                 .and_then(|detail| detail.get("destination"))
@@ -6061,6 +6081,52 @@ mod tests {
     }
 
     #[test]
+    fn tool_failure_preserves_an_optional_plain_language_tip() {
+        let mut edb = EventDataBase::new();
+        let call = edb
+            .append_tool_call(0, 0, "tip-call", "File.Edit", "{}")
+            .unwrap();
+        append_tool_failure(
+            &mut edb,
+            call,
+            "unread_range",
+            "the requested lines were not read",
+            false,
+            Some("Please use File.Read to inspect a wider range around the intended location."),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let Event::ToolCallResult(result) = edb.events().last().unwrap() else {
+            panic!("expected tool result");
+        };
+        let detail: Value = serde_json::from_str(&result.detail).unwrap();
+        assert_eq!(detail["error"]["code"], "unread_range");
+        assert_eq!(
+            detail["error"]["tip"],
+            "Please use File.Read to inspect a wider range around the intended location."
+        );
+
+        let call = edb
+            .append_tool_call(0, 0, "no-tip-call", "File.Stat", "{}")
+            .unwrap();
+        append_tool_failure(
+            &mut edb,
+            call,
+            "not_found",
+            "path does not exist",
+            false,
+            None,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let Event::ToolCallResult(result) = edb.events().last().unwrap() else {
+            panic!("expected tool result");
+        };
+        let detail: Value = serde_json::from_str(&result.detail).unwrap();
+        assert!(detail["error"].get("tip").is_none());
+    }
+
+    #[test]
     fn file_edit_scope_is_rebuilt_from_visible_read_results_and_reset_by_mutation() {
         let mut edb = EventDataBase::new();
         append_file_result_for_scope_test(
@@ -6120,6 +6186,27 @@ mod tests {
                 "total_lines":6,
                 "eof":false
             })
+        );
+
+        append_file_result_for_scope_test(
+            &mut edb,
+            "File.Copy",
+            json!({"path":"scoped.txt","destination":"copy.txt","expected_hash":"1234abcd"}),
+            json!({
+                "path":"scoped.txt",
+                "destination":"copy.txt",
+                "operation":"copied",
+                "hash":"1234abcd",
+                "size":24
+            }),
+            ToolResultState::Succeeded,
+        );
+        assert_ne!(
+            projected_file_edit_scopes(&edb)
+                .unwrap()
+                .scope_value("scoped.txt"),
+            Value::Null,
+            "copying must not invalidate the unchanged source file's read scope"
         );
 
         append_file_result_for_scope_test(

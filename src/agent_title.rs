@@ -73,11 +73,13 @@ pub fn execute(
             code: "invalid_arguments".into(),
             message: error.to_string(),
             retryable: false,
+            tip: None,
         })?;
     let title = normalize_title(&input.title).map_err(|message| ToolboxExecutionError::Tool {
         code: "invalid_title".into(),
         message,
         retryable: false,
+        tip: None,
     })?;
     edb.append_agent_title_changed(tool_call_id, title)
         .map_err(|error| ToolboxExecutionError::Protocol(error.to_string()))?;

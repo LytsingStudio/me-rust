@@ -317,6 +317,7 @@ fn tool_error(
         code: code.into(),
         message: message.into(),
         retryable,
+        tip: None,
     }
 }
 

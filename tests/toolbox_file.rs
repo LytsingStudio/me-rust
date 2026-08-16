@@ -279,11 +279,12 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     let mut toolbox = ToolboxProcess::start(&workspace, &script);
     let tools = toolbox.query("getTools", None);
     assert_eq!(tools["type"], "result");
-    assert_eq!(tools["output"].as_array().unwrap().len(), 14);
+    assert_eq!(tools["output"].as_array().unwrap().len(), 15);
     assert_eq!(tools["output"][0], "Read");
     assert_eq!(tools["output"][2], "EditBytes");
     assert_eq!(tools["output"][7], "MakeDirectory");
-    assert_eq!(tools["output"][13], "Delete");
+    assert_eq!(tools["output"][12], "Copy");
+    assert_eq!(tools["output"][14], "Delete");
     let tool_names = tools["output"]
         .as_array()
         .unwrap()
@@ -296,6 +297,7 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     assert!(brief.contains("Source file size is not artificially capped"));
     assert!(brief.contains("absolute paths and relative paths that resolve outside"));
     assert!(brief.contains("PATH SUPPORT IS CAPABILITY, NOT AUTHORIZATION"));
+    assert!(brief.contains("plain language"));
     let read_schema = toolbox.query("getInputSchema", Some("Read"));
     assert!(
         read_schema["output"]["properties"]["path"]["description"]
@@ -423,7 +425,7 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     assert!(edit_instructions.contains("MUST NOT contain LF or CR"));
     assert!(edit_instructions.contains("automatically selects and preserves"));
     assert!(edit_instructions.contains("clears every editable range"));
-    assert!(edit_instructions.contains("call File.Read again"));
+    assert!(edit_instructions.contains("wider continuous range"));
     assert!(edit_instructions.contains("File.Search"));
     assert!(edit_instructions.contains("later model response"));
     let edit_examples = toolbox.query("getExamples", Some("Edit"));
@@ -607,6 +609,24 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
         toolbox.query("getInputSchema", Some("MakeDirectory"))["output"]["properties"]["parents"]["default"],
         false
     );
+    let copy_input = toolbox.query("getInputSchema", Some("Copy"));
+    assert_eq!(
+        copy_input["output"]["required"],
+        json!(["path", "destination", "expected_hash"])
+    );
+    let copy_instructions = toolbox.query("getInstructions", Some("Copy"));
+    assert!(
+        copy_instructions["output"]
+            .as_str()
+            .unwrap()
+            .contains("leaves the source unchanged")
+    );
+    assert!(
+        toolbox.query("getExamples", Some("Copy"))["output"]
+            .as_str()
+            .unwrap()
+            .contains("archive/notes.txt")
+    );
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
 }
@@ -686,6 +706,27 @@ fn file_mutations_require_a_refreshed_hash_after_edit_and_never_add_implicit_tex
         "whole\n"
     );
 
+    let copied = toolbox.execute(
+        "Copy",
+        json!({
+            "path":"notes.txt",
+            "destination":"archive/copied.txt",
+            "expected_hash":hash4
+        }),
+    );
+    assert_eq!(copied["type"], "result", "{copied}");
+    assert_eq!(copied["output"]["operation"], "copied");
+    assert_eq!(copied["output"]["hash"], hash4);
+    assert_eq!(copied["output"]["size"], 6);
+    assert_eq!(
+        fs::read_to_string(workspace.join("archive/copied.txt")).unwrap(),
+        "whole\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("notes.txt")).unwrap(),
+        "whole\n"
+    );
+
     let moved = toolbox.execute(
         "Move",
         json!({
@@ -708,6 +749,111 @@ fn file_mutations_require_a_refreshed_hash_after_edit_and_never_add_implicit_tex
     assert_eq!(deleted["output"]["deleted_hash"], moved["output"]["hash"]);
     assert_eq!(deleted["output"]["exists"], false);
     assert!(!workspace.join("archive/notes.txt").exists());
+
+    let copied_deleted = toolbox.execute(
+        "Delete",
+        json!({
+            "path":"archive/copied.txt",
+            "expected_hash":copied["output"]["hash"]
+        }),
+    );
+    assert_eq!(copied_deleted["type"], "result");
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn copy_is_atomic_preserves_the_source_and_guides_recoverable_failures() {
+    let workspace = temporary_workspace();
+    fs::create_dir(workspace.join("copies")).unwrap();
+    fs::write(workspace.join("source.bin"), [0x00, 0x11, 0x22, 0xff]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            workspace.join("source.bin"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+    }
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+    let source = toolbox.execute("Stat", json!({"paths":["source.bin"]}));
+    let hash = source["output"]["entries"][0]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let copied = toolbox.execute(
+        "Copy",
+        json!({"path":"source.bin","destination":"copies/target.bin","expected_hash":hash}),
+    );
+    assert_eq!(copied["type"], "result", "{copied}");
+    assert_eq!(copied["output"]["hash"], hash);
+    assert_eq!(
+        fs::read(workspace.join("source.bin")).unwrap(),
+        [0x00, 0x11, 0x22, 0xff]
+    );
+    assert_eq!(
+        fs::read(workspace.join("copies/target.bin")).unwrap(),
+        [0x00, 0x11, 0x22, 0xff]
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(workspace.join("copies/target.bin"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+
+    let existing = toolbox.execute(
+        "Copy",
+        json!({"path":"source.bin","destination":"copies/target.bin","expected_hash":hash}),
+    );
+    assert_eq!(existing["error"]["code"], "already_exists");
+    assert!(
+        existing["error"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("new destination")
+    );
+
+    let missing_parent = toolbox.execute(
+        "Copy",
+        json!({"path":"source.bin","destination":"missing/target.bin","expected_hash":hash}),
+    );
+    assert_eq!(missing_parent["error"]["code"], "parent_not_found");
+    assert!(
+        missing_parent["error"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("MakeDirectory")
+    );
+
+    fs::write(workspace.join("source.bin"), [0xaa]).unwrap();
+    let stale = toolbox.execute(
+        "Copy",
+        json!({"path":"source.bin","destination":"copies/stale.bin","expected_hash":hash}),
+    );
+    assert_eq!(stale["error"]["code"], "conflict");
+    assert!(!workspace.join("copies/stale.bin").exists());
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("source.bin", workspace.join("source-link")).unwrap();
+        let linked = toolbox.execute(
+            "Copy",
+            json!({"path":"source-link","destination":"copies/link.bin","expected_hash":hash}),
+        );
+        assert_eq!(linked["error"]["code"], "unsupported_file_type");
+        assert!(!workspace.join("copies/link.bin").exists());
+    }
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
@@ -1147,6 +1293,12 @@ fn edit_requires_visible_read_ranges_merges_them_and_clears_them_after_success()
         json!({"path":"scoped.txt","edits":[{"operation":"replace","start_line":2,"end_line":2,"new_lines":["TWO"]}]}),
     );
     assert_eq!(without_read["error"]["code"], "read_required");
+    assert!(
+        without_read["error"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("wider range")
+    );
 
     let search = toolbox.execute_raw(
         "Search",
@@ -1185,6 +1337,12 @@ fn edit_requires_visible_read_ranges_merges_them_and_clears_them_after_success()
         json!({"path":"scoped.txt","edits":[{"operation":"replace","start_line":3,"end_line":5,"new_lines":["merged"]}]}),
     );
     assert_eq!(unread_gap["error"]["code"], "unread_range");
+    assert!(
+        unread_gap["error"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("wider range")
+    );
     assert_eq!(
         fs::read_to_string(workspace.join("scoped.txt")).unwrap(),
         "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n"
@@ -1201,6 +1359,12 @@ fn edit_requires_visible_read_ranges_merges_them_and_clears_them_after_success()
         }),
     );
     assert_eq!(edited["type"], "result", "{edited}");
+    assert!(
+        edited["output"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("wider continuous range")
+    );
     assert_eq!(
         fs::read_to_string(workspace.join("scoped.txt")).unwrap(),
         "one\r\nTWO\r\nthree\r\nfour\r\nFIVE\r\nsix\r\n"
@@ -1211,6 +1375,12 @@ fn edit_requires_visible_read_ranges_merges_them_and_clears_them_after_success()
         json!({"path":"scoped.txt","edits":[{"operation":"delete","start_line":3,"end_line":3}]}),
     );
     assert_eq!(edit_again["error"]["code"], "read_required");
+    assert!(
+        edit_again["error"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("wider range")
+    );
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
@@ -1283,7 +1453,7 @@ fn read_supports_optional_inclusive_bounds_and_reports_total_lines() {
         json!({"4":"four","5":"five"})
     );
     assert!(
-        clamped_end["output"]["notice"]
+        clamped_end["output"]["tip"]
             .as_str()
             .unwrap()
             .contains("5 lines")
@@ -1297,10 +1467,10 @@ fn read_supports_optional_inclusive_bounds_and_reports_total_lines() {
     assert_eq!(past_eof["output"]["lines"], json!({}));
     assert_eq!(past_eof["output"]["eof"], true);
     assert!(
-        past_eof["output"]["notice"]
+        past_eof["output"]["tip"]
             .as_str()
             .unwrap()
-            .contains("start_line 600 is beyond EOF")
+            .contains("this range contains no lines")
     );
 
     let reversed = toolbox.execute_raw(
@@ -1376,6 +1546,12 @@ fn edit_rejects_bad_ranges_stale_hashes_and_lossy_text_atomically() {
         json!({"path":"safe.txt","edits":[{"operation":"replace","start_line":1,"end_line":1,"new_lines":["changed"]}]}),
     );
     assert_eq!(stale["error"]["code"], "stale_read");
+    assert!(
+        stale["error"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("wider range")
+    );
     assert_eq!(
         fs::read_to_string(workspace.join("safe.txt")).unwrap(),
         "external\n"
@@ -1543,6 +1719,12 @@ fn stale_hash_fails_without_mutating_the_file() {
             .unwrap()
             .contains("current_hash=")
     );
+    assert!(
+        stale["error"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("current hash")
+    );
     assert_eq!(
         fs::read_to_string(workspace.join("state.txt")).unwrap(),
         "external\n"
@@ -1608,6 +1790,12 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     assert_eq!(past_eof["output"]["offset"], 4);
     assert_eq!(past_eof["output"]["length"], 0);
     assert_eq!(past_eof["output"]["eof"], true);
+    assert!(
+        past_eof["output"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("contains no bytes")
+    );
 
     let list = toolbox.execute(
         "List",
@@ -1629,6 +1817,7 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
             "src/nested/b.txt"
         ]
     );
+    assert_eq!(list["output"]["returned"], 5);
 
     let find = toolbox.execute(
         "Find",
@@ -1638,6 +1827,7 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
         find["output"]["results"],
         json!(["src/a.txt", "src/line-endings.txt", "src/nested/b.txt"])
     );
+    assert_eq!(find["output"]["returned"], 3);
 
     let search = toolbox.execute(
         "Search",
@@ -1650,6 +1840,7 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
         }),
     );
     assert_eq!(search["output"]["matches"].as_array().unwrap().len(), 2);
+    assert_eq!(search["output"]["returned"], 2);
     assert_eq!(search["output"]["matches"][0]["column"], 1);
     assert!(search["output"]["matches"][0].get("hash").is_none());
     assert!(search["output"]["matches"][1].get("hash").is_none());
@@ -1678,6 +1869,42 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     );
     assert_eq!(status["output"]["entries"][1]["type"], "directory");
     assert_eq!(status["output"]["entries"][2]["exists"], false);
+    assert_eq!(status["output"]["returned"], 3);
+    assert!(
+        status["output"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("1 requested path does not exist")
+    );
+
+    fs::create_dir(workspace.join("empty-dir")).unwrap();
+    let empty_list = toolbox.execute("List", json!({"path":"empty-dir"}));
+    assert_eq!(empty_list["output"]["returned"], 0);
+    assert!(
+        empty_list["output"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("No entries")
+    );
+    let empty_find = toolbox.execute("Find", json!({"path":"src", "patterns":["*.missing"]}));
+    assert_eq!(empty_find["output"]["returned"], 0);
+    assert!(
+        empty_find["output"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("No paths")
+    );
+    let empty_search = toolbox.execute(
+        "Search",
+        json!({"path":"src", "query":"definitely-not-present"}),
+    );
+    assert_eq!(empty_search["output"]["returned"], 0);
+    assert!(
+        empty_search["output"]["tip"]
+            .as_str()
+            .unwrap()
+            .contains("No text")
+    );
 
     let twelve_lines = (1..=12)
         .map(|number| format!("line {number}\n"))
@@ -2315,6 +2542,19 @@ fn every_file_tool_supports_normalized_external_paths_without_weakening_other_gu
     assert_eq!(edited_bytes["type"], "result");
     assert_eq!(fs::read(&binary_path).unwrap(), [0x01, 0xff, 0x03]);
 
+    let copied_path = nested.join("copied.txt");
+    let copied = toolbox.execute(
+        "Copy",
+        json!({
+            "path":display(&text_path),
+            "destination":display(&copied_path),
+            "expected_hash":replaced["output"]["hash"]
+        }),
+    );
+    assert_eq!(copied["type"], "result");
+    assert_eq!(copied["output"]["destination"], display(&copied_path));
+    assert_eq!(fs::read_to_string(&copied_path).unwrap(), "needle\nfinal\n");
+
     let moved_path = nested.join("moved.txt");
     let moved = toolbox.execute(
         "Move",
@@ -2332,6 +2572,11 @@ fn every_file_tool_supports_normalized_external_paths_without_weakening_other_gu
     );
     assert_eq!(deleted["type"], "result");
     assert!(!moved_path.exists());
+    let copied_deleted = toolbox.execute(
+        "Delete",
+        json!({"path":display(&copied_path), "expected_hash":copied["output"]["hash"]}),
+    );
+    assert_eq!(copied_deleted["type"], "result");
 
     toolbox.finish();
     fs::remove_dir_all(outside).unwrap();

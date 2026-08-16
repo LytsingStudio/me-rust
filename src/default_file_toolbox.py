@@ -46,8 +46,9 @@ MAX_EDIT_OPERATIONS = 128
 EDIT_TIP = (
     "The file was edited. Every previously readable edit range for this file "
     "is now invalid. Before editing it again, you MUST use File.Read to inspect "
-    "every target line and establish fresh editable ranges. File.Search never "
-    "establishes an editable range."
+    "a wider continuous range around every intended target and establish fresh "
+    "line numbers and editable ranges. File.Search never establishes an editable "
+    "range."
 )
 EDIT_BYTES_TIP = (
     "The file was edited. Its previous byte offsets and hash are now stale, "
@@ -116,17 +117,39 @@ TOOLS = [
     "Edit",
     "Append",
     "Replace",
+    "Copy",
     "Move",
     "Delete",
 ]
 
 
 class ToolError(Exception):
-    def __init__(self, code: str, message: str, retryable: bool = False):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        retryable: bool = False,
+        tip: str | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.tip = tip
+
+
+TIP_LOCATE_PATH = (
+    "Please check the path. Use File.List or File.Find if you need to locate it."
+)
+TIP_CREATE_PARENT = (
+    "Please create the missing parent directory with File.MakeDirectory, then try again."
+)
+TIP_REGULAR_FILE = "Please choose an existing ordinary file for this operation."
+TIP_REFRESH_HASH = "The file has changed. Please inspect it again and retry with its current hash."
+TIP_READ_EDIT_RANGE = (
+    "Please use File.Read to inspect a wider range around the intended location, "
+    "then retry with the refreshed line numbers and editable_ranges."
+)
 
 
 @dataclass(frozen=True)
@@ -563,6 +586,14 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         ["path", "expected_hash", "content"],
     ),
+    "Copy": object_schema(
+        {
+            "path": PATH_SCHEMA,
+            "destination": PATH_SCHEMA,
+            "expected_hash": HASH_SCHEMA,
+        },
+        ["path", "destination", "expected_hash"],
+    ),
     "Move": object_schema(
         {
             "path": PATH_SCHEMA,
@@ -609,9 +640,9 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                 "type": "boolean",
                 "description": "True when the requested range ends before the file's actual EOF.",
             },
-            "notice": {
+            "tip": {
                 "type": "string",
-                "description": "Additional information about the actual returned range.",
+                "description": "Optional plain-language guidance when the requested range could not be returned exactly.",
             },
             "hash": HASH_SCHEMA,
             "size": {"type": "integer"},
@@ -647,6 +678,7 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "size": {"type": "integer"},
             "eof": {"type": "boolean"},
             "hash": HASH_SCHEMA,
+            "tip": {"type": "string"},
         },
         ["path", "data", "offset", "length", "size", "eof", "hash"],
     ),
@@ -699,17 +731,21 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         {
             "path": PATH_SCHEMA,
             "entries": {"type": "array", "items": {"type": "object"}},
+            "returned": {"type": "integer"},
             "truncated": {"type": "boolean"},
+            "tip": {"type": "string"},
         },
-        ["path", "entries", "truncated"],
+        ["path", "entries", "returned", "truncated"],
     ),
     "Find": object_schema(
         {
             "path": PATH_SCHEMA,
             "results": {"type": "array", "items": {"type": "string"}},
+            "returned": {"type": "integer"},
             "truncated": {"type": "boolean"},
+            "tip": {"type": "string"},
         },
-        ["path", "results", "truncated"],
+        ["path", "results", "returned", "truncated"],
     ),
     "Search": object_schema(
         {
@@ -750,13 +786,19 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                 ),
             },
             "skipped_binary": {"type": "integer"},
+            "returned": {"type": "integer"},
             "truncated": {"type": "boolean"},
+            "tip": {"type": "string"},
         },
-        ["path", "matches", "skipped_binary", "truncated"],
+        ["path", "matches", "skipped_binary", "returned", "truncated"],
     ),
     "Stat": object_schema(
-        {"entries": {"type": "array", "items": {"type": "object"}}},
-        ["entries"],
+        {
+            "entries": {"type": "array", "items": {"type": "object"}},
+            "returned": {"type": "integer"},
+            "tip": {"type": "string"},
+        },
+        ["entries", "returned"],
     ),
     "MakeDirectory": object_schema(
         {
@@ -837,6 +879,16 @@ OUTPUT_SCHEMAS["Edit"]["required"].extend(
 OUTPUT_SCHEMAS["Edit"]["properties"].pop("hash")
 OUTPUT_SCHEMAS["Edit"]["required"].remove("hash")
 OUTPUT_SCHEMAS["Append"]["properties"]["appended_bytes"] = {"type": "integer"}
+OUTPUT_SCHEMAS["Copy"] = object_schema(
+    {
+        "path": PATH_SCHEMA,
+        "destination": PATH_SCHEMA,
+        "operation": {"type": "string", "enum": ["copied"]},
+        "hash": HASH_SCHEMA,
+        "size": {"type": "integer"},
+    },
+    ["path", "destination", "operation", "hash", "size"],
+)
 OUTPUT_SCHEMAS["Move"] = object_schema(
     {
         "path": PATH_SCHEMA,
@@ -872,6 +924,7 @@ ROUTES = {
     "Edit": "Atomically replace, delete, or insert one or more independently located line ranges in a known text file.",
     "Append": "Append exact text using the existing file's detected encoding without adding a newline.",
     "Replace": "Replace an entire known text file while preserving its detected encoding and BOM.",
+    "Copy": "Copy one known regular file to a new destination without changing the source.",
     "Move": "Move one known regular file to a destination that does not exist.",
     "Delete": "Delete one explicit known regular file.",
 }
@@ -894,10 +947,11 @@ INSTRUCTIONS = {
         "Edit atomically applies one or more explicit operations to one text file. Before Edit, you MUST call File.Read for every target line or insertion point, receive that result, and only then call Edit in a later model response; a Read and Edit emitted together cannot authorize each other. The latest File.Read result returns editable_ranges, the complete current edit authorization for that file. Replace and delete ranges must be fully contained in it. An insertion before an existing line requires that line in editable_ranges; insertion after the final line additionally requires that File.Read established EOF; insertion into an empty file requires a Read-established empty EOF. File.Search, File.Stat, hashes from other tools, generated content, and remembered line numbers never establish permission. Every operation is independently located against the same original pre-edit snapshot. Earlier array items never shift later line numbers; array order is not execution order. The tool validates every operation before writing and commits the combined result once. If one item is malformed, unread, out of range, unencodable, overlapping, duplicated at the same insertion point, or otherwise ambiguous, the entire call fails and the file remains unchanged. A later item cannot target lines created by an earlier item in the same call.\n"
         "Each edits item uses exactly one of three shapes. Replace: {operation:\"replace\", start_line, end_line, new_lines}; start_line and end_line are inclusive original 1-based line numbers, require 1 <= start_line <= end_line <= total_lines, and new_lines must be non-empty. Delete: {operation:\"delete\", start_line, end_line}; it removes those complete original lines and accepts no new_lines. Insert: {operation:\"insert\", before_line, new_lines}; it inserts before the original 1-based before_line and requires non-empty new_lines. before_line=1 inserts at the beginning and into an empty file; before_line=total_lines+1 appends only when the existing final line is terminated. Do not encode an operation indirectly with an empty new_lines array or reversed line range.\n"
         "new_lines is an array of logical lines matching File.Read values. Each array item is exactly one line and MUST NOT contain LF or CR; use an empty string for one blank line. File automatically selects and preserves the file's existing line-ending convention. To change part of a line, replace that whole source line with its complete resulting logical text, including unchanged surrounding characters but no terminator. To merge several source lines, replace their whole range with the resulting logical line or lines. To append after an unterminated final source line, include that final line in a replacement and supply both resulting logical lines.\n"
-        "Replacement and deletion ranges must not overlap. An insertion cannot lie strictly inside such a range, and one original insertion point may appear only once; an insertion exactly at a range boundary is allowed. Source file size is not artificially capped; the complete file is loaded into memory. Existing encoding, BOM, permissions, line-ending style, and all unselected text are preserved. A successful Edit clears every editable range for that file. Before any later Edit, call File.Read again for every new target range."
+        "Replacement and deletion ranges must not overlap. An insertion cannot lie strictly inside such a range, and one original insertion point may appear only once; an insertion exactly at a range boundary is allowed. Source file size is not artificially capped; the complete file is loaded into memory. Existing encoding, BOM, permissions, line-ending style, and all unselected text are preserved. A successful Edit clears every editable range for that file. Before any later Edit, use File.Read to inspect a wider continuous range around every intended target so the surrounding context, line numbers, and editable_ranges are all fresh."
     ),
     "Append": "The file must exist and match expected_hash. Existing encoding and BOM are preserved. Content is appended exactly and no newline is added. Unrepresentable text returns encoding_error without modifying the file.",
     "Replace": "The file must exist and match expected_hash. Its detected encoding and BOM are preserved while the complete content is replaced atomically. Unrepresentable text returns encoding_error without modifying the file.",
+    "Copy": "The source must be an ordinary file and match expected_hash. The destination parent must exist, and the destination itself must not exist. Copy preserves the source bytes and file permissions, leaves the source unchanged, and returns the shared content hash. It never overwrites a destination.",
     "Move": "The source must match expected_hash and the destination must not exist. A pure move preserves the content hash.",
     "Delete": "The file must match expected_hash. Directories and symbolic links are rejected. Success returns deleted_hash and exists=false.",
 }
@@ -945,10 +999,11 @@ EXAMPLES = {
         '{"path":"unterminated.txt","edits":[{"operation":"replace","start_line":4,"end_line":4,"new_lines":["original final text","appended"]}]}'
         "\n\nCRLF is detected and preserved automatically; do not put CRLF in new_lines:\n"
         '{"path":"windows.txt","edits":[{"operation":"replace","start_line":2,"end_line":2,"new_lines":["complete changed line"]}]}'
-        "\n\nCommon errors: editing without Read, targeting any line outside editable_ranges, using Search as permission, replace with new_lines=[], delete with a new_lines field, insert with start_line/end_line, reversed ranges, new_lines=[\"two\\nlines\"], overlapping ranges, duplicate insertion points, insertion inside another range, or targeting lines created by another item. Any one rejects the entire call. After success all editable ranges for the file are cleared; Read again before another Edit."
+        "\n\nCommon errors: editing without Read, targeting any line outside editable_ranges, using Search as permission, replace with new_lines=[], delete with a new_lines field, insert with start_line/end_line, reversed ranges, new_lines=[\"two\\nlines\"], overlapping ranges, duplicate insertion points, insertion inside another range, or targeting lines created by another item. Any one rejects the entire call. After success all editable ranges for the file are cleared; before another Edit, use File.Read to inspect a wider continuous range around every intended target."
     ),
     "Append": '{"path":"notes.txt","expected_hash":"0123abcd","content":"next line\\n"}',
     "Replace": '{"path":"notes.txt","expected_hash":"0123abcd","content":"complete new content\\n"}',
+    "Copy": '{"path":"notes.txt","destination":"archive/notes.txt","expected_hash":"0123abcd"}',
     "Move": '{"path":"notes.txt","destination":"archive/notes.txt","expected_hash":"0123abcd"}',
     "Delete": '{"path":"archive/notes.txt","expected_hash":"0123abcd"}',
 }
@@ -964,17 +1019,14 @@ def result(request_id: int, output: Any) -> None:
 
 
 def error(request_id: int, exc: ToolError) -> None:
-    send(
-        {
-            "id": request_id,
-            "type": "error",
-            "error": {
-                "code": exc.code,
-                "message": exc.message,
-                "retryable": exc.retryable,
-            },
-        }
-    )
+    detail: dict[str, Any] = {
+        "code": exc.code,
+        "message": exc.message,
+        "retryable": exc.retryable,
+    }
+    if exc.tip is not None:
+        detail["tip"] = exc.tip
+    send({"id": request_id, "type": "error", "error": detail})
 
 
 def validate_object(value: Any) -> dict[str, Any]:
@@ -998,6 +1050,7 @@ def logical_lines_arg(data: dict[str, Any], edit_index: int) -> tuple[str, ...]:
         raise ToolError(
             "invalid_line_syntax",
             f"edits[{edit_index}].new_lines must be an array of logical lines",
+            tip="Please provide new_lines as a JSON array with one string per line and no newline characters inside a string.",
         )
     result: list[str] = []
     for line_index, line in enumerate(value):
@@ -1005,6 +1058,7 @@ def logical_lines_arg(data: dict[str, Any], edit_index: int) -> tuple[str, ...]:
             raise ToolError(
                 "invalid_line_syntax",
                 f"edits[{edit_index}].new_lines[{line_index}] must be a string",
+                tip="Please provide new_lines as a JSON array with one string per line.",
             )
         if "\x00" in line:
             raise ToolError(
@@ -1015,6 +1069,7 @@ def logical_lines_arg(data: dict[str, Any], edit_index: int) -> tuple[str, ...]:
             raise ToolError(
                 "invalid_line_syntax",
                 f"edits[{edit_index}].new_lines[{line_index}] must not contain CR or LF; provide one array item per logical line",
+                tip="Please split the text into separate new_lines array items and remove all CR and LF characters from each item.",
             )
         result.append(line)
     return tuple(result)
@@ -1108,7 +1163,7 @@ def existing_path(value: str) -> Path:
     try:
         return raw_path(value).resolve(strict=True)
     except FileNotFoundError as exc:
-        raise ToolError("not_found", f"path does not exist: {value}") from exc
+        raise ToolError("not_found", f"path does not exist: {value}", tip=TIP_LOCATE_PATH) from exc
     except OSError as exc:
         raise ToolError("path_error", f"cannot resolve {value}: {exc}") from exc
 
@@ -1118,7 +1173,11 @@ def lexical_path(value: str) -> Path:
     try:
         parent = candidate.parent.resolve(strict=True)
     except FileNotFoundError as exc:
-        raise ToolError("parent_not_found", f"parent directory does not exist: {value}") from exc
+        raise ToolError(
+            "parent_not_found",
+            f"parent directory does not exist: {value}",
+            tip=TIP_CREATE_PARENT,
+        ) from exc
     except OSError as exc:
         raise ToolError("path_error", f"cannot resolve parent of {value}: {exc}") from exc
     path = parent / candidate.name
@@ -1181,9 +1240,17 @@ def require_regular_file(path: Path, logical: str, reject_symlink: bool = False)
         raise ToolError("protected_path", "File toolbox coordination lock cannot be modified")
     lexical = raw_path(logical)
     if reject_symlink and lexical.is_symlink():
-        raise ToolError("unsupported_file_type", f"symbolic links are not mutable: {logical}")
+        raise ToolError(
+            "unsupported_file_type",
+            f"symbolic links are not mutable: {logical}",
+            tip=TIP_REGULAR_FILE,
+        )
     if not path.is_file():
-        raise ToolError("unsupported_file_type", f"path is not a regular file: {logical}")
+        raise ToolError(
+            "unsupported_file_type",
+            f"path is not a regular file: {logical}",
+            tip=TIP_REGULAR_FILE,
+        )
 
 
 def validate_expected_hash(value: Any) -> str:
@@ -1201,6 +1268,7 @@ def verify_hash(path: Path, expected: str) -> str:
             "conflict",
             f"file changed: expected_hash={expected}, current_hash={current}",
             True,
+            TIP_REFRESH_HASH,
         )
     return current
 
@@ -1212,6 +1280,7 @@ def verify_content_hash(content: bytes, expected: str) -> str:
             "conflict",
             f"file changed: expected_hash={expected}, current_hash={current}",
             True,
+            TIP_REFRESH_HASH,
         )
     return current
 
@@ -1231,7 +1300,11 @@ def decode_strict(payload: bytes, encoding: str, logical: str) -> str:
             "encoding_error", f"file is not valid {encoding}: {logical}"
         ) from exc
     if "\x00" in text:
-        raise ToolError("binary_file", f"decoded text contains NUL characters: {logical}")
+        raise ToolError(
+            "binary_file",
+            f"decoded text contains NUL characters: {logical}",
+            tip="Please use File.ReadBytes to inspect this file as bytes.",
+        )
     return text
 
 
@@ -1358,11 +1431,19 @@ def decode_text_bytes(raw: bytes, logical: str, requested: str = "auto") -> Text
         text = ""
     else:
         if "\x00" in text:
-            raise ToolError("binary_file", f"decoded text contains NUL characters: {logical}")
+            raise ToolError(
+                "binary_file",
+                f"decoded text contains NUL characters: {logical}",
+                tip="Please use File.ReadBytes to inspect this file as bytes.",
+            )
         return TextDocument(raw, text, "utf-8", 1.0, b"")
 
     if b"\x00" in raw:
-        raise ToolError("binary_file", f"file contains NUL bytes: {logical}")
+        raise ToolError(
+            "binary_file",
+            f"file contains NUL bytes: {logical}",
+            tip="Please use File.ReadBytes to inspect this file as bytes.",
+        )
 
     candidates: list[tuple[float, str, str]] = []
     for encoding in ("gb18030", "big5", "shift_jis", "euc_kr", "windows-1252"):
@@ -1376,13 +1457,18 @@ def decode_text_bytes(raw: bytes, logical: str, requested: str = "auto") -> Text
         candidates.append((legacy_quality(decoded, encoding), encoding, decoded))
     candidates.sort(reverse=True)
     if not candidates:
-        raise ToolError("binary_file", f"file is not recognized as text: {logical}")
+        raise ToolError(
+            "binary_file",
+            f"file is not recognized as text: {logical}",
+            tip="Please use File.ReadBytes to inspect this file as bytes.",
+        )
     best_score, best_encoding, best_text = candidates[0]
     if best_score < 0.70:
         names = ", ".join(candidate[1] for candidate in candidates[:3])
         raise ToolError(
             "encoding_uncertain",
             f"text encoding has low confidence ({names}): {logical}; specify encoding explicitly or use ReadBytes",
+            tip="If you know the encoding, retry with it explicitly. Otherwise use File.ReadBytes.",
         )
     runner_up = candidates[1][0] if len(candidates) > 1 else 0.0
     gap = best_score - runner_up
@@ -1391,6 +1477,7 @@ def decode_text_bytes(raw: bytes, logical: str, requested: str = "auto") -> Text
         raise ToolError(
             "encoding_uncertain",
             f"text encoding is ambiguous ({names}): {logical}; specify encoding explicitly or use ReadBytes",
+            tip="If you know the encoding, retry with it explicitly. Otherwise use File.ReadBytes.",
         )
     confidence = min(0.95, 0.78 + max(0.0, gap))
     return TextDocument(raw, best_text, best_encoding, round(confidence, 3), b"")
@@ -1479,7 +1566,51 @@ def atomic_create(path: Path, content: bytes) -> None:
         try:
             os.link(temporary, path)
         except FileExistsError as exc:
-            raise ToolError("already_exists", f"destination already exists: {relative_path(path)}") from exc
+            raise ToolError(
+                "already_exists",
+                f"destination already exists: {relative_path(path)}",
+                tip="Please choose a new destination, or inspect the existing path before deciding what to do.",
+            ) from exc
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def atomic_copy(source: Path, target: Path, expected_hash: str) -> tuple[str, int]:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.me-", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        source_mode = source.stat().st_mode
+        with os.fdopen(descriptor, "wb") as output, source.open("rb") as input_file:
+            for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+                output.write(chunk)
+                size += len(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        copied_hash = digest.hexdigest()[:8]
+        if copied_hash != expected_hash:
+            raise ToolError(
+                "conflict",
+                f"file changed: expected_hash={expected_hash}, current_hash={copied_hash}",
+                True,
+                TIP_REFRESH_HASH,
+            )
+        verify_hash(source, expected_hash)
+        os.chmod(temporary, stat.S_IMODE(source_mode))
+        try:
+            os.link(temporary, target)
+        except FileExistsError as exc:
+            raise ToolError(
+                "already_exists",
+                f"destination already exists: {relative_path(target)}",
+                tip="Please choose a new destination, or inspect the existing path before deciding what to do.",
+            ) from exc
+        return copied_hash, size
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
@@ -1603,6 +1734,7 @@ def execute_read(data: dict[str, Any]) -> dict[str, Any]:
         raise ToolError(
             "invalid_arguments",
             "start_line must be less than or equal to end_line",
+            tip="Please check the requested line numbers and retry with start_line no greater than end_line.",
         )
     encoding = encoding_arg(data)
     path = existing_path(logical)
@@ -1656,16 +1788,15 @@ def execute_read(data: dict[str, Any]) -> dict[str, Any]:
         "bom": bool(document.bom),
     }
     if total_lines == 0 and (requested_start is not None or requested_end is not None):
-        output["notice"] = "The file has 0 lines; no lines were returned."
+        output["tip"] = "The file is empty, so no lines were returned."
     elif effective_start > total_lines:
-        output["notice"] = (
-            f"The file has {total_lines} lines; start_line {effective_start} is "
-            "beyond EOF, so no lines were returned."
+        output["tip"] = (
+            f"The file has {total_lines} lines, so this range contains no lines. "
+            "Use total_lines to choose an existing range."
         )
     elif requested_end is not None and requested_end > total_lines:
-        output["notice"] = (
-            f"The file has {total_lines} lines; the returned range ends at the "
-            "actual final line."
+        output["tip"] = (
+            f"The file has {total_lines} lines, so the result ends at line {total_lines}."
         )
     return output
 
@@ -1685,7 +1816,7 @@ def execute_read_bytes(data: dict[str, Any]) -> dict[str, Any]:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
     actual_offset = min(offset, size)
-    return {
+    output = {
         "path": relative_path(path),
         "data": " ".join(f"{byte:02x}" for byte in chunk),
         "offset": actual_offset,
@@ -1694,6 +1825,14 @@ def execute_read_bytes(data: dict[str, Any]) -> dict[str, Any]:
         "eof": actual_offset + len(chunk) >= size,
         "hash": digest.hexdigest()[:8],
     }
+    if offset >= size:
+        output["tip"] = (
+            f"The file has {size} bytes, so this range contains no bytes. "
+            "Use size to choose an existing range."
+        )
+    elif offset + length > size:
+        output["tip"] = f"The file has {size} bytes, so the result ends at byte {size}."
+    return output
 
 
 def execute_list(data: dict[str, Any]) -> dict[str, Any]:
@@ -1703,7 +1842,11 @@ def execute_list(data: dict[str, Any]) -> dict[str, Any]:
     max_entries = int_arg(data, "max_entries", 1000, 1, 10000)
     start = existing_path(logical)
     if not start.is_dir():
-        raise ToolError("not_directory", f"path is not a directory: {logical}")
+        raise ToolError(
+            "not_directory",
+            f"path is not a directory: {logical}",
+            tip="Please use File.Stat to inspect the path, then choose an existing directory for File.List.",
+        )
     entries: list[dict[str, Any]] = []
     pending: list[tuple[Path, int]] = [(start, 1)]
     truncated = False
@@ -1733,7 +1876,17 @@ def execute_list(data: dict[str, Any]) -> dict[str, Any]:
             if kind == "directory" and level < depth:
                 next_directories.append(child)
         pending.extend((child, level + 1) for child in next_directories)
-    return {"path": relative_path(start), "entries": entries, "truncated": truncated}
+    output = {
+        "path": relative_path(start),
+        "entries": entries,
+        "returned": len(entries),
+        "truncated": truncated,
+    }
+    if not entries:
+        output["tip"] = (
+            "No entries were found. Check path, depth, and include_hidden if you expected content."
+        )
+    return output
 
 
 def execute_find(data: dict[str, Any]) -> dict[str, Any]:
@@ -1752,8 +1905,23 @@ def execute_find(data: dict[str, Any]) -> dict[str, Any]:
         if matches_any(relative, patterns) or matches_any(path.name, patterns):
             results.append(relative)
             if len(results) >= max_results:
-                return {"path": relative_path(start), "results": results, "truncated": True}
-    return {"path": relative_path(start), "results": results, "truncated": False}
+                return {
+                    "path": relative_path(start),
+                    "results": results,
+                    "returned": len(results),
+                    "truncated": True,
+                }
+    output = {
+        "path": relative_path(start),
+        "results": results,
+        "returned": len(results),
+        "truncated": False,
+    }
+    if not results:
+        output["tip"] = (
+            "No paths matched. Check patterns, path, depth, exclude, and include_hidden if you expected results."
+        )
+    return output
 
 
 def execute_search(data: dict[str, Any]) -> dict[str, Any]:
@@ -1770,7 +1938,11 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
     try:
         pattern = re.compile(query if use_regex else re.escape(query), flags)
     except re.error as exc:
-        raise ToolError("invalid_regex", str(exc)) from exc
+        raise ToolError(
+            "invalid_regex",
+            str(exc),
+            tip="Please correct the regular expression, or set regex=false for a literal text search.",
+        ) from exc
     start = existing_path(logical)
     matches: list[dict[str, Any]] = []
     skipped_binary = 0
@@ -1814,14 +1986,21 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
                         "path": relative_path(start),
                         "matches": matches,
                         "skipped_binary": skipped_binary,
+                        "returned": len(matches),
                         "truncated": True,
                     }
-    return {
+    output = {
         "path": relative_path(start),
         "matches": matches,
         "skipped_binary": skipped_binary,
+        "returned": len(matches),
         "truncated": False,
     }
+    if not matches:
+        output["tip"] = (
+            "No text matched. Check query, path, depth, globs, case_sensitive, and regex if you expected results."
+        )
+    return output
 
 
 def execute_stat(data: dict[str, Any]) -> dict[str, Any]:
@@ -1852,7 +2031,14 @@ def execute_stat(data: dict[str, Any]) -> dict[str, Any]:
             entry["size"] = opened.st_size
             entry["modified_ms"] = opened.st_mtime_ns // 1_000_000
         entries.append(entry)
-    return {"entries": entries}
+    output: dict[str, Any] = {"entries": entries, "returned": len(entries)}
+    missing = sum(not entry["exists"] for entry in entries)
+    if missing:
+        output["tip"] = (
+            f"{missing} requested path{'s do' if missing != 1 else ' does'} not exist. "
+            "Check entries with exists=false before continuing."
+        )
+    return output
 
 
 def mutation_result(
@@ -1884,7 +2070,11 @@ def execute_make_directory(data: dict[str, Any]) -> dict[str, Any]:
         try:
             path.mkdir(parents=parents)
         except FileExistsError as exc:
-            raise ToolError("already_exists", f"destination already exists: {logical}") from exc
+            raise ToolError(
+                "already_exists",
+                f"destination already exists: {logical}",
+                tip="Please choose a new path, or inspect the existing path before deciding what to do.",
+            ) from exc
         except OSError as exc:
             raise ToolError(
                 "create_directory_error", f"cannot create directory {logical}: {exc}"
@@ -1905,7 +2095,11 @@ def execute_create(data: dict[str, Any]) -> dict[str, Any]:
     path = lexical_path(logical)
     with mutation_lock():
         if path.exists() or path.is_symlink():
-            raise ToolError("already_exists", f"destination already exists: {logical}")
+            raise ToolError(
+                "already_exists",
+                f"destination already exists: {logical}",
+                tip="Please choose a new path, or inspect the existing file before deciding whether to edit or replace it.",
+            )
         atomic_create(path, content)
         clear_edit_scope(path)
     return mutation_result(path, "created", None, content, encoding, 1.0, bom)
@@ -2154,6 +2348,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
         raise ToolError(
             "invalid_arguments",
             f"edits must contain 1..={MAX_EDIT_OPERATIONS} operation objects",
+            tip=f"Please provide a non-empty edits array with at most {MAX_EDIT_OPERATIONS} operations.",
         )
     with mutation_lock():
         path = existing_path(logical)
@@ -2163,6 +2358,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
             raise ToolError(
                 "read_required",
                 f"File.Edit has no readable range for {relative_path(path)}; call File.Read for every target range before editing",
+                tip=TIP_READ_EDIT_RANGE,
             )
         document = read_text_file(path, logical, encoding)
         current_hash = sha256_bytes(document.raw)
@@ -2172,6 +2368,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                 "stale_read",
                 f"{relative_path(path)} changed after File.Read; call File.Read again before editing",
                 True,
+                TIP_READ_EDIT_RANGE,
             )
         previous = current_hash
         lines = split_text_file_lines(document.text)
@@ -2183,6 +2380,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                 "stale_read",
                 f"{relative_path(path)} line structure changed after File.Read; call File.Read again before editing",
                 True,
+                TIP_READ_EDIT_RANGE,
             )
         preferred_ending = prevailing_line_ending(text_lines)
         line_offsets = [0]
@@ -2202,6 +2400,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                 raise ToolError(
                     "invalid_arguments",
                     f"edits[{index}].operation must be replace, delete, or insert",
+                    tip="Please choose exactly one supported operation: replace, delete, or insert.",
                 )
             unexpected = sorted(set(item) - required_fields)
             missing = sorted(required_fields - set(item))
@@ -2214,6 +2413,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                 raise ToolError(
                     "invalid_arguments",
                     f"edits[{index}] " + "; ".join(details),
+                    tip="Please use the exact fields for the selected operation and remove unrelated fields.",
                 )
             if operation in {"replace", "delete"}:
                 start_line = int_arg(item, "start_line", 0, 1, 2**31 - 1)
@@ -2224,11 +2424,13 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                         "invalid_range",
                         f"edits[{index}] requires 1 <= start_line <= end_line <= total_lines; "
                         f"received start_line={start_line}, end_line={end_line}, total_lines={total_lines}",
+                        tip=TIP_READ_EDIT_RANGE,
                     )
                 if not range_is_covered(scope, start_line, end_line):
                     raise ToolError(
                         "unread_range",
                         f"edits[{index}] targets lines {start_line}-{end_line}, which are not fully inside the current editable ranges {scope_ranges_value(scope)}; call File.Read for the missing range",
+                        tip=TIP_READ_EDIT_RANGE,
                     )
                 new_lines = (
                     logical_lines_arg(item, index)
@@ -2239,6 +2441,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                     raise ToolError(
                         "invalid_arguments",
                         f"edits[{index}].new_lines cannot be empty for replace; use operation=delete",
+                        tip="Please provide at least one replacement line, or use operation=delete to remove the selected lines.",
                     )
                 source_start = line_offsets[start_line - 1]
                 source_end = line_offsets[end_line]
@@ -2251,6 +2454,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                         "invalid_range",
                         f"edits[{index}].before_line must be <= total_lines + 1; "
                         f"received before_line={before_line}, total_lines={total_lines}",
+                        tip=TIP_READ_EDIT_RANGE,
                     )
                 if total_lines == 0:
                     insertion_read = before_line == 1 and scope.eof
@@ -2264,12 +2468,14 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                     raise ToolError(
                         "unread_range",
                         f"edits[{index}] insertion point before line {before_line} was not established by File.Read; call File.Read around that insertion point",
+                        tip=TIP_READ_EDIT_RANGE,
                     )
                 new_lines = logical_lines_arg(item, index)
                 if not new_lines:
                     raise ToolError(
                         "invalid_line_syntax",
                         f"edits[{index}].new_lines cannot be empty for insert",
+                        tip="Please provide at least one logical line to insert.",
                     )
                 if (
                     before_line == total_lines + 1
@@ -2279,6 +2485,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                     raise ToolError(
                         "invalid_line_syntax",
                         f"edits[{index}] cannot insert after an unterminated final line; replace that final line instead",
+                        tip="Please read a wider range around the final line, then replace that line with the complete intended result.",
                     )
                 source_start = line_offsets[before_line - 1]
                 source_end = source_start
@@ -2337,6 +2544,7 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                     raise ToolError(
                         "overlapping_edits",
                         f"edits[{left.index}] and edits[{right.index}] overlap or use the same original insertion point; all edit coordinates must be independent",
+                        tip="Please combine overlapping changes into one edit item, or read the updated area and apply dependent changes in a later File.Edit call.",
                     )
         ordered = sorted(
             resolved,
@@ -2591,6 +2799,31 @@ def execute_replace(data: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def execute_copy(data: dict[str, Any]) -> dict[str, Any]:
+    logical = string_arg(data, "path")
+    destination = string_arg(data, "destination")
+    expected = validate_expected_hash(data.get("expected_hash"))
+    with mutation_lock():
+        source = existing_path(logical)
+        require_regular_file(source, logical, True)
+        target = lexical_path(destination)
+        if target.exists() or target.is_symlink():
+            raise ToolError(
+                "already_exists",
+                f"destination already exists: {destination}",
+                tip="Please choose a new destination, or inspect the existing path before deciding what to do.",
+            )
+        copied_hash, size = atomic_copy(source, target, expected)
+        clear_edit_scope(target)
+    return {
+        "path": relative_path(source),
+        "destination": relative_path(target),
+        "operation": "copied",
+        "hash": copied_hash,
+        "size": size,
+    }
+
+
 def execute_move(data: dict[str, Any]) -> dict[str, Any]:
     logical = string_arg(data, "path")
     destination = string_arg(data, "destination")
@@ -2600,7 +2833,11 @@ def execute_move(data: dict[str, Any]) -> dict[str, Any]:
         require_regular_file(source, logical, True)
         target = lexical_path(destination)
         if target.exists() or target.is_symlink():
-            raise ToolError("already_exists", f"destination already exists: {destination}")
+            raise ToolError(
+                "already_exists",
+                f"destination already exists: {destination}",
+                tip="Please choose a new destination, or inspect the existing path before deciding what to do.",
+            )
         previous = verify_hash(source, expected)
         size = source.stat().st_size
         try:
@@ -2652,6 +2889,7 @@ EXECUTORS = {
     "Edit": execute_edit,
     "Append": execute_append,
     "Replace": execute_replace,
+    "Copy": execute_copy,
     "Move": execute_move,
     "Delete": execute_delete,
 }
@@ -2668,7 +2906,7 @@ def handle(request: Any) -> None:
     if command == "getBrief":
         result(
             request_id,
-            "Read, search, and safely mutate files and explicitly create directories. Relative paths resolve from the workspace; absolute paths and relative paths that resolve outside the workspace are supported. Paths inside the workspace are returned relative to it, while outside paths are returned as normalized absolute paths. PATH SUPPORT IS CAPABILITY, NOT AUTHORIZATION: obey the governing external-path safety rule before any modification outside the workspace. Source file size is not artificially capped; operations that need complete contents load them into memory, while bounded query parameters limit model-visible results. Line-oriented results and edits use logical lines without CR or LF; File preserves the file's detected line-ending convention automatically. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. File.Edit is limited to ranges actually returned by File.Read, clears those ranges after success, and validates the remembered file version internally. Binary operations use zero-based byte ranges and canonical hexadecimal data. Other mutations use an 8-character SHA-256-derived concurrency fingerprint. This short value detects stale edits; it is not a security integrity digest.",
+            "Read, search, copy, and safely mutate files and explicitly create directories. Relative paths resolve from the workspace; absolute paths and relative paths that resolve outside the workspace are supported. Paths inside the workspace are returned relative to it, while outside paths are returned as normalized absolute paths. PATH SUPPORT IS CAPABILITY, NOT AUTHORIZATION: obey the governing external-path safety rule before any modification outside the workspace. Source file size is not artificially capped; operations that need complete contents load them into memory, while bounded query parameters limit model-visible results. Line-oriented results and edits use logical lines without CR or LF; File preserves the file's detected line-ending convention automatically. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. File.Edit is limited to ranges actually returned by File.Read, clears those ranges after success, and validates the remembered file version internally. Binary operations use zero-based byte ranges and canonical hexadecimal data. Other mutations use an 8-character SHA-256-derived concurrency fingerprint. This short value detects stale edits; it is not a security integrity digest. Recoverable failures may include a short tip that states the next useful action in plain language.",
         )
         return
     tool = request.get("tool")
