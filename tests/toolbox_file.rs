@@ -414,18 +414,25 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
         "auto"
     );
     let read_instructions = toolbox.query("getInstructions", Some("Read"));
-    assert!(
-        read_instructions["output"]
-            .as_str()
-            .unwrap()
-            .contains("Source file size is not artificially capped")
-    );
+    let read_instructions_text = read_instructions["output"].as_str().unwrap();
+    assert!(read_instructions_text.contains("Source file size is not artificially capped"));
+    assert!(read_instructions_text.contains("EDIT AUTHORIZATION"));
+    assert!(read_instructions_text.contains("complete current set"));
+    assert!(read_instructions_text.contains("File.Search"));
+    assert!(read_instructions_text.contains("earlier model response"));
+    assert!(read_instructions_text.contains("clears the authorization"));
     let read_output = toolbox.query("getOutputSchema", Some("Read"));
     assert_eq!(
         read_output["output"]["properties"]["lines"]["type"],
         "object"
     );
     assert!(read_output["output"]["properties"].get("content").is_none());
+    let editable_ranges_description =
+        read_output["output"]["properties"]["editable_ranges"]["description"]
+            .as_str()
+            .unwrap();
+    assert!(editable_ranges_description.contains("complete current File.Edit authorization"));
+    assert!(editable_ranges_description.contains("Search and other tools do not grant"));
     let read_bytes_output = toolbox.query("getOutputSchema", Some("ReadBytes"));
     assert_eq!(
         read_bytes_output["output"]["properties"]["data"]["type"],

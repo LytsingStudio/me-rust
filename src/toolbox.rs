@@ -1503,7 +1503,22 @@ fn render_catalog_prompt(
 ) -> Result<String> {
     let mut sections = vec![r#"# Tool result envelope
 
-Every tool response is a JSON object with a top-level `truncate` boolean. `truncate:false` means the complete tool result is present. `truncate:true` means ME-RUST safely reduced only the tool's potentially large content before adding it to model context; read `truncate_info` for the retained and omitted original ranges. Existing tool-specific `truncated` fields have their documented collection-time meaning and are independent of this envelope.
+Every tool response uses this runtime envelope:
+
+```json
+{
+  "result": {
+    "state": "succeeded",
+    "exit_code": null,
+    "detail": {}
+  },
+  "truncate": false
+}
+```
+
+`result.state` reports `succeeded`, `failed`, `interrupted`, or `indeterminate`. The `Result detail schema` shown under each tool describes only `result.detail`, including its actual JSON type; it does not describe this outer runtime envelope. `detail` is omitted when a tool has no detail. Streaming or structured activity may additionally appear in top-level `terminal_updates`, `updates`, or `other_updates` arrays.
+
+Every envelope has a top-level `truncate` boolean. `truncate:false` means the complete tool result is present. `truncate:true` means ME-RUST safely reduced only the tool's potentially large content before adding it to model context; read `truncate_info` for the retained and omitted original ranges. Existing tool-specific `truncated` fields have their documented collection-time meaning and are independent of this envelope.
 
 Safe truncation never cuts serialized JSON or leaves dangling references. Ordered logs and result lists omit their oldest complete items. `File.Read` keeps its first and last numbered line entries; missing numeric keys are omitted source lines, while an oversized individual line may use `text_fragments`. `File.Search` keeps each match object coherent: it removes complete numbered context-line entries from `before` and `after` before representing an oversized `match_text` value as `text_fragments`. Other documents and long text retain exact beginning and ending fragments. When a normal string cannot remain contiguous, it is represented as a `text_fragments` object whose fragments carry exact original byte offsets; never treat separated fragments as adjacent original text. A cropped browser accessibility tree uses `aria_fragments`, whose fragments carry exact source line ranges and remain separated by omitted source ranges."#.into()];
     for (toolbox, brief) in briefs {
@@ -1513,7 +1528,7 @@ Safe truncation never cuts serialized JSON or leaves dangling references. Ordere
         let mut section = format!("# Toolbox {toolbox}\n\n{}", brief.trim());
         for tool in tools.iter().filter(|tool| tool.toolbox == toolbox.as_str()) {
             section.push_str(&format!(
-                "\n\n## {}\n\nRoute:\n{}\n\nInstructions:\n{}\n\nOutput schema:\n```json\n{}\n```\n\nExamples:\n{}",
+                "\n\n## {}\n\nRoute:\n{}\n\nInstructions:\n{}\n\nResult detail schema:\n```json\n{}\n```\n\nExamples:\n{}",
                 tool.full_name,
                 tool.route.trim(),
                 tool.instructions.trim(),
@@ -2245,7 +2260,11 @@ for line in sys.stdin:
         );
         assert!(catalog.prompt().contains("# Toolbox Terminal"));
         assert!(catalog.prompt().contains("## Terminal.Interact"));
-        assert!(catalog.prompt().contains("Output schema:"));
+        assert!(catalog.prompt().contains("Result detail schema:"));
+        assert!(catalog.prompt().contains("describes only `result.detail`"));
+        assert!(catalog.prompt().contains("including its actual JSON type"));
+        assert!(catalog.prompt().contains("\"state\": \"succeeded\""));
+        assert!(catalog.prompt().contains("\"truncate\": false"));
     }
 
     #[test]
@@ -2305,7 +2324,7 @@ for line in sys.stdin:
                 .prompt()
                 .contains("Instructions:\nChoose a fixed PTY size")
         );
-        assert!(manager.prompt().contains("Output schema:\n```json"));
+        assert!(manager.prompt().contains("Result detail schema:\n```json"));
         assert!(manager.prompt().contains("Examples:\n"));
         assert!(manager.prompt().contains("\"max_output_chars\""));
         assert_eq!(
