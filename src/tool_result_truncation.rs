@@ -1710,6 +1710,7 @@ mod tests {
         assert!(retained.contains_key("200"));
         assert!(retained.len() < 200);
         assert!(!retained.contains_key("100"));
+        assert_eq!(result["result"]["detail"]["total_lines"], 200);
         assert!(
             result["truncate_info"]["ranges"]["lines"]["removed_line_ranges"]
                 .as_array()

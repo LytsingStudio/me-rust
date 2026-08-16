@@ -6066,7 +6066,7 @@ mod tests {
         append_file_result_for_scope_test(
             &mut edb,
             "File.Read",
-            json!({"path":"scoped.txt","start_line":2,"max_lines":2}),
+            json!({"path":"scoped.txt","start_line":2,"end_line":3}),
             json!({
                 "path":"scoped.txt",
                 "lines":{"2":"two\r\n","3":"three\n"},
@@ -6093,7 +6093,7 @@ mod tests {
         append_file_result_for_scope_test(
             &mut edb,
             "File.Read",
-            json!({"path":"scoped.txt","start_line":5,"max_lines":1}),
+            json!({"path":"scoped.txt","start_line":5,"end_line":5}),
             json!({
                 "path":"scoped.txt",
                 "lines":{"5":"five\n"},
@@ -6196,7 +6196,7 @@ mod tests {
         append_file_result_for_scope_test(
             &mut edb,
             "File.Read",
-            json!({"path":"target.txt","start_line":2,"max_lines":1}),
+            json!({"path":"target.txt","start_line":2,"end_line":2}),
             json!({
                 "path":"target.txt",
                 "lines":{"2":"two"},
@@ -6283,7 +6283,7 @@ mod tests {
         append_file_result_for_scope_test(
             &mut edb,
             "File.Read",
-            json!({"path":relative_request.clone(),"start_line":2,"max_lines":1}),
+            json!({"path":relative_request.clone(),"start_line":2,"end_line":2}),
             json!({
                 "path":canonical.clone(),
                 "lines":{"2":"two"},

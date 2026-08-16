@@ -226,7 +226,7 @@ impl ToolboxProcess {
         let mut input = input;
         if tool == "Edit" {
             let path = input["path"].as_str().unwrap().to_owned();
-            let mut read = json!({"path": path, "max_lines": 10000});
+            let mut read = json!({"path": path});
             if let Some(encoding) = input.get("encoding") {
                 read["encoding"] = encoding.clone();
             }
@@ -303,6 +303,38 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
             .unwrap()
             .contains("normalized absolute paths outside")
     );
+    assert!(
+        read_schema["output"]["properties"]
+            .get("max_lines")
+            .is_none()
+    );
+    assert_eq!(
+        read_schema["output"]["properties"]["start_line"]["minimum"],
+        1
+    );
+    assert_eq!(
+        read_schema["output"]["properties"]["end_line"]["minimum"],
+        1
+    );
+    let read_instructions = toolbox.query("getInstructions", Some("Read"));
+    let read_instructions = read_instructions["output"].as_str().unwrap();
+    assert!(read_instructions.contains("omit both to read the complete file"));
+    assert!(read_instructions.contains("Every successful result includes total_lines"));
+    assert!(!read_instructions.contains("max_lines"));
+    let read_examples = toolbox.query("getExamples", Some("Read"));
+    let read_examples = read_examples["output"].as_str().unwrap();
+    assert!(read_examples.contains("\"end_line\":200"));
+    assert!(!read_examples.contains("max_lines"));
+    let read_output_schema = toolbox.query("getOutputSchema", Some("Read"));
+    for model_visible_read_section in [
+        read_schema["output"].to_string(),
+        read_output_schema["output"].to_string(),
+        read_instructions.to_owned(),
+        read_examples.to_owned(),
+    ] {
+        assert!(!model_visible_read_section.contains("beyond EOF"));
+        assert!(!model_visible_read_section.contains("out of range"));
+    }
     for tool in &tool_names {
         for command in [
             "getInputSchema",
@@ -1129,7 +1161,7 @@ fn edit_requires_visible_read_ranges_merges_them_and_clears_them_after_success()
 
     let first = toolbox.execute_raw(
         "Read",
-        json!({"path":"scoped.txt","start_line":2,"max_lines":2}),
+        json!({"path":"scoped.txt","start_line":2,"end_line":3}),
     );
     assert_eq!(first["output"]["lines"], json!({"2":"two","3":"three"}));
     assert_eq!(
@@ -1138,7 +1170,7 @@ fn edit_requires_visible_read_ranges_merges_them_and_clears_them_after_success()
     );
     let second = toolbox.execute_raw(
         "Read",
-        json!({"path":"scoped.txt","start_line":5,"max_lines":1}),
+        json!({"path":"scoped.txt","start_line":5,"end_line":5}),
     );
     assert_eq!(
         second["output"]["editable_ranges"],
@@ -1179,6 +1211,120 @@ fn edit_requires_visible_read_ranges_merges_them_and_clears_them_after_success()
         json!({"path":"scoped.txt","edits":[{"operation":"delete","start_line":3,"end_line":3}]}),
     );
     assert_eq!(edit_again["error"]["code"], "read_required");
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn read_supports_optional_inclusive_bounds_and_reports_total_lines() {
+    let workspace = temporary_workspace();
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+    toolbox.execute(
+        "Create",
+        json!({"path":"ranges.txt", "content":"one\ntwo\nthree\nfour\nfive\n"}),
+    );
+
+    let complete = toolbox.execute_raw("Read", json!({"path":"ranges.txt"}));
+    assert_eq!(complete["type"], "result", "{complete}");
+    assert_eq!(complete["output"]["total_lines"], 5);
+    assert_eq!(complete["output"]["start_line"], 1);
+    assert_eq!(complete["output"]["end_line"], 5);
+    assert_eq!(complete["output"]["eof"], true);
+    assert_eq!(complete["output"]["truncated"], false);
+    assert_eq!(
+        complete["output"]["lines"],
+        json!({"1":"one","2":"two","3":"three","4":"four","5":"five"})
+    );
+
+    let from_start = toolbox.execute_raw("Read", json!({"path":"ranges.txt","start_line":3}));
+    assert_eq!(from_start["output"]["total_lines"], 5);
+    assert_eq!(from_start["output"]["start_line"], 3);
+    assert_eq!(from_start["output"]["end_line"], 5);
+    assert_eq!(
+        from_start["output"]["lines"],
+        json!({"3":"three","4":"four","5":"five"})
+    );
+
+    let through_end = toolbox.execute_raw("Read", json!({"path":"ranges.txt","end_line":3}));
+    assert_eq!(through_end["output"]["total_lines"], 5);
+    assert_eq!(through_end["output"]["start_line"], 1);
+    assert_eq!(through_end["output"]["end_line"], 3);
+    assert_eq!(through_end["output"]["eof"], false);
+    assert_eq!(through_end["output"]["truncated"], true);
+    assert_eq!(
+        through_end["output"]["lines"],
+        json!({"1":"one","2":"two","3":"three"})
+    );
+
+    let bounded = toolbox.execute_raw(
+        "Read",
+        json!({"path":"ranges.txt","start_line":2,"end_line":4}),
+    );
+    assert_eq!(bounded["output"]["total_lines"], 5);
+    assert_eq!(bounded["output"]["start_line"], 2);
+    assert_eq!(bounded["output"]["end_line"], 4);
+    assert_eq!(
+        bounded["output"]["lines"],
+        json!({"2":"two","3":"three","4":"four"})
+    );
+
+    let clamped_end = toolbox.execute_raw(
+        "Read",
+        json!({"path":"ranges.txt","start_line":4,"end_line":700}),
+    );
+    assert_eq!(clamped_end["type"], "result", "{clamped_end}");
+    assert_eq!(clamped_end["output"]["total_lines"], 5);
+    assert_eq!(clamped_end["output"]["start_line"], 4);
+    assert_eq!(clamped_end["output"]["end_line"], 5);
+    assert_eq!(
+        clamped_end["output"]["lines"],
+        json!({"4":"four","5":"five"})
+    );
+    assert!(
+        clamped_end["output"]["notice"]
+            .as_str()
+            .unwrap()
+            .contains("5 lines")
+    );
+
+    let past_eof = toolbox.execute_raw("Read", json!({"path":"ranges.txt","start_line":600}));
+    assert_eq!(past_eof["type"], "result", "{past_eof}");
+    assert_eq!(past_eof["output"]["total_lines"], 5);
+    assert!(past_eof["output"]["start_line"].is_null());
+    assert!(past_eof["output"]["end_line"].is_null());
+    assert_eq!(past_eof["output"]["lines"], json!({}));
+    assert_eq!(past_eof["output"]["eof"], true);
+    assert!(
+        past_eof["output"]["notice"]
+            .as_str()
+            .unwrap()
+            .contains("start_line 600 is beyond EOF")
+    );
+
+    let reversed = toolbox.execute_raw(
+        "Read",
+        json!({"path":"ranges.txt","start_line":4,"end_line":3}),
+    );
+    assert_eq!(reversed["type"], "error");
+    assert_eq!(reversed["error"]["code"], "invalid_arguments");
+    let old_parameter = toolbox.execute_raw("Read", json!({"path":"ranges.txt","max_lines":2}));
+    assert_eq!(old_parameter["type"], "error");
+    assert_eq!(old_parameter["error"]["code"], "invalid_arguments");
+
+    toolbox.execute("Create", json!({"path":"empty.txt", "content":""}));
+    let empty = toolbox.execute_raw("Read", json!({"path":"empty.txt"}));
+    assert_eq!(empty["output"]["total_lines"], 0);
+    assert!(empty["output"]["start_line"].is_null());
+    assert!(empty["output"]["end_line"].is_null());
+    assert_eq!(empty["output"]["lines"], json!({}));
+    assert_eq!(empty["output"]["eof"], true);
+    assert_eq!(
+        empty["output"]["editable_ranges"],
+        json!([]),
+        "an empty EOF is authorized internally without inventing line ranges"
+    );
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
@@ -1424,7 +1570,7 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
 
     let read = toolbox.execute(
         "Read",
-        json!({"path":"src/a.txt", "start_line":2, "max_lines":1}),
+        json!({"path":"src/a.txt", "start_line":2, "end_line":2}),
     );
     assert_eq!(read["output"]["lines"], numbered_lines("Needle one\n", 2));
     assert_eq!(read["output"]["start_line"], 2);
@@ -1722,7 +1868,7 @@ fn large_source_files_are_not_rejected_by_an_artificial_size_limit() {
 
     let read = toolbox.execute(
         "Read",
-        json!({"path":"large.txt", "start_line":67, "max_lines":1}),
+        json!({"path":"large.txt", "start_line":67, "end_line":67}),
     );
     assert_eq!(read["type"], "result", "unexpected result: {read}");
     assert_eq!(
@@ -2084,7 +2230,7 @@ fn every_file_tool_supports_normalized_external_paths_without_weakening_other_gu
 
     let read = toolbox.execute(
         "Read",
-        json!({"path":display(&text_path), "start_line":1, "max_lines":2}),
+        json!({"path":display(&text_path), "start_line":1, "end_line":2}),
     );
     assert_eq!(read["output"]["lines"], json!({"1":"one", "2":"two"}));
     assert_eq!(

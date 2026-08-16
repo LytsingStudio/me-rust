@@ -293,14 +293,17 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "Read": object_schema(
         {
             "path": PATH_SCHEMA,
-            "start_line": {"type": "integer", "minimum": 1, "default": 1},
-            "encoding": {**ENCODING_SCHEMA, "default": "auto"},
-            "max_lines": {
+            "start_line": {
                 "type": "integer",
                 "minimum": 1,
-                "maximum": 10000,
-                "default": 500,
+                "description": "Optional inclusive 1-based first line. Omit to begin at line 1.",
             },
+            "end_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional inclusive 1-based final line. Omit to continue through EOF.",
+            },
+            "encoding": {**ENCODING_SCHEMA, "default": "auto"},
         },
         ["path"],
     ),
@@ -595,11 +598,21 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                     ["start_line", "end_line"],
                 ),
             },
-            "start_line": {"type": "integer"},
-            "end_line": {"type": "integer"},
-            "total_lines": {"type": "integer"},
+            "start_line": {"type": ["integer", "null"]},
+            "end_line": {"type": ["integer", "null"]},
+            "total_lines": {
+                "type": "integer",
+                "description": "The complete file's total logical line count, always present on success.",
+            },
             "eof": {"type": "boolean"},
-            "truncated": {"type": "boolean"},
+            "truncated": {
+                "type": "boolean",
+                "description": "True when the requested range ends before the file's actual EOF.",
+            },
+            "notice": {
+                "type": "string",
+                "description": "Additional information about the actual returned range.",
+            },
             "hash": HASH_SCHEMA,
             "size": {"type": "integer"},
             "encoding": CREATE_ENCODING_SCHEMA,
@@ -847,7 +860,7 @@ OUTPUT_SCHEMAS["Delete"] = object_schema(
 
 
 ROUTES = {
-    "Read": "Read a bounded text range with conservative automatic encoding detection when exact file content is needed.",
+    "Read": "Read an inclusive text line range, or the complete file, with conservative automatic encoding detection when exact file content is needed.",
     "ReadBytes": "Read a bounded byte range for binary data, text whose encoding cannot be determined safely, or a File.EditBytes baseline.",
     "EditBytes": "Atomically replace, delete, or insert one or more independently located byte ranges after inspecting them with File.ReadBytes.",
     "List": "Inspect directory contents without invoking a shell.",
@@ -864,7 +877,7 @@ ROUTES = {
 }
 
 INSTRUCTIONS = {
-    "Read": "Line numbers are 1-based. The lines object maps each actual file line number to its logical text without any LF, CRLF, or CR terminator; an empty string is one blank line. Keys are minimally zero-padded to the digit width of total_lines solely to preserve numeric order in serialized JSON; interpret them as decimal line numbers. Missing numeric keys in a safely truncated model-visible result are omitted lines, not empty lines.\n\nEDIT AUTHORIZATION: editable_ranges is the complete current set of inclusive 1-based line ranges that File.Edit is allowed to target for this file. It is authorization state, not merely a description of what this one Read requested. Every successful Read adds only the complete ordinary-string lines actually returned and visible to you; repeated reads of the same unchanged file merge adjacent or separate ranges and return the full accumulated set. Safely omitted lines and incomplete text_fragments do not become editable. Replace and delete operations must be fully contained in editable_ranges. An insert before an existing line requires that line to be editable; inserting after the final line requires that the final line and EOF were read; inserting into an empty file requires a successful Read that established the empty EOF. Before File.Edit, read every target line or insertion point and receive the Read result in an earlier model response. File.Search, File.Stat, hashes, remembered content, and any other tool do not grant edit authorization. A successful File.Edit or a detected file change clears the authorization, so call File.Read again before another edit.\n\nSource file size is not artificially capped: the complete file is loaded into memory to detect its encoding, count lines, and compute its hash, while max_lines bounds the returned range. Auto detection checks BOM, Unicode encodings, strict UTF-8, then common legacy encodings conservatively. If auto detection is uncertain, retry only when the encoding is known by setting encoding explicitly; otherwise use ReadBytes.",
+    "Read": "Line numbers are inclusive and 1-based. Use start_line and end_line as optional bounds: omit start_line to begin at line 1, omit end_line to continue through EOF, or omit both to read the complete file. Every successful result includes total_lines for the complete file. start_line and end_line in the result identify the actual returned range and are null when no line exists in the requested range. The lines object maps each actual file line number to its logical text without any LF, CRLF, or CR terminator; an empty string is one blank line. Keys are minimally zero-padded to the digit width of total_lines solely to preserve numeric order in serialized JSON; interpret them as decimal line numbers. Missing numeric keys in a safely truncated model-visible result are omitted lines, not empty lines.\n\nEDIT AUTHORIZATION: editable_ranges is the complete current set of inclusive 1-based line ranges that File.Edit is allowed to target for this file. It is authorization state, not merely a description of what this one Read requested. Every successful Read adds only the complete ordinary-string lines actually returned and visible to you; repeated reads of the same unchanged file merge adjacent or separate ranges and return the full accumulated set. Safely omitted lines and incomplete text_fragments do not become editable. Replace and delete operations must be fully contained in editable_ranges. An insert before an existing line requires that line to be editable; inserting after the final line requires that the final line and EOF were read; inserting into an empty file requires a successful Read that established the empty EOF. Before File.Edit, read every target line or insertion point and receive the Read result in an earlier model response. File.Search, File.Stat, hashes, remembered content, and any other tool do not grant edit authorization. A successful File.Edit or a detected file change clears the authorization, so call File.Read again before another edit.\n\nSource file size is not artificially capped: the complete file is loaded into memory to detect its encoding, count lines, and compute its hash. Large model-visible results are reduced only by the structured safety envelope, which preserves the JSON shape and absolute line numbers and reports truncate=true. Auto detection checks BOM, Unicode encodings, strict UTF-8, then common legacy encodings conservatively. If auto detection is uncertain, retry only when the encoding is known by setting encoding explicitly; otherwise use ReadBytes.",
     "ReadBytes": "Offsets are zero-based, and source file size is not artificially capped. The result data contains lowercase two-digit hexadecimal bytes separated by one space, without a 0x prefix. length is the number of bytes represented by data, and hash identifies the complete file rather than only the returned range. Use the returned bytes and hash as the baseline for File.EditBytes. If the model-context safety envelope reports truncate:true, data retains only the earliest complete bytes from the requested range; read another range before editing bytes that are not visible. truncate_info.ranges.bytes reports retained_offset_start, retained_offset_end_exclusive, removed_offset_start, and removed_offset_end_exclusive as absolute half-open byte ranges.",
     "EditBytes": (
         "EditBytes atomically applies one or more operations to one file. First use File.ReadBytes to inspect every target range and obtain the complete file hash, then pass that hash as expected_hash. target_offset is a zero-based original byte offset, and target_length selects the half-open original range [target_offset, target_offset + target_length). Every operation is independently located against the same original pre-edit snapshot. Earlier array items never shift later offsets, and array order is not execution order. The tool validates every operation before writing and commits the combined result once. A later operation cannot target bytes created by another operation in the same call; perform dependent work only after another ReadBytes.\n"
@@ -890,7 +903,7 @@ INSTRUCTIONS = {
 }
 
 EXAMPLES = {
-    "Read": '{"path":"src/main.rs","start_line":1,"max_lines":200}',
+    "Read": 'Read a bounded inclusive range:\n{"path":"src/main.rs","start_line":1,"end_line":200}\n\nRead from line 201 through EOF:\n{"path":"src/main.rs","start_line":201}\n\nRead from the beginning through line 80:\n{"path":"src/main.rs","end_line":80}\n\nRead the complete file:\n{"path":"src/main.rs"}',
     "ReadBytes": '{"path":"assets/data.bin","offset":0,"length":65536}',
     "EditBytes": (
         "Assume File.ReadBytes returned offset=0, data=\"00 11 22 33 44 55\", size=6, and hash=0123abcd. Every edit below refers to those six original bytes.\n\n"
@@ -913,7 +926,7 @@ EXAMPLES = {
     "MakeDirectory": '{"path":"build/generated/assets","parents":true}',
     "Create": '{"path":"notes.txt","content":"first line\\n","encoding":"utf-8"}',
     "Edit": (
-        "First call File.Read for every target, for example {\"path\":\"notes.txt\",\"start_line\":1,\"max_lines\":4}. Wait for its result before calling Edit; do not emit Read and Edit together. Assume it returned lines {\"1\":\"aaa\",\"2\":\"bbb\",\"3\":\"ccc\",\"4\":\"ddd\"} and editable_ranges=[{\"start_line\":1,\"end_line\":4}]. This means only lines 1 through 4 and insertion points established from them are currently authorized; it does not authorize any unseen line. new_lines contains logical text only; never add LF or CR.\n\n"
+        "First call File.Read for every target, for example {\"path\":\"notes.txt\",\"start_line\":1,\"end_line\":4}. Wait for its result before calling Edit; do not emit Read and Edit together. Assume it returned lines {\"1\":\"aaa\",\"2\":\"bbb\",\"3\":\"ccc\",\"4\":\"ddd\"} and editable_ranges=[{\"start_line\":1,\"end_line\":4}]. This means only lines 1 through 4 and insertion points established from them are currently authorized; it does not authorize any unseen line. new_lines contains logical text only; never add LF or CR.\n\n"
         "Replace original lines 1 and 3 independently. The first replacement adds a line, but the second still targets original line 3:\n"
         '{"path":"notes.txt","edits":[{"operation":"replace","start_line":1,"end_line":1,"new_lines":["111","aaa"]},{"operation":"replace","start_line":3,"end_line":3,"new_lines":["333","ccc"]}]}'
         "\n\nMixed atomic batch; array order is irrelevant. Replace original line 4, insert before original line 2, and delete original line 3:\n"
@@ -1583,41 +1596,57 @@ def line_without_ending(line: str) -> str:
 
 def execute_read(data: dict[str, Any]) -> dict[str, Any]:
     logical = string_arg(data, "path")
-    start_line = int_arg(data, "start_line", 1, 1, 2**31 - 1)
-    max_lines = int_arg(data, "max_lines", 500, 1, 10000)
+    requested_start = optional_int_arg(data, "start_line", 1, 2**31 - 1)
+    requested_end = optional_int_arg(data, "end_line", 1, 2**31 - 1)
+    effective_start = requested_start if requested_start is not None else 1
+    if requested_end is not None and effective_start > requested_end:
+        raise ToolError(
+            "invalid_arguments",
+            "start_line must be less than or equal to end_line",
+        )
     encoding = encoding_arg(data)
     path = existing_path(logical)
     require_regular_file(path, logical)
     document = read_text_file(path, logical, encoding)
     lines = split_text_file_lines(document.text)
-    start_index = min(start_line - 1, len(lines))
-    selected = lines[start_index : start_index + max_lines]
-    end_line = start_index + len(selected)
-    eof = end_line >= len(lines)
+    total_lines = len(lines)
+    if effective_start > total_lines:
+        start_index = total_lines
+        selected: list[str] = []
+        actual_start: int | None = None
+        actual_end: int | None = None
+    else:
+        start_index = effective_start - 1
+        effective_end = requested_end if requested_end is not None else total_lines
+        actual_end = min(effective_end, total_lines)
+        selected = lines[start_index:actual_end]
+        actual_start = effective_start
+    eof = actual_end is None or actual_end >= total_lines
     line_number_width = max(1, len(str(len(lines))))
     content_hash = sha256_bytes(document.raw)
     scope_key = relative_path(path)
     scope = EDIT_SCOPES.get(scope_key)
     if scope is None or scope.content_hash != content_hash:
-        scope = EditScope(content_hash, [], len(lines), False)
+        scope = EditScope(content_hash, [], total_lines, False)
     if selected:
+        assert actual_start is not None and actual_end is not None
         scope.ranges = merge_ranges(
-            scope.ranges + [(start_index + 1, end_line)]
+            scope.ranges + [(actual_start, actual_end)]
         )
-    scope.total_lines = len(lines)
+    scope.total_lines = total_lines
     if len(lines) == 0 or (eof and bool(selected)):
         scope.eof = True
     EDIT_SCOPES[scope_key] = scope
-    return {
+    output: dict[str, Any] = {
         "path": scope_key,
         "lines": {
             str(start_index + offset + 1).zfill(line_number_width): line_without_ending(line)
             for offset, line in enumerate(selected)
         },
         "editable_ranges": scope_ranges_value(scope),
-        "start_line": start_line,
-        "end_line": end_line,
-        "total_lines": len(lines),
+        "start_line": actual_start,
+        "end_line": actual_end,
+        "total_lines": total_lines,
         "eof": eof,
         "truncated": not eof,
         "hash": content_hash,
@@ -1626,6 +1655,19 @@ def execute_read(data: dict[str, Any]) -> dict[str, Any]:
         "encoding_confidence": document.confidence,
         "bom": bool(document.bom),
     }
+    if total_lines == 0 and (requested_start is not None or requested_end is not None):
+        output["notice"] = "The file has 0 lines; no lines were returned."
+    elif effective_start > total_lines:
+        output["notice"] = (
+            f"The file has {total_lines} lines; start_line {effective_start} is "
+            "beyond EOF, so no lines were returned."
+        )
+    elif requested_end is not None and requested_end > total_lines:
+        output["notice"] = (
+            f"The file has {total_lines} lines; the returned range ends at the "
+            "actual final line."
+        )
+    return output
 
 
 def execute_read_bytes(data: dict[str, Any]) -> dict[str, Any]:
