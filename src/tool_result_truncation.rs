@@ -626,13 +626,31 @@ fn detail_object_mut(root: &mut Value) -> Option<&mut Map<String, Value>> {
 }
 
 fn normalize_legacy_tool_result(tool_name: &str, root: &mut Value) {
-    if tool_name != "File.Read" {
-        return;
-    }
     let Some(detail) = detail_object_mut(root) else {
         return;
     };
+    if tool_name == "File.Search" {
+        if let Some(matches) = detail.get_mut("matches").and_then(Value::as_array_mut) {
+            for matched in matches {
+                let Some(matched) = matched.as_object_mut() else {
+                    continue;
+                };
+                for field in ["before", "match_text", "after"] {
+                    if let Some(lines) = matched.get_mut(field).and_then(Value::as_object_mut) {
+                        normalize_numbered_logical_lines(lines);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if tool_name != "File.Read" {
+        return;
+    }
     if detail.get("lines").is_some() {
+        if let Some(lines) = detail.get_mut("lines").and_then(Value::as_object_mut) {
+            normalize_numbered_logical_lines(lines);
+        }
         return;
     }
     let Some(content) = detail
@@ -659,12 +677,34 @@ fn normalize_legacy_tool_result(tool_name: &str, root: &mut Value) {
         .enumerate()
         .map(|(offset, line)| {
             let number = start_line.saturating_add(offset as u64);
-            (format!("{number:0width$}"), Value::String(line))
+            (
+                format!("{number:0width$}"),
+                Value::String(without_line_ending(&line).to_owned()),
+            )
         })
         .collect::<Map<_, _>>();
     detail.remove("content");
     detail.remove("content_segments");
     detail.insert("lines".into(), Value::Object(lines));
+}
+
+fn normalize_numbered_logical_lines(lines: &mut Map<String, Value>) {
+    for value in lines.values_mut() {
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        let logical = without_line_ending(text);
+        if logical.len() != text.len() {
+            *value = Value::String(logical.to_owned());
+        }
+    }
+}
+
+fn without_line_ending(text: &str) -> &str {
+    text.strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .or_else(|| text.strip_suffix('\r'))
+        .unwrap_or(text)
 }
 
 fn batch_size(length: usize) -> usize {
@@ -1612,10 +1652,44 @@ mod tests {
         assert!(result["result"]["detail"].get("content").is_none());
         assert_eq!(
             result["result"]["detail"]["lines"],
-            json!({"01":"first\r\n", "02":"\r", "03":"third"})
+            json!({"01":"first", "02":"", "03":"third"})
         );
         assert_eq!(original["result"]["detail"]["content"], "first\r\n\rthird");
         assert!(original["result"]["detail"].get("lines").is_none());
+    }
+
+    #[test]
+    fn legacy_file_search_lines_are_projected_without_line_endings() {
+        let original = wrapper(json!({
+            "path":"src",
+            "matches":[{
+                "path":"src/main.rs",
+                "before":{"01":"before\r\n"},
+                "match_text":{"02":"needle\n"},
+                "after":{"03":"\r"},
+                "column":1,
+                "match_length":6
+            }],
+            "truncated":false
+        }));
+        let result = truncate_for_model_with_limit("File.Search", original.clone(), 1_000);
+        assert_eq!(result["truncate"], false);
+        assert_eq!(
+            result["result"]["detail"]["matches"][0]["before"],
+            json!({"01":"before"})
+        );
+        assert_eq!(
+            result["result"]["detail"]["matches"][0]["match_text"],
+            json!({"02":"needle"})
+        );
+        assert_eq!(
+            result["result"]["detail"]["matches"][0]["after"],
+            json!({"03":""})
+        );
+        assert_eq!(
+            original["result"]["detail"]["matches"][0]["match_text"]["02"],
+            "needle\n"
+        );
     }
 
     #[test]
@@ -1751,7 +1825,7 @@ mod tests {
             last_fragments.last().unwrap()["text"]
                 .as_str()
                 .unwrap()
-                .ends_with('\n')
+                .ends_with('乙')
         );
     }
 

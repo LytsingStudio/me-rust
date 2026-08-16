@@ -94,7 +94,16 @@ fn numbered_lines(text: &str, first_line: usize) -> Value {
             _ => None,
         };
         if let Some(end) = end {
-            lines.insert(number.to_string(), json!(&text[start..end]));
+            let mut logical_end = end;
+            if bytes[end - 1] == b'\n' {
+                logical_end -= 1;
+                if logical_end > start && bytes[logical_end - 1] == b'\r' {
+                    logical_end -= 1;
+                }
+            } else if bytes[end - 1] == b'\r' {
+                logical_end -= 1;
+            }
+            lines.insert(number.to_string(), json!(&text[start..logical_end]));
             number += 1;
             start = end;
             index = end;
@@ -108,12 +117,35 @@ fn numbered_lines(text: &str, first_line: usize) -> Value {
     Value::Object(lines)
 }
 
+fn logical_lines(value: Value) -> Value {
+    Value::Array(
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| {
+                line.as_str().map_or_else(
+                    || line.clone(),
+                    |line| {
+                        json!(
+                            line.strip_suffix("\r\n")
+                                .or_else(|| line.strip_suffix('\r'))
+                                .or_else(|| line.strip_suffix('\n'))
+                                .unwrap_or(line)
+                        )
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
 macro_rules! single_edit_input {
     ($path:expr, $hash:expr, $start:expr, $end:expr, $new_lines:expr) => {
         {
             let start = $start;
             let end = $end;
-            let new_lines = $new_lines;
+            let new_lines = logical_lines($new_lines);
             let edit = if start > end {
                 json!({"operation":"insert","before_line":start,"new_lines":new_lines})
             } else if new_lines.as_array().is_some_and(|lines| lines.is_empty()) {
@@ -121,7 +153,8 @@ macro_rules! single_edit_input {
             } else {
                 json!({"operation":"replace","start_line":start,"end_line":end,"new_lines":new_lines})
             };
-            json!({"path":$path,"expected_hash":$hash,"edits":[edit]})
+            let _ = $hash;
+            json!({"path":$path,"edits":[edit]})
         }
     };
 }
@@ -190,6 +223,38 @@ impl ToolboxProcess {
     }
 
     fn execute(&mut self, tool: &str, input: Value) -> Value {
+        let mut input = input;
+        if tool == "Edit" {
+            let path = input["path"].as_str().unwrap().to_owned();
+            let mut read = json!({"path": path, "max_lines": 10000});
+            if let Some(encoding) = input.get("encoding") {
+                read["encoding"] = encoding.clone();
+            }
+            let read_result = self.execute_raw("Read", read);
+            assert_eq!(read_result["type"], "result", "edit baseline read failed");
+            input.as_object_mut().unwrap().remove("expected_hash");
+            if let Some(edits) = input.get_mut("edits").and_then(Value::as_array_mut) {
+                for edit in edits {
+                    if let Some(lines) = edit.get_mut("new_lines").and_then(Value::as_array_mut) {
+                        for line in lines {
+                            if let Some(text) = line.as_str() {
+                                let logical = text
+                                    .strip_suffix("\r\n")
+                                    .or_else(|| text.strip_suffix('\r'))
+                                    .or_else(|| text.strip_suffix('\n'))
+                                    .unwrap_or(text)
+                                    .to_owned();
+                                *line = Value::String(logical);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.execute_raw(tool, input)
+    }
+
+    fn execute_raw(&mut self, tool: &str, input: Value) -> Value {
         self.request(json!({"cmd":"execute", "tool":tool, "input":input}))
     }
 
@@ -278,6 +343,11 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
         json!(["insert"])
     );
     assert_eq!(edit_variants[2]["properties"]["before_line"]["minimum"], 1);
+    assert!(
+        edit_schema["output"]["properties"]
+            .get("expected_hash")
+            .is_none()
+    );
     assert_eq!(edit_variants[0]["properties"]["new_lines"]["type"], "array");
     assert!(
         edit_variants[0]["properties"]["new_lines"]
@@ -306,14 +376,15 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     );
     let edit_instructions = toolbox.query("getInstructions", Some("Edit"));
     let edit_instructions = edit_instructions["output"].as_str().unwrap();
-    assert!(edit_instructions.contains("one original pre-edit snapshot"));
+    assert!(edit_instructions.contains("same original pre-edit snapshot"));
     assert!(edit_instructions.contains("array order is not execution order"));
     assert!(edit_instructions.contains("duplicated at the same insertion point"));
-    assert!(edit_instructions.contains("must end in LF"));
-    assert!(edit_instructions.contains("missing final line ending is a syntax error"));
-    assert!(edit_instructions.contains("deliberately omits the new hash"));
+    assert!(edit_instructions.contains("MUST NOT contain LF or CR"));
+    assert!(edit_instructions.contains("automatically selects and preserves"));
+    assert!(edit_instructions.contains("clears every editable range"));
     assert!(edit_instructions.contains("call File.Read again"));
-    assert!(edit_instructions.contains("File.Search is only a locator"));
+    assert!(edit_instructions.contains("File.Search"));
+    assert!(edit_instructions.contains("later model response"));
     let edit_examples = toolbox.query("getExamples", Some("Edit"));
     let edit_examples = edit_examples["output"].as_str().unwrap();
     assert!(edit_examples.contains("original lines 1 and 3 independently"));
@@ -321,6 +392,7 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     assert!(edit_examples.contains("Deletion has no new_lines field"));
     assert!(edit_examples.contains("Insert into an empty file"));
     assert!(edit_examples.contains("Common errors"));
+    assert!(edit_examples.contains("do not emit Read and Edit together"));
     for example in edit_examples.lines().filter(|line| line.starts_with('{')) {
         serde_json::from_str::<Value>(example).unwrap();
     }
@@ -335,7 +407,7 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
         search_instructions["output"]
             .as_str()
             .unwrap()
-            .contains("deliberately returns no hash")
+            .contains("never establishes editable_ranges")
     );
     assert_eq!(
         toolbox.query("getInputSchema", Some("Read"))["output"]["properties"]["encoding"]["default"],
@@ -426,8 +498,8 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     let search_instructions = toolbox.query("getInstructions", Some("Search"));
     let search_instructions = search_instructions["output"].as_str().unwrap();
     assert!(search_instructions.contains("before, match_text, and after"));
-    assert!(search_instructions.contains("no separate line field"));
-    assert!(search_instructions.contains("never establishes a File.Edit baseline"));
+    assert!(search_instructions.contains("line-number-keyed objects"));
+    assert!(search_instructions.contains("never establishes editable_ranges"));
     assert!(search_instructions.contains("top-level truncate:true"));
     assert!(search_instructions.contains("text_fragments"));
     assert!(search_instructions.contains("Source file size is not artificially capped"));
@@ -512,7 +584,7 @@ fn file_mutations_require_a_refreshed_hash_after_edit_and_never_add_implicit_tex
     let hash3 = appended["output"]["hash"].as_str().unwrap().to_owned();
     assert_eq!(
         fs::read_to_string(workspace.join("notes.txt")).unwrap(),
-        "first\nsecond\ntail"
+        "first\nsecondtail"
     );
     assert_eq!(appended["output"]["appended_bytes"], 4);
 
@@ -664,7 +736,7 @@ fn edit_replaces_deletes_inserts_and_preserves_exact_line_endings() {
             2,
             2,
             json!(["omega\n", "appended\n"]),
-            "alpha\nomega\nappended\n",
+            "alpha\nomega\nappended",
         ),
         (
             "mixed-endings.txt",
@@ -793,7 +865,7 @@ fn edit_locates_every_operation_on_one_snapshot_and_reports_each_result() {
         edited["output"]["tip"]
             .as_str()
             .unwrap()
-            .contains("previous line numbers and hash are now stale")
+            .contains("previously readable edit range")
     );
 
     let search = toolbox.execute(
@@ -802,9 +874,9 @@ fn edit_locates_every_operation_on_one_snapshot_and_reports_each_result() {
     );
     let matched = &search["output"]["matches"][0];
     assert!(matched.get("hash").is_none());
-    assert_eq!(matched["before"], json!({"3":"bbb\n"}));
-    assert_eq!(matched["match_text"], json!({"4":"333\n"}));
-    assert_eq!(matched["after"], json!({"5":"ccc\n"}));
+    assert_eq!(matched["before"], json!({"3":"bbb"}));
+    assert_eq!(matched["match_text"], json!({"4":"333"}));
+    assert_eq!(matched["after"], json!({"5":"ccc"}));
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
@@ -922,53 +994,31 @@ fn edit_accepts_unordered_independent_ranges_and_rejects_every_ambiguous_batch_a
 }
 
 #[test]
-fn edit_rejects_malformed_physical_lines_and_unterminated_append_atomically() {
+fn edit_uses_logical_lines_and_rejects_embedded_terminators_atomically() {
     let workspace = temporary_workspace();
     let script = generated_file_toolbox(&workspace);
     let mut toolbox = ToolboxProcess::start(&workspace, &script);
-    let created = toolbox.execute(
+    toolbox.execute(
         "Create",
         json!({"path":"physical.txt", "content":"alpha\nbeta"}),
     );
-    let hash = created["output"]["hash"].clone();
     let original = "alpha\nbeta";
-
-    for (name, edits) in [
-        (
-            "missing line ending",
-            json!([{"operation":"replace","start_line":1,"end_line":1,"new_lines":["changed"]}]),
-        ),
-        (
-            "two physical lines in one item",
-            json!([{"operation":"replace","start_line":1,"end_line":1,"new_lines":["one\ntwo\n"]}]),
-        ),
-        (
-            "non-string physical line",
-            json!([{"operation":"replace","start_line":1,"end_line":1,"new_lines":[42]}]),
-        ),
-        (
-            "NUL in physical line",
-            json!([{"operation":"replace","start_line":1,"end_line":1,"new_lines":["bad\u{0}\n"]}]),
-        ),
-        (
-            "later item missing line ending",
-            json!([
-                {"operation":"replace","start_line":1,"end_line":1,"new_lines":["valid\n"]},
-                {"operation":"replace","start_line":2,"end_line":2,"new_lines":["invalid"]}
-            ]),
-        ),
-        (
-            "empty insertion",
-            json!([{"operation":"insert","before_line":2,"new_lines":[]}]),
-        ),
-        (
-            "append after unterminated final line",
-            json!([{"operation":"insert","before_line":3,"new_lines":["appended\n"]}]),
-        ),
+    let read = toolbox.execute_raw("Read", json!({"path":"physical.txt"}));
+    assert_eq!(read["output"]["lines"], json!({"1":"alpha","2":"beta"}));
+    assert_eq!(
+        read["output"]["editable_ranges"],
+        json!([{"start_line":1,"end_line":2}])
+    );
+    for (name, new_lines) in [
+        ("LF", json!(["one\ntwo"])),
+        ("CRLF", json!(["one\r\ntwo"])),
+        ("CR", json!(["one\rtwo"])),
+        ("non-string", json!([42])),
+        ("NUL", json!(["bad\u{0}"])),
     ] {
-        let rejected = toolbox.execute(
+        let rejected = toolbox.execute_raw(
             "Edit",
-            json!({"path":"physical.txt", "expected_hash":hash, "edits":edits}),
+            json!({"path":"physical.txt","edits":[{"operation":"replace","start_line":1,"end_line":1,"new_lines":new_lines}]}),
         );
         assert_eq!(
             rejected["error"]["code"], "invalid_line_syntax",
@@ -976,56 +1026,103 @@ fn edit_rejects_malformed_physical_lines_and_unterminated_append_atomically() {
         );
         assert_eq!(
             fs::read_to_string(workspace.join("physical.txt")).unwrap(),
-            original,
-            "case={name} mutated the file"
-        );
-    }
-
-    let obsolete = toolbox.execute(
-        "Edit",
-        json!({
-            "path":"physical.txt",
-            "expected_hash":hash,
-            "edits":[{"operation":"replace","start_line":1,"end_line":1,"new_text":"changed\n"}]
-        }),
-    );
-    assert_eq!(obsolete["error"]["code"], "invalid_arguments");
-    assert_eq!(
-        fs::read_to_string(workspace.join("physical.txt")).unwrap(),
-        original
-    );
-
-    for (name, edit) in [
-        (
-            "replace cannot encode delete",
-            json!({"operation":"replace","start_line":1,"end_line":1,"new_lines":[]}),
-        ),
-        (
-            "delete rejects replacement data",
-            json!({"operation":"delete","start_line":1,"end_line":1,"new_lines":["x\n"]}),
-        ),
-        (
-            "insert rejects range fields",
-            json!({"operation":"insert","before_line":1,"start_line":1,"end_line":1,"new_lines":["x\n"]}),
-        ),
-        (
-            "operation is mandatory",
-            json!({"start_line":1,"end_line":1,"new_lines":["x\n"]}),
-        ),
-    ] {
-        let rejected = toolbox.execute(
-            "Edit",
-            json!({"path":"physical.txt","expected_hash":hash,"edits":[edit]}),
-        );
-        assert_eq!(
-            rejected["error"]["code"], "invalid_arguments",
-            "case={name}: {rejected}"
-        );
-        assert_eq!(
-            fs::read_to_string(workspace.join("physical.txt")).unwrap(),
             original
         );
     }
+
+    let accepted = toolbox.execute_raw(
+        "Edit",
+        json!({"path":"physical.txt","edits":[{"operation":"replace","start_line":1,"end_line":1,"new_lines":["changed",""]}]}),
+    );
+    assert_eq!(accepted["type"], "result", "{accepted}");
+    assert_eq!(
+        fs::read_to_string(workspace.join("physical.txt")).unwrap(),
+        "changed\n\nbeta"
+    );
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn edit_requires_visible_read_ranges_merges_them_and_clears_them_after_success() {
+    let workspace = temporary_workspace();
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+    toolbox.execute(
+        "Create",
+        json!({"path":"scoped.txt", "content":"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n"}),
+    );
+
+    let without_read = toolbox.execute_raw(
+        "Edit",
+        json!({"path":"scoped.txt","edits":[{"operation":"replace","start_line":2,"end_line":2,"new_lines":["TWO"]}]}),
+    );
+    assert_eq!(without_read["error"]["code"], "read_required");
+
+    let search = toolbox.execute_raw(
+        "Search",
+        json!({"path":"scoped.txt","query":"two","context_before":1,"context_after":1}),
+    );
+    assert_eq!(search["type"], "result");
+    let after_search = toolbox.execute_raw(
+        "Edit",
+        json!({"path":"scoped.txt","edits":[{"operation":"replace","start_line":2,"end_line":2,"new_lines":["TWO"]}]}),
+    );
+    assert_eq!(after_search["error"]["code"], "read_required");
+
+    let first = toolbox.execute_raw(
+        "Read",
+        json!({"path":"scoped.txt","start_line":2,"max_lines":2}),
+    );
+    assert_eq!(first["output"]["lines"], json!({"2":"two","3":"three"}));
+    assert_eq!(
+        first["output"]["editable_ranges"],
+        json!([{"start_line":2,"end_line":3}])
+    );
+    let second = toolbox.execute_raw(
+        "Read",
+        json!({"path":"scoped.txt","start_line":5,"max_lines":1}),
+    );
+    assert_eq!(
+        second["output"]["editable_ranges"],
+        json!([
+            {"start_line":2,"end_line":3},
+            {"start_line":5,"end_line":5}
+        ])
+    );
+
+    let unread_gap = toolbox.execute_raw(
+        "Edit",
+        json!({"path":"scoped.txt","edits":[{"operation":"replace","start_line":3,"end_line":5,"new_lines":["merged"]}]}),
+    );
+    assert_eq!(unread_gap["error"]["code"], "unread_range");
+    assert_eq!(
+        fs::read_to_string(workspace.join("scoped.txt")).unwrap(),
+        "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\n"
+    );
+
+    let edited = toolbox.execute_raw(
+        "Edit",
+        json!({
+            "path":"scoped.txt",
+            "edits":[
+                {"operation":"replace","start_line":2,"end_line":2,"new_lines":["TWO"]},
+                {"operation":"replace","start_line":5,"end_line":5,"new_lines":["FIVE"]}
+            ]
+        }),
+    );
+    assert_eq!(edited["type"], "result", "{edited}");
+    assert_eq!(
+        fs::read_to_string(workspace.join("scoped.txt")).unwrap(),
+        "one\r\nTWO\r\nthree\r\nfour\r\nFIVE\r\nsix\r\n"
+    );
+
+    let edit_again = toolbox.execute_raw(
+        "Edit",
+        json!({"path":"scoped.txt","edits":[{"operation":"delete","start_line":3,"end_line":3}]}),
+    );
+    assert_eq!(edit_again["error"]["code"], "read_required");
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();
@@ -1070,12 +1167,13 @@ fn edit_rejects_bad_ranges_stale_hashes_and_lossy_text_atomically() {
     );
     assert_eq!(unexpected["error"]["code"], "invalid_arguments");
 
+    toolbox.execute_raw("Read", json!({"path":"safe.txt"}));
     fs::write(workspace.join("safe.txt"), "external\n").unwrap();
-    let stale = toolbox.execute(
+    let stale = toolbox.execute_raw(
         "Edit",
-        single_edit_input!("safe.txt", hash, 1, 1, json!(["changed\n"])),
+        json!({"path":"safe.txt","edits":[{"operation":"replace","start_line":1,"end_line":1,"new_lines":["changed"]}]}),
     );
-    assert_eq!(stale["error"]["code"], "conflict");
+    assert_eq!(stale["error"]["code"], "stale_read");
     assert_eq!(
         fs::read_to_string(workspace.join("safe.txt")).unwrap(),
         "external\n"
@@ -1271,7 +1369,7 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     let line_endings = toolbox.execute("Read", json!({"path":"src/line-endings.txt"}));
     assert_eq!(
         line_endings["output"]["lines"],
-        json!({"1":"first\r\n", "2":"\r", "3":"third\u{2028}same\n", "4":"last"})
+        json!({"1":"first", "2":"", "3":"third\u{2028}same", "4":"last"})
     );
 
     let bytes = toolbox.execute(
@@ -1346,16 +1444,13 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     assert!(search["output"]["matches"][1].get("hash").is_none());
     assert_eq!(
         search["output"]["matches"][0]["before"],
-        json!({"1":"zero\n"})
+        json!({"1":"zero"})
     );
     assert_eq!(
         search["output"]["matches"][0]["match_text"],
-        json!({"2":"Needle one\n"})
+        json!({"2":"Needle one"})
     );
-    assert_eq!(
-        search["output"]["matches"][0]["after"],
-        json!({"3":"last\n"})
-    );
+    assert_eq!(search["output"]["matches"][0]["after"], json!({"3":"last"}));
     assert_eq!(search["output"]["skipped_binary"], 1);
 
     let status = toolbox.execute(
@@ -1378,8 +1473,8 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
         .collect::<String>();
     fs::write(workspace.join("twelve.txt"), twelve_lines).unwrap();
     let numbered = toolbox.execute("Read", json!({"path":"twelve.txt"}));
-    assert_eq!(numbered["output"]["lines"]["01"], "line 1\n");
-    assert_eq!(numbered["output"]["lines"]["12"], "line 12\n");
+    assert_eq!(numbered["output"]["lines"]["01"], "line 1");
+    assert_eq!(numbered["output"]["lines"]["12"], "line 12");
     assert_eq!(
         numbered["output"]["lines"]
             .as_object()
@@ -1401,9 +1496,9 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
         }),
     );
     let padded_match = &padded_search["output"]["matches"][0];
-    assert_eq!(padded_match["before"], json!({"09":"line 9\n"}));
-    assert_eq!(padded_match["match_text"], json!({"10":"line 10\n"}));
-    assert_eq!(padded_match["after"], json!({"11":"line 11\n"}));
+    assert_eq!(padded_match["before"], json!({"09":"line 9"}));
+    assert_eq!(padded_match["match_text"], json!({"10":"line 10"}));
+    assert_eq!(padded_match["after"], json!({"11":"line 11"}));
     assert!(padded_match.get("line").is_none());
     assert!(padded_match.get("text").is_none());
 
@@ -1443,7 +1538,7 @@ fn large_source_files_are_not_rejected_by_an_artificial_size_limit() {
     assert_eq!(read["type"], "result", "unexpected result: {read}");
     assert_eq!(
         read["output"]["lines"],
-        json!({"67":"unique-large-file-needle\n"})
+        json!({"67":"unique-large-file-needle"})
     );
     assert_eq!(read["output"]["total_lines"], 67);
 
@@ -1456,7 +1551,7 @@ fn large_source_files_are_not_rejected_by_an_artificial_size_limit() {
     assert_eq!(search["output"]["matches"].as_array().unwrap().len(), 1);
     assert_eq!(
         search["output"]["matches"][0]["match_text"],
-        json!({"67":"unique-large-file-needle\n"})
+        json!({"67":"unique-large-file-needle"})
     );
 
     let bytes = toolbox.execute(

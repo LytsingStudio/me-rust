@@ -44,10 +44,10 @@ HUNK_PATTERN = re.compile(
 )
 MAX_EDIT_OPERATIONS = 128
 EDIT_TIP = (
-    "The file was edited. Its previous line numbers and hash are now stale, "
-    "and the new hash is intentionally not returned. Before editing this file "
-    "again, you MUST use File.Read to obtain refreshed numbered lines and the "
-    "latest hash. File.Search never supplies an editing hash."
+    "The file was edited. Every previously readable edit range for this file "
+    "is now invalid. Before editing it again, you MUST use File.Read to inspect "
+    "every target line and establish fresh editable ranges. File.Search never "
+    "establishes an editable range."
 )
 EDIT_BYTES_TIP = (
     "The file was edited. Its previous byte offsets and hash are now stale, "
@@ -183,6 +183,85 @@ class ResolvedByteEdit:
     source_end: int
     data: bytes
     kind: str
+
+
+@dataclass
+class EditScope:
+    content_hash: str
+    ranges: list[tuple[int, int]]
+    total_lines: int
+    eof: bool
+
+
+EDIT_SCOPES: dict[str, EditScope] = {}
+
+
+def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if start > end:
+            continue
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def scope_ranges_value(scope: EditScope) -> list[dict[str, int]]:
+    return [
+        {"start_line": start, "end_line": end}
+        for start, end in scope.ranges
+    ]
+
+
+def range_is_covered(scope: EditScope, start: int, end: int) -> bool:
+    return any(left <= start and end <= right for left, right in scope.ranges)
+
+
+def clear_edit_scope(path: Path) -> None:
+    EDIT_SCOPES.pop(relative_path(path), None)
+
+
+def import_edit_scope(data: dict[str, Any], path: Path) -> EditScope | None:
+    logical = relative_path(path)
+    if "_edit_scope" not in data:
+        return EDIT_SCOPES.get(logical)
+    raw = data.get("_edit_scope")
+    if raw is None:
+        EDIT_SCOPES.pop(logical, None)
+        return None
+    if not isinstance(raw, dict) or raw.get("path") != logical:
+        raise ToolError("invalid_internal_scope", "invalid File.Edit scope")
+    content_hash = raw.get("hash")
+    total_lines = raw.get("total_lines")
+    eof = raw.get("eof")
+    raw_ranges = raw.get("ranges")
+    if (
+        not isinstance(content_hash, str)
+        or not HASH_PATTERN.fullmatch(content_hash)
+        or not isinstance(total_lines, int)
+        or total_lines < 0
+        or not isinstance(eof, bool)
+        or not isinstance(raw_ranges, list)
+    ):
+        raise ToolError("invalid_internal_scope", "invalid File.Edit scope")
+    ranges: list[tuple[int, int]] = []
+    for item in raw_ranges:
+        if not isinstance(item, dict):
+            raise ToolError("invalid_internal_scope", "invalid File.Edit scope range")
+        start = item.get("start_line")
+        end = item.get("end_line")
+        if (
+            not isinstance(start, int)
+            or not isinstance(end, int)
+            or not 1 <= start <= end <= total_lines
+        ):
+            raise ToolError("invalid_internal_scope", "invalid File.Edit scope range")
+        ranges.append((start, end))
+    scope = EditScope(content_hash, merge_ranges(ranges), total_lines, eof)
+    EDIT_SCOPES[logical] = scope
+    return scope
 
 
 def object_schema(
@@ -364,13 +443,12 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "Edit": object_schema(
         {
             "path": PATH_SCHEMA,
-            "expected_hash": HASH_SCHEMA,
             "encoding": {**ENCODING_SCHEMA, "default": "auto"},
             "edits": {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": MAX_EDIT_OPERATIONS,
-                "description": "Atomic edit operations whose line coordinates all refer to the same original file identified by expected_hash.",
+                "description": "Atomic edit operations whose line coordinates all refer to the same original file snapshot established by File.Read.",
                 "items": {
                     "oneOf": [
                         object_schema(
@@ -394,8 +472,8 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                                 "new_lines": {
                                     "type": "array",
                                     "minItems": 1,
-                                    "items": {"type": "string", "minLength": 1},
-                                    "description": "One or more exact replacement physical lines, each ending in LF, CRLF, or CR.",
+                                    "items": {"type": "string"},
+                                    "description": "One or more logical replacement lines without CR or LF characters. An empty string is one blank line.",
                                 },
                             },
                             ["operation", "start_line", "end_line", "new_lines"],
@@ -436,8 +514,8 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                                 "new_lines": {
                                     "type": "array",
                                     "minItems": 1,
-                                    "items": {"type": "string", "minLength": 1},
-                                    "description": "One or more exact inserted physical lines, each ending in LF, CRLF, or CR.",
+                                    "items": {"type": "string"},
+                                    "description": "One or more logical inserted lines without CR or LF characters. An empty string is one blank line.",
                                 },
                             },
                             ["operation", "before_line", "new_lines"],
@@ -446,7 +524,7 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
                 },
             },
         },
-        ["path", "expected_hash", "edits"],
+        ["path", "edits"],
     ),
     "Append": object_schema(
         {
@@ -488,7 +566,17 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "lines": {
                 "type": "object",
                 "additionalProperties": {"type": ["string", "object"]},
-                "description": "Text keyed by its 1-based file line number, minimally zero-padded to the width of total_lines so serialized keys stay in numeric order. Normal values are exact strings including their original line ending; an oversized value may become a safe text_fragments object only in model context.",
+                "description": "Logical text without CR or LF characters, keyed by its 1-based file line number and minimally zero-padded to the width of total_lines. An oversized value may become a safe text_fragments object only in model context.",
+            },
+            "editable_ranges": {
+                "type": "array",
+                "items": object_schema(
+                    {
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"},
+                    },
+                    ["start_line", "end_line"],
+                ),
             },
             "start_line": {"type": "integer"},
             "end_line": {"type": "integer"},
@@ -504,6 +592,7 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         [
             "path",
             "lines",
+            "editable_ranges",
             "start_line",
             "end_line",
             "total_lines",
@@ -758,7 +847,7 @@ ROUTES = {
 }
 
 INSTRUCTIONS = {
-    "Read": "Line numbers are 1-based. The lines object maps each actual file line number to its exact text, including that line's original LF, CRLF, CR, or absent final line ending. Keys are minimally zero-padded to the digit width of total_lines solely to preserve numeric order in serialized JSON; interpret them as decimal line numbers. Missing numeric keys in a safely truncated model-visible result are omitted lines, not empty lines. Source file size is not artificially capped: the complete file is loaded into memory to detect its encoding, count lines, and compute its hash, while max_lines bounds the returned range. Auto detection checks BOM, Unicode encodings, strict UTF-8, then common legacy encodings conservatively. The result reports encoding, confidence, BOM presence, and the file's current 8-character concurrency fingerprint. If auto detection is uncertain, retry only when the encoding is known by setting encoding explicitly; otherwise use ReadBytes.",
+    "Read": "Line numbers are 1-based. The lines object maps each actual file line number to its logical text without any LF, CRLF, or CR terminator; an empty string is one blank line. Keys are minimally zero-padded to the digit width of total_lines solely to preserve numeric order in serialized JSON; interpret them as decimal line numbers. Missing numeric keys in a safely truncated model-visible result are omitted lines, not empty lines. Every successful Read adds only the complete lines actually visible to you to this file's editable_ranges. Repeated reads of the unchanged file merge their ranges. File.Edit is permitted only inside those ranges, and any successful edit clears them all. Source file size is not artificially capped: the complete file is loaded into memory to detect its encoding, count lines, and compute its hash, while max_lines bounds the returned range. Auto detection checks BOM, Unicode encodings, strict UTF-8, then common legacy encodings conservatively. If auto detection is uncertain, retry only when the encoding is known by setting encoding explicitly; otherwise use ReadBytes.",
     "ReadBytes": "Offsets are zero-based, and source file size is not artificially capped. The result data contains lowercase two-digit hexadecimal bytes separated by one space, without a 0x prefix. length is the number of bytes represented by data, and hash identifies the complete file rather than only the returned range. Use the returned bytes and hash as the baseline for File.EditBytes. If the model-context safety envelope reports truncate:true, data retains only the earliest complete bytes from the requested range; read another range before editing bytes that are not visible. truncate_info.ranges.bytes reports retained_offset_start, retained_offset_end_exclusive, removed_offset_start, and removed_offset_end_exclusive as absolute half-open byte ranges.",
     "EditBytes": (
         "EditBytes atomically applies one or more operations to one file. First use File.ReadBytes to inspect every target range and obtain the complete file hash, then pass that hash as expected_hash. target_offset is a zero-based original byte offset, and target_length selects the half-open original range [target_offset, target_offset + target_length). Every operation is independently located against the same original pre-edit snapshot. Earlier array items never shift later offsets, and array order is not execution order. The tool validates every operation before writing and commits the combined result once. A later operation cannot target bytes created by another operation in the same call; perform dependent work only after another ReadBytes.\n"
@@ -767,15 +856,15 @@ INSTRUCTIONS = {
     ),
     "List": "Depth counts levels below path. Results are stable and symbolic-link directories are never traversed.",
     "Find": "Patterns and exclusions match workspace-relative POSIX paths. Results are stable and symbolic-link directories are never traversed.",
-    "Search": "Literal search is the default. Source file size is not artificially capped; each candidate file is loaded into memory, and max_matches bounds the returned result. Each match returns before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and exact line text as File.Read. The sole key in match_text is the matching file line; column is 1-based within that line, so no separate line field is returned. Example: {\"path\":\"src/main.rs\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\\n\"},\"match_text\":{\"042\":\"    runtime.start();\\n\"},\"after\":{\"043\":\"}\\n\"}}. Search is only a locator: it deliberately returns no hash and never establishes a File.Edit baseline. Before editing a located file, call File.Read for every target range and use the hash returned by that Read. Never infer unseen edit boundaries from Search results. With top-level truncate:true, missing before or after keys are omitted context lines, and the sole match_text value may instead be a text_fragments object while its line key and match metadata remain intact. Text encoding is detected conservatively per file; binary and uncertain files are skipped.",
+    "Search": "Literal search is the default. Source file size is not artificially capped; each candidate file is loaded into memory, and max_matches bounds the returned result. Each match returns before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and logical line text as File.Read; values never contain line terminators. The sole key in match_text is the matching file line; column is 1-based within that line. Example: {\"path\":\"src/main.rs\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\"},\"match_text\":{\"042\":\"    runtime.start();\"},\"after\":{\"043\":\"}\"}}. Search is only a locator: it never establishes editable_ranges. Before editing a located file, call File.Read for every target range. Never infer unseen edit boundaries from Search results. With top-level truncate:true, missing before or after keys are omitted context lines, and the sole match_text value may instead be a text_fragments object while its line key and match metadata remain intact. Text encoding is detected conservatively per file; binary and uncertain files are skipped.",
     "Stat": "A missing path is a normal result. Content hashes are returned only for ordinary files, not directories or symbolic links.",
     "MakeDirectory": "parents defaults to false, requiring the immediate parent to exist. Set parents=true to create every missing directory in the path. The target itself must not already exist; existing files, directories, and symbolic links return already_exists.",
     "Create": "The parent directory must already exist. encoding defaults to utf-8 because a new file has no bytes to inspect; bom defaults to false and is allowed only for UTF encodings. Creation fails if the destination exists.",
     "Edit": (
-        "Edit atomically applies one or more explicit operations to one text file. File.Search is only a locator and returns no editing hash. Before Edit, you MUST call File.Read, inspect every source line affected by the batch, and pass that Read result's hash as expected_hash. Every operation is independently located against that one original pre-edit snapshot. Earlier array items never shift later line numbers; array order is not execution order. The tool validates every operation before writing and commits the combined result once. If one item is malformed, out of range, unencodable, overlapping, duplicated at the same insertion point, or otherwise ambiguous, the entire call fails and the file remains unchanged. A later item cannot target lines created by an earlier item in the same call; first finish this batch, then Read again before dependent editing.\n"
+        "Edit atomically applies one or more explicit operations to one text file. Before Edit, you MUST call File.Read for every target line or insertion point, receive that result, and only then call Edit in a later model response; a Read and Edit emitted together cannot authorize each other. Edit accepts a target only when it is fully inside the editable_ranges returned by prior reads of the unchanged file; File.Search, File.Stat, hashes from other tools, generated content, and remembered line numbers never establish permission. Every operation is independently located against the same original pre-edit snapshot. Earlier array items never shift later line numbers; array order is not execution order. The tool validates every operation before writing and commits the combined result once. If one item is malformed, unread, out of range, unencodable, overlapping, duplicated at the same insertion point, or otherwise ambiguous, the entire call fails and the file remains unchanged. A later item cannot target lines created by an earlier item in the same call.\n"
         "Each edits item uses exactly one of three shapes. Replace: {operation:\"replace\", start_line, end_line, new_lines}; start_line and end_line are inclusive original 1-based line numbers, require 1 <= start_line <= end_line <= total_lines, and new_lines must be non-empty. Delete: {operation:\"delete\", start_line, end_line}; it removes those complete original lines and accepts no new_lines. Insert: {operation:\"insert\", before_line, new_lines}; it inserts before the original 1-based before_line and requires non-empty new_lines. before_line=1 inserts at the beginning and into an empty file; before_line=total_lines+1 appends only when the existing final line is terminated. Do not encode an operation indirectly with an empty new_lines array or reversed line range.\n"
-        "new_lines is an array of exact physical lines, deliberately matching File.Read line values. Every item must contain exactly one line and must end in LF (\\n), CRLF (\\r\\n), or CR (\\r); an embedded line ending or missing final line ending is a syntax error. Edit never guesses or converts endings. Use a replace operation with new_lines=[\"\\n\"] (or matching CRLF/CR) to retain one blank line. To change part of a line, replace that source line with the complete resulting physical line, including unchanged surrounding characters and its ending. To merge several source lines, replace their whole range with the complete resulting physical line or lines. File.Edit cannot create an unterminated new line. To append after an unterminated final source line, include that final line in a replace operation.\n"
-        "Replacement and deletion ranges must not overlap. An insertion cannot lie strictly inside such a range, and one original insertion point may appear only once; an insertion exactly at a range boundary is allowed. Source file size is not artificially capped; the complete file is loaded into memory. Existing encoding, BOM, permissions, and all unselected text are preserved. A successful result deliberately omits the new hash because all previous line numbers and hashes are stale. Before every later File.Edit on this file, call File.Read again and use its refreshed numbered lines and hash."
+        "new_lines is an array of logical lines matching File.Read values. Each array item is exactly one line and MUST NOT contain LF or CR; use an empty string for one blank line. File automatically selects and preserves the file's existing line-ending convention. To change part of a line, replace that whole source line with its complete resulting logical text, including unchanged surrounding characters but no terminator. To merge several source lines, replace their whole range with the resulting logical line or lines. To append after an unterminated final source line, include that final line in a replacement and supply both resulting logical lines.\n"
+        "Replacement and deletion ranges must not overlap. An insertion cannot lie strictly inside such a range, and one original insertion point may appear only once; an insertion exactly at a range boundary is allowed. Source file size is not artificially capped; the complete file is loaded into memory. Existing encoding, BOM, permissions, line-ending style, and all unselected text are preserved. A successful Edit clears every editable range for that file. Before any later Edit, call File.Read again for every new target range."
     ),
     "Append": "The file must exist and match expected_hash. Existing encoding and BOM are preserved. Content is appended exactly and no newline is added. Unrepresentable text returns encoding_error without modifying the file.",
     "Replace": "The file must exist and match expected_hash. Its detected encoding and BOM are preserved while the complete content is replaced atomically. Unrepresentable text returns encoding_error without modifying the file.",
@@ -807,28 +896,26 @@ EXAMPLES = {
     "MakeDirectory": '{"path":"build/generated/assets","parents":true}',
     "Create": '{"path":"notes.txt","content":"first line\\n","encoding":"utf-8"}',
     "Edit": (
-        "First call File.Read. Assume it returned lines 1=aaa\\n, 2=bbb\\n, 3=ccc\\n, 4=ddd\\n and hash 0123abcd unless stated otherwise. Every item below refers to that original snapshot, and every new_lines item is one complete physical line with its ending.\n\n"
-        "Replace original lines 1 and 3 independently. The first replacement adds a line, but the second still targets original line 3. Result: 111\\n, aaa\\n, bbb\\n, 333\\n, ccc\\n, ddd\\n:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"operation":"replace","start_line":1,"end_line":1,"new_lines":["111\\n","aaa\\n"]},{"operation":"replace","start_line":3,"end_line":3,"new_lines":["333\\n","ccc\\n"]}]}'
+        "First call File.Read for every target, for example {\"path\":\"notes.txt\",\"start_line\":1,\"max_lines\":4}. Wait for its result before calling Edit; do not emit Read and Edit together. Assume it returned lines {1:\"aaa\",2:\"bbb\",3:\"ccc\",4:\"ddd\"} and editable_ranges=[{\"start_line\":1,\"end_line\":4}]. new_lines contains logical text only; never add LF or CR.\n\n"
+        "Replace original lines 1 and 3 independently. The first replacement adds a line, but the second still targets original line 3:\n"
+        '{"path":"notes.txt","edits":[{"operation":"replace","start_line":1,"end_line":1,"new_lines":["111","aaa"]},{"operation":"replace","start_line":3,"end_line":3,"new_lines":["333","ccc"]}]}'
         "\n\nMixed atomic batch; array order is irrelevant. Replace original line 4, insert before original line 2, and delete original line 3:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"operation":"replace","start_line":4,"end_line":4,"new_lines":["last\\n"]},{"operation":"insert","before_line":2,"new_lines":["inserted\\n"]},{"operation":"delete","start_line":3,"end_line":3}]}'
+        '{"path":"notes.txt","edits":[{"operation":"replace","start_line":4,"end_line":4,"new_lines":["last"]},{"operation":"insert","before_line":2,"new_lines":["inserted"]},{"operation":"delete","start_line":3,"end_line":3}]}'
         "\n\nInsertion exactly before a replaced range is a valid outer-boundary insertion; inserted appears before updated:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"operation":"insert","before_line":2,"new_lines":["inserted\\n"]},{"operation":"replace","start_line":2,"end_line":2,"new_lines":["updated\\n"]}]}'
+        '{"path":"notes.txt","edits":[{"operation":"insert","before_line":2,"new_lines":["inserted"]},{"operation":"replace","start_line":2,"end_line":2,"new_lines":["updated"]}]}'
         "\n\nReplace several lines with one and another original line with several:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"operation":"replace","start_line":1,"end_line":2,"new_lines":["combined\\n"]},{"operation":"replace","start_line":4,"end_line":4,"new_lines":["one\\n","two\\n","three\\n"]}]}'
-        "\n\nDelete a complete line, and separately replace a line with one blank LF line. Deletion has no new_lines field:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"operation":"delete","start_line":1,"end_line":1},{"operation":"replace","start_line":3,"end_line":3,"new_lines":["\\n"]}]}'
-        "\n\nInsert at file start and after a newline-terminated four-line file:\n"
-        '{"path":"notes.txt","expected_hash":"0123abcd","edits":[{"operation":"insert","before_line":1,"new_lines":["header\\n"]},{"operation":"insert","before_line":5,"new_lines":["footer\\n"]}]}'
+        '{"path":"notes.txt","edits":[{"operation":"replace","start_line":1,"end_line":2,"new_lines":["combined"]},{"operation":"replace","start_line":4,"end_line":4,"new_lines":["one","two","three"]}]}'
+        "\n\nDelete a complete line, and separately replace a line with one blank line. Deletion has no new_lines field; an empty string is a blank line:\n"
+        '{"path":"notes.txt","edits":[{"operation":"delete","start_line":1,"end_line":1},{"operation":"replace","start_line":3,"end_line":3,"new_lines":[""]}]}'
+        "\n\nInsert at file start and append after a four-line file whose EOF was read:\n"
+        '{"path":"notes.txt","edits":[{"operation":"insert","before_line":1,"new_lines":["header"]},{"operation":"insert","before_line":5,"new_lines":["footer"]}]}'
         "\n\nInsert into an empty file before line 1:\n"
-        '{"path":"empty.txt","expected_hash":"e3b0c442","edits":[{"operation":"insert","before_line":1,"new_lines":["first line\\n"]}]}'
-        "\n\nAn unterminated final source line cannot be appended after directly. Replace that final line and include both complete resulting physical lines:\n"
-        '{"path":"unterminated.txt","expected_hash":"0123abcd","edits":[{"operation":"replace","start_line":4,"end_line":4,"new_lines":["original final text\\n","appended\\n"]}]}'
-        "\n\nPreserve CRLF explicitly and rewrite a partial phrase by supplying the complete resulting source line:\n"
-        '{"path":"windows.txt","expected_hash":"0123abcd","edits":[{"operation":"replace","start_line":2,"end_line":2,"new_lines":["complete changed line\\r\\n"]}]}'
-        "\n\nEscaped quotes, backslashes, and a tab remain exact text:\n"
-        '{"path":"config.txt","expected_hash":"0123abcd","edits":[{"operation":"replace","start_line":2,"end_line":2,"new_lines":["path = \\"C:\\\\Program Files\\\\ME\\"\\n","value\\t42\\n"]}]}'
-        "\n\nCommon errors: replace with new_lines=[], delete with a new_lines field, insert with start_line/end_line, reversed or out-of-range line numbers, new_lines=[\"missing ending\"], new_lines=[\"two\\nlines\\n\"], or new_lines=[\"first\\n\",\"second\"]. Any one rejects the whole call. Other atomic errors include overlapping ranges, duplicate insertion points, insertion inside a replaced/deleted range, a stale expected_hash, guessing unseen boundaries from Search, or targeting lines created by another item. A successful result has no new hash. Before any later Edit, always call File.Read again and use its refreshed hash and numbered lines."
+        '{"path":"empty.txt","edits":[{"operation":"insert","before_line":1,"new_lines":["first line"]}]}'
+        "\n\nAppend after an unterminated final line by replacing that read final line with both resulting logical lines:\n"
+        '{"path":"unterminated.txt","edits":[{"operation":"replace","start_line":4,"end_line":4,"new_lines":["original final text","appended"]}]}'
+        "\n\nCRLF is detected and preserved automatically; do not put CRLF in new_lines:\n"
+        '{"path":"windows.txt","edits":[{"operation":"replace","start_line":2,"end_line":2,"new_lines":["complete changed line"]}]}'
+        "\n\nCommon errors: editing without Read, targeting any line outside editable_ranges, using Search as permission, replace with new_lines=[], delete with a new_lines field, insert with start_line/end_line, reversed ranges, new_lines=[\"two\\nlines\"], overlapping ranges, duplicate insertion points, insertion inside another range, or targeting lines created by another item. Any one rejects the entire call. After success all editable ranges for the file are cleared; Read again before another Edit."
     ),
     "Append": '{"path":"notes.txt","expected_hash":"0123abcd","content":"next line\\n"}',
     "Replace": '{"path":"notes.txt","expected_hash":"0123abcd","content":"complete new content\\n"}',
@@ -875,12 +962,12 @@ def string_arg(data: dict[str, Any], name: str, default: str | None = None) -> s
     return value
 
 
-def physical_lines_arg(data: dict[str, Any], edit_index: int) -> tuple[str, ...]:
+def logical_lines_arg(data: dict[str, Any], edit_index: int) -> tuple[str, ...]:
     value = data.get("new_lines")
     if not isinstance(value, list):
         raise ToolError(
             "invalid_line_syntax",
-            f"edits[{edit_index}].new_lines must be an array of complete physical lines",
+            f"edits[{edit_index}].new_lines must be an array of logical lines",
         )
     result: list[str] = []
     for line_index, line in enumerate(value):
@@ -894,19 +981,10 @@ def physical_lines_arg(data: dict[str, Any], edit_index: int) -> tuple[str, ...]
                 "invalid_line_syntax",
                 f"edits[{edit_index}].new_lines[{line_index}] contains NUL",
             )
-        if line.endswith("\r\n"):
-            body = line[:-2]
-        elif line.endswith("\r") or line.endswith("\n"):
-            body = line[:-1]
-        else:
+        if "\r" in line or "\n" in line:
             raise ToolError(
                 "invalid_line_syntax",
-                f"edits[{edit_index}].new_lines[{line_index}] must end in LF, CRLF, or CR",
-            )
-        if "\r" in body or "\n" in body:
-            raise ToolError(
-                "invalid_line_syntax",
-                f"edits[{edit_index}].new_lines[{line_index}] contains more than one physical line",
+                f"edits[{edit_index}].new_lines[{line_index}] must not contain CR or LF; provide one array item per logical line",
             )
         result.append(line)
     return tuple(result)
@@ -1481,18 +1559,32 @@ def execute_read(data: dict[str, Any]) -> dict[str, Any]:
     end_line = start_index + len(selected)
     eof = end_line >= len(lines)
     line_number_width = max(1, len(str(len(lines))))
+    content_hash = sha256_bytes(document.raw)
+    scope_key = relative_path(path)
+    scope = EDIT_SCOPES.get(scope_key)
+    if scope is None or scope.content_hash != content_hash:
+        scope = EditScope(content_hash, [], len(lines), False)
+    if selected:
+        scope.ranges = merge_ranges(
+            scope.ranges + [(start_index + 1, end_line)]
+        )
+    scope.total_lines = len(lines)
+    if len(lines) == 0 or (eof and bool(selected)):
+        scope.eof = True
+    EDIT_SCOPES[scope_key] = scope
     return {
-        "path": relative_path(path),
+        "path": scope_key,
         "lines": {
-            str(start_index + offset + 1).zfill(line_number_width): line
+            str(start_index + offset + 1).zfill(line_number_width): line_without_ending(line)
             for offset, line in enumerate(selected)
         },
+        "editable_ranges": scope_ranges_value(scope),
         "start_line": start_line,
         "end_line": end_line,
         "total_lines": len(lines),
         "eof": eof,
         "truncated": not eof,
-        "hash": sha256_bytes(document.raw),
+        "hash": content_hash,
         "size": len(document.raw),
         "encoding": document.encoding,
         "encoding_confidence": document.confidence,
@@ -1625,14 +1717,14 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
                         "column": found.start() + 1,
                         "match_length": found.end() - found.start(),
                         "before": {
-                            str(index + 1).zfill(line_number_width): lines[index]
+                            str(index + 1).zfill(line_number_width): line_without_ending(lines[index])
                             for index in range(before_start, line_index)
                         },
                         "match_text": {
-                            str(line_index + 1).zfill(line_number_width): exact_line
+                            str(line_index + 1).zfill(line_number_width): searchable_line
                         },
                         "after": {
-                            str(index + 1).zfill(line_number_width): lines[index]
+                            str(index + 1).zfill(line_number_width): line_without_ending(lines[index])
                             for index in range(line_index + 1, after_end)
                         },
                     }
@@ -1735,6 +1827,7 @@ def execute_create(data: dict[str, Any]) -> dict[str, Any]:
         if path.exists() or path.is_symlink():
             raise ToolError("already_exists", f"destination already exists: {logical}")
         atomic_create(path, content)
+        clear_edit_scope(path)
     return mutation_result(path, "created", None, content, encoding, 1.0, bom)
 
 
@@ -1971,7 +2064,6 @@ def execute_apply_patch(data: dict[str, Any]) -> dict[str, Any]:
 
 def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
     logical = string_arg(data, "path")
-    expected = validate_expected_hash(data.get("expected_hash"))
     encoding = encoding_arg(data)
     requested_edits = data.get("edits")
     if (
@@ -1986,10 +2078,33 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
     with mutation_lock():
         path = existing_path(logical)
         require_regular_file(path, logical, True)
+        scope = import_edit_scope(data, path)
+        if scope is None:
+            raise ToolError(
+                "read_required",
+                f"File.Edit has no readable range for {relative_path(path)}; call File.Read for every target range before editing",
+            )
         document = read_text_file(path, logical, encoding)
-        previous = verify_content_hash(document.raw, expected)
+        current_hash = sha256_bytes(document.raw)
+        if current_hash != scope.content_hash:
+            clear_edit_scope(path)
+            raise ToolError(
+                "stale_read",
+                f"{relative_path(path)} changed after File.Read; call File.Read again before editing",
+                True,
+            )
+        previous = current_hash
         lines = split_text_file_lines(document.text)
+        text_lines = split_text_lines(document.text)
         total_lines = len(lines)
+        if total_lines != scope.total_lines:
+            clear_edit_scope(path)
+            raise ToolError(
+                "stale_read",
+                f"{relative_path(path)} line structure changed after File.Read; call File.Read again before editing",
+                True,
+            )
+        preferred_ending = prevailing_line_ending(text_lines)
         line_offsets = [0]
         for line in lines:
             line_offsets.append(line_offsets[-1] + len(line))
@@ -2030,8 +2145,13 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                         f"edits[{index}] requires 1 <= start_line <= end_line <= total_lines; "
                         f"received start_line={start_line}, end_line={end_line}, total_lines={total_lines}",
                     )
+                if not range_is_covered(scope, start_line, end_line):
+                    raise ToolError(
+                        "unread_range",
+                        f"edits[{index}] targets lines {start_line}-{end_line}, which are not fully inside the current editable ranges {scope_ranges_value(scope)}; call File.Read for the missing range",
+                    )
                 new_lines = (
-                    physical_lines_arg(item, index)
+                    logical_lines_arg(item, index)
                     if operation == "replace"
                     else tuple()
                 )
@@ -2052,7 +2172,20 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                         f"edits[{index}].before_line must be <= total_lines + 1; "
                         f"received before_line={before_line}, total_lines={total_lines}",
                     )
-                new_lines = physical_lines_arg(item, index)
+                if total_lines == 0:
+                    insertion_read = before_line == 1 and scope.eof
+                elif before_line <= total_lines:
+                    insertion_read = range_is_covered(scope, before_line, before_line)
+                else:
+                    insertion_read = scope.eof and range_is_covered(
+                        scope, total_lines, total_lines
+                    )
+                if not insertion_read:
+                    raise ToolError(
+                        "unread_range",
+                        f"edits[{index}] insertion point before line {before_line} was not established by File.Read; call File.Read around that insertion point",
+                    )
+                new_lines = logical_lines_arg(item, index)
                 if not new_lines:
                     raise ToolError(
                         "invalid_line_syntax",
@@ -2069,7 +2202,25 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
                     )
                 source_start = line_offsets[before_line - 1]
                 source_end = source_start
-            replacement_text = "".join(new_lines)
+            if operation == "delete":
+                replacement_text = ""
+            elif operation == "replace":
+                target_ending = text_lines[end_line - 1].ending or preferred_ending
+                preserve_unterminated_eof = (
+                    end_line == total_lines and text_lines[end_line - 1].ending == ""
+                )
+                rendered_lines = [line + target_ending for line in new_lines]
+                if rendered_lines and preserve_unterminated_eof:
+                    rendered_lines[-1] = new_lines[-1]
+                replacement_text = "".join(rendered_lines)
+            else:
+                if total_lines == 0:
+                    target_ending = preferred_ending
+                elif before_line <= total_lines:
+                    target_ending = text_lines[before_line - 1].ending or preferred_ending
+                else:
+                    target_ending = text_lines[-1].ending or preferred_ending
+                replacement_text = "".join(line + target_ending for line in new_lines)
             replacement = encode_text(
                 replacement_text, document.encoding, b"", logical
             )
@@ -2128,8 +2279,9 @@ def execute_edit(data: dict[str, Any]) -> dict[str, Any]:
             updated_text, document.encoding, document.bom, logical
         )
         mode = path.stat().st_mode
-        verify_hash(path, expected)
+        verify_hash(path, scope.content_hash)
         atomic_replace(path, updated, mode)
+        clear_edit_scope(path)
     output = mutation_result(
         path,
         "edited",
@@ -2282,6 +2434,7 @@ def execute_edit_bytes(data: dict[str, Any]) -> dict[str, Any]:
         mode = path.stat().st_mode
         verify_hash(path, expected)
         atomic_replace(path, updated, mode)
+        clear_edit_scope(path)
     return {
         "path": relative_path(path),
         "operation": "bytes_edited",
@@ -2318,6 +2471,7 @@ def execute_append(data: dict[str, Any]) -> dict[str, Any]:
         updated = document.raw + appended
         verify_hash(path, expected)
         atomic_replace(path, updated, path.stat().st_mode)
+        clear_edit_scope(path)
     output = mutation_result(
         path,
         "appended",
@@ -2345,6 +2499,7 @@ def execute_replace(data: dict[str, Any]) -> dict[str, Any]:
         mode = path.stat().st_mode
         verify_hash(path, expected)
         atomic_replace(path, updated, mode)
+        clear_edit_scope(path)
     return mutation_result(
         path,
         "replaced",
@@ -2372,6 +2527,8 @@ def execute_move(data: dict[str, Any]) -> dict[str, Any]:
             source.rename(target)
         except OSError as exc:
             raise ToolError("move_error", f"cannot move {logical} to {destination}: {exc}") from exc
+        clear_edit_scope(source)
+        clear_edit_scope(target)
     return {
         "path": relative_path(source),
         "destination": relative_path(target),
@@ -2393,6 +2550,7 @@ def execute_delete(data: dict[str, Any]) -> dict[str, Any]:
             path.unlink()
         except OSError as exc:
             raise ToolError("delete_error", f"cannot delete {logical}: {exc}") from exc
+        clear_edit_scope(path)
     return {
         "path": relative_path(path),
         "operation": "deleted",
@@ -2430,7 +2588,7 @@ def handle(request: Any) -> None:
     if command == "getBrief":
         result(
             request_id,
-            "Read, search, and safely mutate files and explicitly create directories inside the workspace. Source file size is not artificially capped; operations that need complete contents load them into memory, while bounded query parameters limit model-visible results. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. Binary operations use zero-based byte ranges and canonical hexadecimal data. Mutations use an 8-character SHA-256-derived concurrency fingerprint. File.Edit and File.EditBytes apply all requested ranges against one original snapshot, deliberately omit the new hash, and require a refreshed matching read before another edit; other hash-based mutations may chain from the returned hash. This short value detects stale edits; it is not a security integrity digest.",
+            "Read, search, and safely mutate files and explicitly create directories inside the workspace. Source file size is not artificially capped; operations that need complete contents load them into memory, while bounded query parameters limit model-visible results. Line-oriented results and edits use logical lines without CR or LF; File preserves the file's detected line-ending convention automatically. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. File.Edit is limited to ranges actually returned by File.Read, clears those ranges after success, and validates the remembered file version internally. Binary operations use zero-based byte ranges and canonical hexadecimal data. Other mutations use an 8-character SHA-256-derived concurrency fingerprint. This short value detects stale edits; it is not a security integrity digest.",
         )
         return
     tool = request.get("tool")
@@ -2454,6 +2612,11 @@ def handle(request: Any) -> None:
     elif command == "execute":
         data = validate_object(request.get("input"))
         allowed = set(INPUT_SCHEMAS[tool]["properties"])
+        if tool == "Edit":
+            # _edit_scope is injected by ME-RUST from persisted EDB state.
+            # expected_hash is accepted only as a harmless legacy field; Edit
+            # never trusts it and always uses the remembered Read scope.
+            allowed.update({"_edit_scope", "expected_hash"})
         unexpected = sorted(set(data) - allowed)
         if unexpected:
             raise ToolError(

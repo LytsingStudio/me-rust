@@ -2563,9 +2563,19 @@ impl MainAgent {
             }
             execution
         } else {
+            let execution_arguments = if call.name == "File.Edit" {
+                file_edit_execution_arguments(
+                    edb,
+                    &self.workspace,
+                    &call.arguments,
+                    call.api_call_id,
+                )?
+            } else {
+                call.arguments.clone()
+            };
             self.toolboxes.execute_cancellable(
                 &call.name,
-                &call.arguments,
+                &execution_arguments,
                 |update| match update {
                     ToolboxUpdate::Terminal(update) => {
                         append_terminal_update(edb, call.id, &update, on_event)
@@ -2593,7 +2603,39 @@ impl MainAgent {
             )
         };
         match execution {
-            Ok(output) => {
+            Ok(mut output) => {
+                if call.name == "File.Read" {
+                    let mut projection = projected_file_edit_scopes(edb)?;
+                    let mut raw_for_projection = output.clone();
+                    if let Some(object) = raw_for_projection.as_object_mut() {
+                        object.remove("editable_ranges");
+                    }
+                    let synthetic = ToolCallResultEvent {
+                        id: call.id,
+                        timestamp_ms: call.timestamp_ms,
+                        tool_call_id: call.id,
+                        state: ToolResultState::Succeeded,
+                        exit_code: None,
+                        detail: serde_json::to_string(&raw_for_projection)?,
+                    };
+                    let mut visible =
+                        structured_tool_result_value(&call.name, Vec::new(), &synthetic)?;
+                    projection.apply_result(call, &synthetic, &mut visible);
+                    let path = output
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    if let Some(path) = path
+                        && let Some(object) = output.as_object_mut()
+                    {
+                        let ranges = projection
+                            .files
+                            .get(&path)
+                            .map(file_scope_ranges_value)
+                            .unwrap_or_else(|| Value::Array(Vec::new()));
+                        object.insert("editable_ranges".into(), ranges);
+                    }
+                }
                 let outcome = if wait_result_requests_follow_up_yield(&call.name, &output) {
                     ToolExecutionOutcome::YieldForFollowUp
                 } else {
@@ -5166,6 +5208,7 @@ fn main_model_context_with_toolboxes_and_environment(
     let mut assistant = String::new();
     let mut outputs: BTreeMap<EventId, Vec<ModelToolUpdate>> = BTreeMap::new();
     let mut images: BTreeMap<EventId, &crate::event::ImageContentEvent> = BTreeMap::new();
+    let mut file_edit_scopes = FileEditScopeProjection::default();
     let effective = effective_conversation_events(edb.events())?;
     let first_user_prompt_id = edb.events().iter().find_map(|event| match event {
         Event::UserPrompt(prompt) => Some(prompt.id),
@@ -5268,15 +5311,16 @@ fn main_model_context_with_toolboxes_and_environment(
                     )
                     .into());
                 };
-                let content = structured_tool_result(
+                let mut content = structured_tool_result_value(
                     &call.name,
                     outputs.remove(&result.tool_call_id).unwrap_or_default(),
                     result,
                 )?;
+                file_edit_scopes.apply_result(call, result, &mut content);
                 context.push_value(json!({
                     "role": "tool",
                     "tool_call_id": call.provider_call_id,
-                    "content": content,
+                    "content": serde_json::to_string(&content)?,
                 }));
                 let later_result_in_batch = effective.iter().any(|event| {
                     let Event::ToolCallResult(later) = event else {
@@ -5452,11 +5496,278 @@ enum ModelToolUpdate {
     Structured(Value),
 }
 
+#[derive(Clone, Debug, Default)]
+struct FileEditScopeProjection {
+    files: BTreeMap<String, FileEditScope>,
+}
+
+#[derive(Clone, Debug)]
+struct FileEditScope {
+    hash: String,
+    ranges: Vec<(u64, u64)>,
+    total_lines: u64,
+    eof: bool,
+}
+
+impl FileEditScopeProjection {
+    fn apply_result(
+        &mut self,
+        call: &ToolCallEvent,
+        result: &ToolCallResultEvent,
+        visible: &mut Value,
+    ) {
+        let detail = visible
+            .get_mut("result")
+            .and_then(Value::as_object_mut)
+            .and_then(|result| result.get_mut("detail"))
+            .and_then(Value::as_object_mut);
+        if call.name == "File.Read" && result.state == ToolResultState::Succeeded {
+            let Some(detail) = detail else { return };
+            let Some(path) = detail
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                return;
+            };
+            let Some(hash) = detail
+                .get("hash")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                return;
+            };
+            let total_lines = detail
+                .get("total_lines")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let eof = detail.get("eof").and_then(Value::as_bool).unwrap_or(false);
+            let complete_lines = detail
+                .get("lines")
+                .and_then(Value::as_object)
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.is_string().then(|| key.parse::<u64>().ok()).flatten()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut added = numbered_ranges(complete_lines.clone());
+            let scope = self
+                .files
+                .entry(path.clone())
+                .or_insert_with(|| FileEditScope {
+                    hash: hash.clone(),
+                    ranges: Vec::new(),
+                    total_lines,
+                    eof: false,
+                });
+            if scope.hash != hash {
+                scope.hash = hash;
+                scope.ranges.clear();
+                scope.eof = false;
+            }
+            scope.total_lines = total_lines;
+            scope.ranges.append(&mut added);
+            scope.ranges = merge_numbered_ranges(std::mem::take(&mut scope.ranges));
+            if total_lines == 0 || (eof && complete_lines.contains(&total_lines)) {
+                scope.eof = true;
+            }
+            detail.insert("editable_ranges".into(), file_scope_ranges_value(scope));
+            return;
+        }
+
+        let path = detail
+            .as_ref()
+            .and_then(|detail| detail.get("path"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| tool_call_path(&call.arguments));
+        let succeeded_mutation = result.state == ToolResultState::Succeeded
+            && matches!(
+                call.name.as_str(),
+                "File.Edit"
+                    | "File.EditBytes"
+                    | "File.Append"
+                    | "File.Replace"
+                    | "File.Move"
+                    | "File.Delete"
+                    | "File.Create"
+            );
+        let stale_edit = call.name == "File.Edit"
+            && detail
+                .as_ref()
+                .and_then(|detail| detail.get("error"))
+                .and_then(Value::as_object)
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                == Some("stale_read");
+        if (succeeded_mutation || stale_edit)
+            && let Some(path) = path
+        {
+            self.files.remove(&path);
+        }
+        if succeeded_mutation && call.name == "File.Move" {
+            let destination = detail
+                .as_ref()
+                .and_then(|detail| detail.get("destination"))
+                .and_then(Value::as_str);
+            if let Some(destination) = destination {
+                self.files.remove(destination);
+            }
+        }
+    }
+
+    fn scope_value(&self, path: &str) -> Value {
+        self.files.get(path).map_or(Value::Null, |scope| {
+            json!({
+                "path": path,
+                "hash": scope.hash,
+                "ranges": file_scope_ranges_value(scope),
+                "total_lines": scope.total_lines,
+                "eof": scope.eof,
+            })
+        })
+    }
+}
+
+fn numbered_ranges(mut lines: Vec<u64>) -> Vec<(u64, u64)> {
+    lines.sort_unstable();
+    lines.dedup();
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for line in lines {
+        if let Some((_, end)) = ranges.last_mut()
+            && line == end.saturating_add(1)
+        {
+            *end = line;
+        } else {
+            ranges.push((line, line));
+        }
+    }
+    ranges
+}
+
+fn merge_numbered_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= previous_end.saturating_add(1)
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn file_scope_ranges_value(scope: &FileEditScope) -> Value {
+    Value::Array(
+        scope
+            .ranges
+            .iter()
+            .map(|(start, end)| json!({"start_line": start, "end_line": end}))
+            .collect(),
+    )
+}
+
+fn tool_call_path(arguments: &str) -> Option<String> {
+    serde_json::from_str::<Value>(arguments)
+        .ok()?
+        .get("path")?
+        .as_str()
+        .map(|path| path.replace('\\', "/").trim_start_matches("./").to_owned())
+}
+
+fn projected_file_edit_scopes(edb: &EventDataBase) -> Result<FileEditScopeProjection> {
+    projected_file_edit_scopes_with_hidden_read_batch(edb, None)
+}
+
+fn projected_file_edit_scopes_with_hidden_read_batch(
+    edb: &EventDataBase,
+    hidden_read_api_call_id: Option<EventId>,
+) -> Result<FileEditScopeProjection> {
+    let mut projection = FileEditScopeProjection::default();
+    for event in effective_conversation_events(edb.events())? {
+        let Event::ToolCallResult(result) = event else {
+            continue;
+        };
+        let Some(Event::ToolCall(call)) = edb.get(result.tool_call_id) else {
+            return Err(format!(
+                "File edit scope projection found result {} without call {}",
+                result.id, result.tool_call_id
+            )
+            .into());
+        };
+        if !call.name.starts_with("File.") {
+            continue;
+        }
+        if call.name == "File.Read" && hidden_read_api_call_id == Some(call.api_call_id) {
+            continue;
+        }
+        let mut visible = structured_tool_result_value(&call.name, Vec::new(), result)?;
+        projection.apply_result(call, result, &mut visible);
+    }
+    Ok(projection)
+}
+
+fn normalized_workspace_file_path(workspace: &Path, logical: &str) -> Option<String> {
+    let root = workspace.canonicalize().ok()?;
+    let target = workspace.join(logical).canonicalize().ok()?;
+    let relative = target.strip_prefix(root).ok()?;
+    Some(
+        relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+fn file_edit_execution_arguments(
+    edb: &EventDataBase,
+    workspace: &Path,
+    arguments: &str,
+    current_api_call_id: EventId,
+) -> Result<String> {
+    let mut input: Value = serde_json::from_str(arguments)?;
+    let object = input
+        .as_object_mut()
+        .ok_or("File.Edit arguments must be a JSON object")?;
+    let logical = object
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or("File.Edit path must be a string")?;
+    let path = normalized_workspace_file_path(workspace, logical).unwrap_or_else(|| {
+        logical
+            .replace('\\', "/")
+            .trim_start_matches("./")
+            .to_owned()
+    });
+    let scope = projected_file_edit_scopes_with_hidden_read_batch(edb, Some(current_api_call_id))?
+        .scope_value(&path);
+    object.insert("_edit_scope".into(), scope);
+    Ok(serde_json::to_string(&input)?)
+}
+
 fn structured_tool_result(
     tool_name: &str,
     updates: Vec<ModelToolUpdate>,
     result: &ToolCallResultEvent,
 ) -> Result<String> {
+    Ok(serde_json::to_string(&structured_tool_result_value(
+        tool_name, updates, result,
+    )?)?)
+}
+
+fn structured_tool_result_value(
+    tool_name: &str,
+    updates: Vec<ModelToolUpdate>,
+    result: &ToolCallResultEvent,
+) -> Result<Value> {
     let mut terminal = Vec::new();
     let mut other = Vec::new();
     for update in updates {
@@ -5496,9 +5807,7 @@ fn structured_tool_result(
                 .expect("terminal tool result is an object")
                 .insert("other_updates".into(), Value::Array(other));
         }
-        return Ok(serde_json::to_string(
-            &tool_result_truncation::truncate_for_model(tool_name, value),
-        )?);
+        return Ok(tool_result_truncation::truncate_for_model(tool_name, value));
     }
 
     let mut value = json!({"result": result_value});
@@ -5508,9 +5817,7 @@ fn structured_tool_result(
     if !other.is_empty() {
         object.insert("updates".into(), Value::Array(other));
     }
-    Ok(serde_json::to_string(
-        &tool_result_truncation::truncate_for_model(tool_name, value),
-    )?)
+    Ok(tool_result_truncation::truncate_for_model(tool_name, value))
 }
 
 fn resolve_main_system_prompt(
@@ -5704,6 +6011,218 @@ mod tests {
     };
 
     use super::*;
+
+    fn append_file_result_for_scope_test(
+        edb: &mut EventDataBase,
+        name: &str,
+        arguments: Value,
+        detail: Value,
+        state: ToolResultState,
+    ) -> EventId {
+        let call = edb
+            .append_tool_call(
+                0,
+                0,
+                format!("scope-call-{}", edb.len()),
+                name,
+                serde_json::to_string(&arguments).unwrap(),
+            )
+            .unwrap();
+        edb.append_tool_result(call, state, None, serde_json::to_string(&detail).unwrap())
+            .unwrap();
+        call
+    }
+
+    #[test]
+    fn file_edit_scope_is_rebuilt_from_visible_read_results_and_reset_by_mutation() {
+        let mut edb = EventDataBase::new();
+        append_file_result_for_scope_test(
+            &mut edb,
+            "File.Read",
+            json!({"path":"scoped.txt","start_line":2,"max_lines":2}),
+            json!({
+                "path":"scoped.txt",
+                "lines":{"2":"two\r\n","3":"three\n"},
+                "editable_ranges":[{"start_line":1,"end_line":99}],
+                "start_line":2,
+                "end_line":3,
+                "total_lines":6,
+                "eof":false,
+                "hash":"1234abcd"
+            }),
+            ToolResultState::Succeeded,
+        );
+        append_file_result_for_scope_test(
+            &mut edb,
+            "File.Search",
+            json!({"path":"scoped.txt","query":"five"}),
+            json!({
+                "path":"scoped.txt",
+                "matches":[{"path":"scoped.txt","before":{},"match_text":{"5":"five\n"},"after":{},"column":1,"match_length":4}],
+                "truncated":false
+            }),
+            ToolResultState::Succeeded,
+        );
+        append_file_result_for_scope_test(
+            &mut edb,
+            "File.Read",
+            json!({"path":"scoped.txt","start_line":5,"max_lines":1}),
+            json!({
+                "path":"scoped.txt",
+                "lines":{"5":"five\n"},
+                "editable_ranges":[],
+                "start_line":5,
+                "end_line":5,
+                "total_lines":6,
+                "eof":false,
+                "hash":"1234abcd"
+            }),
+            ToolResultState::Succeeded,
+        );
+
+        let projection = projected_file_edit_scopes(&edb).unwrap();
+        assert_eq!(
+            projection.scope_value("scoped.txt"),
+            json!({
+                "path":"scoped.txt",
+                "hash":"1234abcd",
+                "ranges":[
+                    {"start_line":2,"end_line":3},
+                    {"start_line":5,"end_line":5}
+                ],
+                "total_lines":6,
+                "eof":false
+            })
+        );
+
+        append_file_result_for_scope_test(
+            &mut edb,
+            "File.Edit",
+            json!({"path":"scoped.txt","edits":[{"operation":"delete","start_line":2,"end_line":2}]}),
+            json!({"path":"scoped.txt","operation":"edited"}),
+            ToolResultState::Succeeded,
+        );
+        assert_eq!(
+            projected_file_edit_scopes(&edb)
+                .unwrap()
+                .scope_value("scoped.txt"),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn safely_truncated_file_read_grants_only_complete_model_visible_lines() {
+        let mut edb = EventDataBase::new();
+        let lines = (1..=240)
+            .map(|line| {
+                (
+                    line.to_string(),
+                    Value::String(format!("line-{line:03} {}", "测".repeat(220))),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        append_file_result_for_scope_test(
+            &mut edb,
+            "File.Read",
+            json!({"path":"large.txt"}),
+            json!({
+                "path":"large.txt",
+                "lines":lines,
+                "editable_ranges":[{"start_line":1,"end_line":240}],
+                "start_line":1,
+                "end_line":240,
+                "total_lines":240,
+                "eof":true,
+                "hash":"89abcdef"
+            }),
+            ToolResultState::Succeeded,
+        );
+
+        let projection = projected_file_edit_scopes(&edb).unwrap();
+        let scope = projection.files.get("large.txt").unwrap();
+        assert!(scope.ranges.iter().any(|(start, _)| *start == 1));
+        assert!(scope.ranges.iter().any(|(_, end)| *end == 240));
+        assert!(
+            !scope
+                .ranges
+                .iter()
+                .any(|(start, end)| *start <= 120 && 120 <= *end),
+            "a safely omitted middle line must not become editable: {:?}",
+            scope.ranges
+        );
+        assert!(!scope.eof || scope.ranges.iter().any(|(_, end)| *end == 240));
+    }
+
+    #[test]
+    fn file_edit_execution_receives_only_the_edb_projected_scope() {
+        let mut suffix = [0_u8; 8];
+        getrandom::fill(&mut suffix).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "me-file-edit-scope-{}-{}",
+            std::process::id(),
+            u64::from_le_bytes(suffix)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("target.txt"), "one\ntwo\nthree\n").unwrap();
+        let edb_path = directory.join("scope.edb");
+        let mut edb = EventDataBase::open(&edb_path).unwrap();
+        append_file_result_for_scope_test(
+            &mut edb,
+            "File.Read",
+            json!({"path":"target.txt","start_line":2,"max_lines":1}),
+            json!({
+                "path":"target.txt",
+                "lines":{"2":"two"},
+                "editable_ranges":[{"start_line":1,"end_line":3}],
+                "start_line":2,
+                "end_line":2,
+                "total_lines":3,
+                "eof":false,
+                "hash":"1234abcd"
+            }),
+            ToolResultState::Succeeded,
+        );
+        drop(edb);
+        let mut edb = EventDataBase::open(&edb_path).unwrap();
+        let same_response_arguments = file_edit_execution_arguments(
+            &edb,
+            &directory,
+            r#"{"path":"target.txt","edits":[{"operation":"delete","start_line":2,"end_line":2}]}"#,
+            0,
+        )
+        .unwrap();
+        let same_response_arguments: Value =
+            serde_json::from_str(&same_response_arguments).unwrap();
+        assert_eq!(
+            same_response_arguments["_edit_scope"],
+            Value::Null,
+            "a model has not seen a Read result emitted by its own response batch"
+        );
+        let arguments = file_edit_execution_arguments(
+            &edb,
+            &directory,
+            r#"{"path":"target.txt","edits":[{"operation":"delete","start_line":2,"end_line":2}]}"#,
+            1,
+        )
+        .unwrap();
+        let arguments: Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(
+            arguments["_edit_scope"]["ranges"],
+            json!([{"start_line":2,"end_line":2}])
+        );
+
+        edb.append_context_cleared().unwrap();
+        let arguments = file_edit_execution_arguments(
+            &edb,
+            &directory,
+            r#"{"path":"target.txt","edits":[{"operation":"delete","start_line":2,"end_line":2}]}"#,
+            1,
+        )
+        .unwrap();
+        let arguments: Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(arguments["_edit_scope"], Value::Null);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn only_main_agent_exposes_toolbox_resource_observation() {
