@@ -114,7 +114,7 @@ Important behavior:
 - A session exists only inside the current persistent Terminal toolbox process. Closing me, replacing the toolbox, or an external process failure destroys its live PTYs. EDB closes any unfinished tool transaction as `interrupted`; it does not synthesize a separate session-loss message.
 - A session_id from an earlier toolbox process does not exist in a restarted process. A later attempt to use it fails with `session_not_found`; do not keep retrying that ID. Call Terminal.Create and continue in a new session if needed.
 - Historical EDB replay never recreates a PTY or repeats terminal side effects.
-- Stay inside the workspace and do not expose secrets or perform destructive actions unless the user explicitly requested the exact action.
+- Follow the governing external-path safety rule for every command: external reads must be materially relevant, and no content outside the workspace may be modified without the actual user's explicit authorization for the exact operation and target scope. Do not expose secrets or perform destructive actions without exact authorization.
 
 The following examples progress from simple to complex and only explain how to interpret structured Terminal results. Neutral commands may appear solely to make returned text understandable; the examples do not prescribe tool input or a workflow for any task.
 

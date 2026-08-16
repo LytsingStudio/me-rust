@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ME-RUST-MANAGED-TOOLBOX
-"""ME-RUST default workspace File toolbox."""
+"""ME-RUST default filesystem File toolbox."""
 
 from __future__ import annotations
 
@@ -277,7 +277,11 @@ def object_schema(
     return schema
 
 
-PATH_SCHEMA = {"type": "string", "minLength": 1}
+PATH_SCHEMA = {
+    "type": "string",
+    "minLength": 1,
+    "description": "A relative path resolves from the workspace. Absolute paths and relative paths that resolve outside the workspace are supported. Results use workspace-relative paths inside the workspace and normalized absolute paths outside it.",
+}
 HASH_SCHEMA = {"type": "string", "pattern": r"^[0-9a-f]{8}$"}
 STRING_ARRAY = {
     "type": "array",
@@ -349,7 +353,7 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "List": object_schema(
         {
-            "path": {"type": "string", "minLength": 1, "default": "."},
+            "path": {**PATH_SCHEMA, "default": "."},
             "depth": {
                 "type": "integer",
                 "minimum": 1,
@@ -367,7 +371,7 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "Find": object_schema(
         {
-            "path": {"type": "string", "minLength": 1, "default": "."},
+            "path": {**PATH_SCHEMA, "default": "."},
             "patterns": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},
@@ -393,7 +397,7 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "Search": object_schema(
         {
-            "path": {"type": "string", "minLength": 1, "default": "."},
+            "path": {**PATH_SCHEMA, "default": "."},
             "query": {"type": "string", "minLength": 1},
             "regex": {"type": "boolean", "default": False},
             "case_sensitive": {"type": "boolean", "default": True},
@@ -847,8 +851,8 @@ ROUTES = {
     "ReadBytes": "Read a bounded byte range for binary data, text whose encoding cannot be determined safely, or a File.EditBytes baseline.",
     "EditBytes": "Atomically replace, delete, or insert one or more independently located byte ranges after inspecting them with File.ReadBytes.",
     "List": "Inspect directory contents without invoking a shell.",
-    "Find": "Find workspace paths by glob patterns with optional recursion depth.",
-    "Search": "Search text across workspace files by literal text or regular expression with optional recursion depth.",
+    "Find": "Find filesystem paths by glob patterns with optional recursion depth.",
+    "Search": "Search text across filesystem files by literal text or regular expression with optional recursion depth.",
     "Stat": "Inspect existence, type, metadata, and current content hashes.",
     "MakeDirectory": "Create one explicit directory, optionally including its missing parent chain.",
     "Create": "Create a new text file in an explicit encoding, defaulting to UTF-8; never overwrite an existing file.",
@@ -868,7 +872,7 @@ INSTRUCTIONS = {
         "data is exact binary content written as lowercase two-digit hexadecimal bytes separated by one space, without 0x prefixes; use an empty string only for deletion. Source file size is not artificially capped; the complete file is loaded into memory for the atomic edit. Unselected bytes and file permissions are preserved. Malformed hexadecimal data, invalid or overlapping ranges, duplicate insertion points, a stale hash, and all other failures leave the file unchanged. A successful result deliberately does not return the new hash. Its old byte offsets and hash are stale: before every later File.EditBytes on this file, call File.ReadBytes again and use the refreshed bytes and hash."
     ),
     "List": "Depth counts levels below path. Results are stable and symbolic-link directories are never traversed.",
-    "Find": "Patterns and exclusions match workspace-relative POSIX paths. depth counts levels below path: 1 visits only direct children and 2 visits direct children plus their children. Omit depth for unlimited recursion. If path is a file, it alone is considered. Results are stable and symbolic-link directories are never traversed.",
+    "Find": "Patterns match each reported normalized POSIX path and basename; exclusions match the reported path. Paths inside the workspace are reported relative to it, while paths outside are reported as normalized absolute paths. depth counts levels below path: 1 visits only direct children and 2 visits direct children plus their children. Omit depth for unlimited recursion. If path is a file, it alone is considered. Results are stable and symbolic-link directories are never traversed.",
     "Search": "Literal search is the default. For a directory path, depth counts levels below it: 1 searches only direct child files and 2 also searches files in direct child directories. Omit depth for unlimited recursion. If path is a file, it alone is searched. Hidden entries and symbolic-link directories are always skipped. Source file size is not artificially capped; each candidate file is loaded into memory, and max_matches bounds the returned result. Each match returns before, match_text, and after as line-number-keyed objects using the same 1-based, minimally zero-padded keys and logical line text as File.Read; values never contain line terminators. The sole key in match_text is the matching file line; column is 1-based within that line. Example: {\"path\":\"src/main.rs\",\"column\":5,\"match_length\":7,\"before\":{\"041\":\"fn main() {\"},\"match_text\":{\"042\":\"    runtime.start();\"},\"after\":{\"043\":\"}\"}}. Search is only a locator: it never establishes editable_ranges. Before editing a located file, call File.Read for every target range. Never infer unseen edit boundaries from Search results. With top-level truncate:true, missing before or after keys are omitted context lines, and the sole match_text value may instead be a text_fragments object while its line key and match metadata remain intact. Text encoding is detected conservatively per file; binary and uncertain files are skipped.",
     "Stat": "A missing path is a normal result. Content hashes are returned only for ordinary files, not directories or symbolic links.",
     "MakeDirectory": "parents defaults to false, requiring the immediate parent to exist. Set parents=true to create every missing directory in the path. The target itself must not already exist; existing files, directories, and symbolic links return already_exists.",
@@ -1082,16 +1086,6 @@ def string_list(
     return value
 
 
-def ensure_within(path: Path) -> Path:
-    try:
-        path.relative_to(ROOT)
-    except ValueError as exc:
-        raise ToolError(
-            "outside_workspace", f"path is outside workspace: {path}"
-        ) from exc
-    return path
-
-
 def raw_path(value: str) -> Path:
     candidate = Path(value)
     return candidate if candidate.is_absolute() else ROOT / candidate
@@ -1099,7 +1093,7 @@ def raw_path(value: str) -> Path:
 
 def existing_path(value: str) -> Path:
     try:
-        return ensure_within(raw_path(value).resolve(strict=True))
+        return raw_path(value).resolve(strict=True)
     except FileNotFoundError as exc:
         raise ToolError("not_found", f"path does not exist: {value}") from exc
     except OSError as exc:
@@ -1108,16 +1102,13 @@ def existing_path(value: str) -> Path:
 
 def lexical_path(value: str) -> Path:
     candidate = raw_path(value)
-    if candidate == ROOT:
-        raise ToolError("invalid_path", "workspace root cannot be modified")
     try:
-        parent = ensure_within(candidate.parent.resolve(strict=True))
+        parent = candidate.parent.resolve(strict=True)
     except FileNotFoundError as exc:
         raise ToolError("parent_not_found", f"parent directory does not exist: {value}") from exc
     except OSError as exc:
         raise ToolError("path_error", f"cannot resolve parent of {value}: {exc}") from exc
     path = parent / candidate.name
-    ensure_within(path)
     if path == ROOT:
         raise ToolError("invalid_path", "workspace root cannot be modified")
     if path == LOCK_PATH:
@@ -1127,13 +1118,13 @@ def lexical_path(value: str) -> Path:
 
 def recursive_lexical_path(value: str) -> Path:
     candidate = raw_path(value)
-    if candidate == ROOT or candidate.name in {"", ".", ".."}:
+    if candidate.name in {"", ".", ".."}:
         raise ToolError("invalid_path", "workspace root cannot be modified")
     try:
-        parent = ensure_within(candidate.parent.resolve(strict=False))
+        parent = candidate.parent.resolve(strict=False)
     except OSError as exc:
         raise ToolError("path_error", f"cannot resolve parent of {value}: {exc}") from exc
-    path = ensure_within(parent / candidate.name)
+    path = parent / candidate.name
     if path == ROOT:
         raise ToolError("invalid_path", "workspace root cannot be modified")
     if path == LOCK_PATH:
@@ -1146,14 +1137,17 @@ def inspection_path(value: str) -> Path:
     if candidate == ROOT:
         return ROOT
     try:
-        parent = ensure_within(candidate.parent.resolve(strict=False))
+        parent = candidate.parent.resolve(strict=False)
     except OSError as exc:
         raise ToolError("path_error", f"cannot resolve parent of {value}: {exc}") from exc
-    return ensure_within(parent / candidate.name)
+    return parent / candidate.name
 
 
 def relative_path(path: Path) -> str:
-    relative = path.relative_to(ROOT)
+    try:
+        relative = path.relative_to(ROOT)
+    except ValueError:
+        return path.as_posix()
     return "." if not relative.parts else relative.as_posix()
 
 
@@ -2632,7 +2626,7 @@ def handle(request: Any) -> None:
     if command == "getBrief":
         result(
             request_id,
-            "Read, search, and safely mutate files and explicitly create directories inside the workspace. Source file size is not artificially capped; operations that need complete contents load them into memory, while bounded query parameters limit model-visible results. Line-oriented results and edits use logical lines without CR or LF; File preserves the file's detected line-ending convention automatically. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. File.Edit is limited to ranges actually returned by File.Read, clears those ranges after success, and validates the remembered file version internally. Binary operations use zero-based byte ranges and canonical hexadecimal data. Other mutations use an 8-character SHA-256-derived concurrency fingerprint. This short value detects stale edits; it is not a security integrity digest.",
+            "Read, search, and safely mutate files and explicitly create directories. Relative paths resolve from the workspace; absolute paths and relative paths that resolve outside the workspace are supported. Paths inside the workspace are returned relative to it, while outside paths are returned as normalized absolute paths. PATH SUPPORT IS CAPABILITY, NOT AUTHORIZATION: obey the governing external-path safety rule before any modification outside the workspace. Source file size is not artificially capped; operations that need complete contents load them into memory, while bounded query parameters limit model-visible results. Line-oriented results and edits use logical lines without CR or LF; File preserves the file's detected line-ending convention automatically. Text operations conservatively detect common Unicode, East Asian, and Windows encodings, preserve the original encoding and BOM, and reject uncertain or lossy writes. File.Edit is limited to ranges actually returned by File.Read, clears those ranges after success, and validates the remembered file version internally. Binary operations use zero-based byte ranges and canonical hexadecimal data. Other mutations use an 8-character SHA-256-derived concurrency fingerprint. This short value detects stale edits; it is not a security integrity digest.",
         )
         return
     tool = request.get("tool")

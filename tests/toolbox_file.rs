@@ -294,6 +294,15 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     let brief = brief["output"].as_str().unwrap();
     assert!(brief.contains("8-character"));
     assert!(brief.contains("Source file size is not artificially capped"));
+    assert!(brief.contains("absolute paths and relative paths that resolve outside"));
+    assert!(brief.contains("PATH SUPPORT IS CAPABILITY, NOT AUTHORIZATION"));
+    let read_schema = toolbox.query("getInputSchema", Some("Read"));
+    assert!(
+        read_schema["output"]["properties"]["path"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("normalized absolute paths outside")
+    );
     for tool in &tool_names {
         for command in [
             "getInputSchema",
@@ -1336,8 +1345,17 @@ fn make_directory_supports_strict_and_recursive_creation_safely() {
         "MakeDirectory",
         json!({"path":format!("../{}/child", outside.file_name().unwrap().to_string_lossy())}),
     );
-    assert_eq!(escaped["error"]["code"], "outside_workspace");
-    assert!(!outside.join("child").exists());
+    assert_eq!(escaped["type"], "result");
+    assert_eq!(
+        escaped["output"]["path"],
+        outside
+            .join("child")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    assert!(outside.join("child").is_dir());
 
     #[cfg(unix)]
     {
@@ -1346,8 +1364,8 @@ fn make_directory_supports_strict_and_recursive_creation_safely() {
             "MakeDirectory",
             json!({"path":"outside-link/missing/child", "parents":true}),
         );
-        assert_eq!(symlink_escape["error"]["code"], "outside_workspace");
-        assert!(!outside.join("child").exists());
+        assert_eq!(symlink_escape["type"], "result");
+        assert!(outside.join("missing/child").is_dir());
     }
 
     toolbox.finish();
@@ -1944,7 +1962,7 @@ fn edit_bytes_rejects_invalid_batches_without_mutating_the_file() {
 }
 
 #[test]
-fn file_toolbox_rejects_escape_overwrite_unknown_fields_and_mutable_symlinks() {
+fn file_toolbox_allows_external_reads_but_rejects_overwrite_unknown_fields_and_mutable_symlinks() {
     let workspace = temporary_workspace();
     let outside = workspace.parent().unwrap().join(format!(
         "me-file-outside-{}",
@@ -1959,8 +1977,16 @@ fn file_toolbox_rejects_escape_overwrite_unknown_fields_and_mutable_symlinks() {
         "Read",
         json!({"path":format!("../{}", outside.file_name().unwrap().to_string_lossy())}),
     );
-    assert_eq!(escaped["type"], "error");
-    assert_eq!(escaped["error"]["code"], "outside_workspace");
+    assert_eq!(escaped["type"], "result");
+    assert_eq!(escaped["output"]["lines"], json!({"1":"outside"}));
+    assert_eq!(
+        escaped["output"]["path"],
+        outside
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
 
     let created = toolbox.execute("Create", json!({"path":"safe.txt", "content":"safe"}));
     let duplicate = toolbox.execute("Create", json!({"path":"safe.txt", "content":"overwrite"}));
@@ -2014,6 +2040,155 @@ fn file_toolbox_rejects_escape_overwrite_unknown_fields_and_mutable_symlinks() {
 
     toolbox.finish();
     fs::remove_file(outside).unwrap();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn every_file_tool_supports_normalized_external_paths_without_weakening_other_guards() {
+    let workspace = temporary_workspace();
+    let outside = workspace.parent().unwrap().join(format!(
+        "me-file-all-tools-outside-{}",
+        workspace.file_name().unwrap().to_string_lossy()
+    ));
+    fs::create_dir_all(&outside).unwrap();
+    let display = |path: &Path| {
+        let normalized = if path.exists() {
+            path.canonicalize().unwrap()
+        } else {
+            path.parent()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+                .join(path.file_name().unwrap())
+        };
+        normalized.to_string_lossy().replace('\\', "/")
+    };
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+
+    let nested = outside.join("nested");
+    let made = toolbox.execute(
+        "MakeDirectory",
+        json!({"path":display(&nested), "parents":false}),
+    );
+    assert_eq!(made["type"], "result");
+    assert_eq!(made["output"]["path"], display(&nested));
+
+    let text_path = nested.join("text.txt");
+    let created = toolbox.execute(
+        "Create",
+        json!({"path":display(&text_path), "content":"one\ntwo\n"}),
+    );
+    assert_eq!(created["type"], "result");
+    assert_eq!(created["output"]["path"], display(&text_path));
+
+    let read = toolbox.execute(
+        "Read",
+        json!({"path":display(&text_path), "start_line":1, "max_lines":2}),
+    );
+    assert_eq!(read["output"]["lines"], json!({"1":"one", "2":"two"}));
+    assert_eq!(
+        read["output"]["editable_ranges"],
+        json!([{"start_line":1,"end_line":2}])
+    );
+    let edited = toolbox.execute(
+        "Edit",
+        json!({
+            "path":display(&text_path),
+            "edits":[{"operation":"replace","start_line":2,"end_line":2,"new_lines":["changed"]}]
+        }),
+    );
+    assert_eq!(edited["type"], "result");
+    assert_eq!(fs::read_to_string(&text_path).unwrap(), "one\nchanged\n");
+
+    let reread = toolbox.execute("Read", json!({"path":display(&text_path)}));
+    let appended = toolbox.execute(
+        "Append",
+        json!({
+            "path":display(&text_path),
+            "expected_hash":reread["output"]["hash"],
+            "content":"three\n"
+        }),
+    );
+    assert_eq!(appended["type"], "result");
+    let replaced = toolbox.execute(
+        "Replace",
+        json!({
+            "path":display(&text_path),
+            "expected_hash":appended["output"]["hash"],
+            "content":"needle\nfinal\n"
+        }),
+    );
+    assert_eq!(replaced["type"], "result");
+
+    let listed = toolbox.execute("List", json!({"path":display(&outside), "depth":2}));
+    assert_eq!(listed["type"], "result");
+    assert!(
+        listed["output"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == display(&text_path))
+    );
+    let found = toolbox.execute(
+        "Find",
+        json!({"path":display(&outside), "patterns":["*.txt"]}),
+    );
+    assert_eq!(found["output"]["results"], json!([display(&text_path)]));
+    let searched = toolbox.execute(
+        "Search",
+        json!({"path":display(&outside), "query":"needle"}),
+    );
+    assert_eq!(
+        searched["output"]["matches"][0]["path"],
+        display(&text_path)
+    );
+    let stated = toolbox.execute(
+        "Stat",
+        json!({"paths":[display(&text_path), display(&outside.join("missing.txt"))]}),
+    );
+    assert_eq!(stated["output"]["entries"][0]["exists"], true);
+    assert_eq!(stated["output"]["entries"][1]["exists"], false);
+    assert_eq!(
+        stated["output"]["entries"][1]["path"],
+        display(&outside.join("missing.txt"))
+    );
+
+    let binary_path = nested.join("data.bin");
+    fs::write(&binary_path, [0x01, 0x02, 0x03]).unwrap();
+    let bytes = toolbox.execute("ReadBytes", json!({"path":display(&binary_path)}));
+    assert_eq!(bytes["output"]["data"], "01 02 03");
+    let edited_bytes = toolbox.execute(
+        "EditBytes",
+        json!({
+            "path":display(&binary_path),
+            "expected_hash":bytes["output"]["hash"],
+            "edits":[{"target_offset":1,"target_length":1,"data":"ff"}]
+        }),
+    );
+    assert_eq!(edited_bytes["type"], "result");
+    assert_eq!(fs::read(&binary_path).unwrap(), [0x01, 0xff, 0x03]);
+
+    let moved_path = nested.join("moved.txt");
+    let moved = toolbox.execute(
+        "Move",
+        json!({
+            "path":display(&text_path),
+            "destination":display(&moved_path),
+            "expected_hash":replaced["output"]["hash"]
+        }),
+    );
+    assert_eq!(moved["type"], "result");
+    assert_eq!(moved["output"]["destination"], display(&moved_path));
+    let deleted = toolbox.execute(
+        "Delete",
+        json!({"path":display(&moved_path), "expected_hash":moved["output"]["hash"]}),
+    );
+    assert_eq!(deleted["type"], "result");
+    assert!(!moved_path.exists());
+
+    toolbox.finish();
+    fs::remove_dir_all(outside).unwrap();
     fs::remove_dir_all(workspace).unwrap();
 }
 
