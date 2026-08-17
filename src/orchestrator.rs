@@ -12070,6 +12070,7 @@ data: [DONE]
                 assert!(summary_json.contains("ORIGINAL-COMPACT-ROOT"));
                 assert!(summary_json.contains("system_prompt_injection"));
                 assert!(summary_json.contains(&format!("stage {}", index + 1)));
+                assert!(summary_json.contains("source of information, never as a template"));
                 if index > 0 {
                     assert!(summary_json.contains("preparation analysis"));
                 }
