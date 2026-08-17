@@ -24,7 +24,7 @@ use crate::{
         EdbMutation, Event, EventDataBase, EventId, HOST_AGENT_TITLE_CHANGE, ModelChangeCause,
         ReasoningEffortChangeCause, TerminalSessionState, ToolCallEvent, ToolCallResultEvent,
         ToolOutputStream, ToolResultState, agent_kind_definition, effective_conversation_events,
-        latest_agent_turn, latest_context_usage,
+        latest_agent_turn, latest_context_usage, latest_context_usage_event,
     },
     image_toolbox,
     model::{
@@ -1605,6 +1605,36 @@ impl MainAgent {
         edb.append_initial_reasoning_effort(self.effort.as_deref().unwrap_or(UNSET_EFFORT))?;
         Ok(())
     }
+
+    fn ensure_context_usage_estimate(
+        &self,
+        edb: &mut EventDataBase,
+        models: &ModelRuntime,
+    ) -> Result<()> {
+        let Some(boundary) = latest_context_usage_event(edb.events()) else {
+            return Ok(());
+        };
+        if edb.events().iter().any(|event| {
+            matches!(event, Event::ContextUsageEstimate(estimate)
+                if estimate.api_state_event_id == boundary.id)
+        }) {
+            return Ok(());
+        }
+        let usage = boundary
+            .usage
+            .expect("latest context usage boundary always carries usage");
+        let catalog = self.visible_catalog(models.active_model())?;
+        let context = main_model_context_with_toolboxes_and_environment(
+            edb,
+            &catalog,
+            self.parent_system_prompt.as_deref(),
+            &self.environment_prompt,
+            image_toolbox::model_supports_images(models.active_model()),
+        )?;
+        let values = crate::context_usage::estimate_current_context(&context, usage.total_tokens);
+        edb.append_context_usage_estimate(boundary.id, values)?;
+        Ok(())
+    }
 }
 
 impl Orchestrator for MainAgent {
@@ -1730,6 +1760,7 @@ impl Orchestrator for MainAgent {
                 | Event::FollowUpPrompt(_)
                 | Event::AssistResponse(_)
                 | Event::ApiStateUpdate(_)
+                | Event::ContextUsageEstimate(_)
                 | Event::UserTurnAborted(_)
                 | Event::ToolCall(_)
                 | Event::ToolInfoUpdate(_)
@@ -1760,6 +1791,7 @@ impl Orchestrator for MainAgent {
         validate_workmap_pending_reminders(edb)?;
         validate_follow_up_prompts(edb)?;
         validate_turn_aborts(edb)?;
+        validate_context_usage_estimates(edb)?;
         terminal_session_states(edb).map(|_| ())
     }
 
@@ -1791,7 +1823,8 @@ impl Orchestrator for MainAgent {
         reconcile_api_states(edb)?;
         reconcile_tool_calls(edb)?;
         reconcile_compact_states(edb)?;
-        reconcile_agent_turns(edb)
+        reconcile_agent_turns(edb)?;
+        self.ensure_context_usage_estimate(edb, models)
     }
 
     fn advance(
@@ -2074,12 +2107,14 @@ impl MainAgent {
                         begin_turn_abort_if_requested(&self.input_queue, prompt_id, edb, on_event)?;
                 }
                 if aborted {
-                    edb.append_api_state_with_usage(
+                    append_api_terminal_with_context_usage(
+                        edb,
                         api_call_id,
                         prompt_id,
                         ApiState::Interrupted,
                         usage,
                         "user requested turn abort",
+                        context,
                     )?;
                     on_event(edb)?;
                     return Ok(ModelRequestOutcome::Aborted);
@@ -2099,12 +2134,14 @@ impl MainAgent {
                 return Ok(ModelRequestOutcome::Interrupted);
             }
             if begin_turn_abort_if_requested(&self.input_queue, prompt_id, edb, on_event)? {
-                edb.append_api_state_with_usage(
+                append_api_terminal_with_context_usage(
+                    edb,
                     api_call_id,
                     prompt_id,
                     ApiState::Interrupted,
                     event_usage(response.usage()),
                     "user requested turn abort",
+                    context,
                 )?;
                 on_event(edb)?;
                 return Ok(ModelRequestOutcome::Aborted);
@@ -2180,12 +2217,14 @@ impl MainAgent {
                 )?);
                 on_event(edb)?;
             }
-            edb.append_api_state_with_usage(
+            append_api_terminal_with_context_usage(
+                edb,
                 api_call_id,
                 prompt_id,
                 ApiState::Completed,
                 usage,
                 "",
+                context,
             )?;
             on_event(edb)?;
             return Ok(ModelRequestOutcome::Completed(tool_call_ids));
@@ -2402,12 +2441,14 @@ impl MainAgent {
                         begin_turn_abort_if_requested(&self.input_queue, prompt_id, edb, on_event)?;
                 }
                 if aborted {
-                    edb.append_api_state_with_usage(
+                    append_api_terminal_with_context_usage(
+                        edb,
                         api_call_id,
                         prompt_id,
                         ApiState::Interrupted,
                         usage,
                         "user requested turn abort during Compact",
+                        context,
                     )?;
                     on_event(edb)?;
                     return Ok(CompactStageRequestOutcome::Aborted);
@@ -2428,12 +2469,14 @@ impl MainAgent {
             }
 
             if begin_turn_abort_if_requested(&self.input_queue, prompt_id, edb, on_event)? {
-                edb.append_api_state_with_usage(
+                append_api_terminal_with_context_usage(
+                    edb,
                     api_call_id,
                     prompt_id,
                     ApiState::Interrupted,
                     event_usage(response.usage()),
                     "user requested turn abort during Compact",
+                    context,
                 )?;
                 on_event(edb)?;
                 return Ok(CompactStageRequestOutcome::Aborted);
@@ -2469,12 +2512,14 @@ impl MainAgent {
                 return Ok(CompactStageRequestOutcome::Failed(error));
             }
 
-            edb.append_api_state_with_usage(
+            append_api_terminal_with_context_usage(
+                edb,
                 api_call_id,
                 prompt_id,
                 ApiState::Completed,
                 event_usage(response.usage()),
                 "",
+                context,
             )?;
             on_event(edb)?;
             return Ok(CompactStageRequestOutcome::Completed(response.content));
@@ -2802,6 +2847,29 @@ impl Chatbot {
         edb.append_initial_reasoning_effort(self.effort.as_deref().unwrap_or(UNSET_EFFORT))?;
         Ok(())
     }
+
+    fn ensure_context_usage_estimate(
+        &self,
+        edb: &mut EventDataBase,
+        _models: &ModelRuntime,
+    ) -> Result<()> {
+        let Some(boundary) = latest_context_usage_event(edb.events()) else {
+            return Ok(());
+        };
+        if edb.events().iter().any(|event| {
+            matches!(event, Event::ContextUsageEstimate(estimate)
+                if estimate.api_state_event_id == boundary.id)
+        }) {
+            return Ok(());
+        }
+        let usage = boundary
+            .usage
+            .expect("latest context usage boundary always carries usage");
+        let context = model_context(edb, boundary.api_call_id)?;
+        let values = crate::context_usage::estimate_current_context(&context, usage.total_tokens);
+        edb.append_context_usage_estimate(boundary.id, values)?;
+        Ok(())
+    }
 }
 
 impl Orchestrator for Chatbot {
@@ -2853,6 +2921,7 @@ impl Orchestrator for Chatbot {
                 | Event::ParentAgentPrompt(_)
                 | Event::AssistResponse(_)
                 | Event::ApiStateUpdate(_)
+                | Event::ContextUsageEstimate(_)
                 | Event::UserTurnAborted(_)
                 | Event::ModelContextItem(_)
                 | Event::ReasoningEffortChanged(_)
@@ -2879,7 +2948,8 @@ impl Orchestrator for Chatbot {
         latest_agent_turn(edb.events()).map_err(|error| error.to_string())?;
         api_call_states(edb)?;
         validate_clone_completed_events(edb)?;
-        validate_turn_aborts(edb)
+        validate_turn_aborts(edb)?;
+        validate_context_usage_estimates(edb)
     }
 
     fn restore(&mut self, edb: &EventDataBase, models: &mut ModelRuntime) -> Result<()> {
@@ -2907,7 +2977,8 @@ impl Orchestrator for Chatbot {
         }
         reconcile_model_effort(&mut self.effort, edb, models)?;
         reconcile_api_states(edb)?;
-        reconcile_agent_turns(edb)
+        reconcile_agent_turns(edb)?;
+        self.ensure_context_usage_estimate(edb, models)
     }
 
     fn advance(
@@ -3017,12 +3088,14 @@ impl Orchestrator for Chatbot {
                             )?;
                         }
                         if aborted {
-                            edb.append_api_state_with_usage(
+                            append_api_terminal_with_context_usage(
+                                edb,
                                 api_call_id,
                                 prompt_id,
                                 ApiState::Interrupted,
                                 usage,
                                 "user requested turn abort",
+                                &context,
                             )?;
                             on_event(edb)?;
                             break;
@@ -3042,12 +3115,14 @@ impl Orchestrator for Chatbot {
                         break;
                     }
                     if begin_turn_abort_if_requested(&self.input_queue, prompt_id, edb, on_event)? {
-                        edb.append_api_state_with_usage(
+                        append_api_terminal_with_context_usage(
+                            edb,
                             api_call_id,
                             prompt_id,
                             ApiState::Interrupted,
                             event_usage(response.usage()),
                             "user requested turn abort",
+                            &context,
                         )?;
                         on_event(edb)?;
                         break;
@@ -3075,12 +3150,14 @@ impl Orchestrator for Chatbot {
                         }
                         break;
                     }
-                    edb.append_api_state_with_usage(
+                    append_api_terminal_with_context_usage(
+                        edb,
                         api_call_id,
                         prompt_id,
                         ApiState::Completed,
                         event_usage(response.usage()),
                         "",
+                        &context,
                     )?;
                     on_event(edb)?;
                     break;
@@ -4634,6 +4711,43 @@ fn validate_clone_completed_events(edb: &EventDataBase) -> std::result::Result<(
     Ok(())
 }
 
+fn validate_context_usage_estimates(edb: &EventDataBase) -> std::result::Result<(), String> {
+    let mut referenced = BTreeSet::new();
+    for event in edb.events() {
+        let Event::ContextUsageEstimate(estimate) = event else {
+            continue;
+        };
+        if !referenced.insert(estimate.api_state_event_id) {
+            return Err(format!(
+                "API state {} has more than one context usage estimate",
+                estimate.api_state_event_id
+            ));
+        }
+        let Some(Event::ApiStateUpdate(update)) = edb.get(estimate.api_state_event_id) else {
+            return Err(format!(
+                "context usage estimate {} references a missing API state {}",
+                estimate.id, estimate.api_state_event_id
+            ));
+        };
+        let Some(usage) = update.usage else {
+            return Err(format!(
+                "context usage estimate {} references API state {} without usage",
+                estimate.id, estimate.api_state_event_id
+            ));
+        };
+        if update.id >= estimate.id
+            || !matches!(update.state, ApiState::Completed | ApiState::Interrupted)
+            || estimate.values.sum() != usage.total_tokens
+        {
+            return Err(format!(
+                "context usage estimate {} does not match API state {}",
+                estimate.id, estimate.api_state_event_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn require_api_terminal_before(
     edb: &EventDataBase,
     api_call_id: EventId,
@@ -4922,6 +5036,26 @@ fn event_usage(usage: Option<&ModelUsage>) -> Option<ApiUsage> {
     })
 }
 
+fn append_api_terminal_with_context_usage(
+    edb: &mut EventDataBase,
+    api_call_id: EventId,
+    prompt_id: EventId,
+    state: ApiState,
+    usage: Option<ApiUsage>,
+    detail: impl Into<String>,
+    context: &ModelContext,
+) -> Result<EventId> {
+    if !matches!(state, ApiState::Completed | ApiState::Interrupted) {
+        return Err(format!("context usage estimate cannot close API request as {state}").into());
+    }
+    let event_id = edb.append_api_state_with_usage(api_call_id, prompt_id, state, usage, detail)?;
+    if let Some(usage) = usage {
+        let values = crate::context_usage::estimate_request(context, usage);
+        edb.append_context_usage_estimate(event_id, values)?;
+    }
+    Ok(event_id)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct AssistResponseChunk {
     content: String,
@@ -5163,6 +5297,7 @@ fn model_context(edb: &EventDataBase, end_id: EventId) -> Result<ModelContext> {
                 assistant.push_str(&response.content);
             }
             Event::ApiStateUpdate(_) | Event::UserTurnAborted(_) => {}
+            Event::ContextUsageEstimate(_) => {}
             Event::ModelContextItem(item) => {
                 push_assistant(&mut context, &mut assistant);
                 push_provider_context_item(&mut context, item)?;
@@ -5255,7 +5390,10 @@ fn main_model_context_with_toolboxes_and_environment(
 
     for event in &effective {
         match event {
-            Event::AgentKindDef(_) | Event::AgentTurn(_) | Event::SystemPrompt(_) => {}
+            Event::AgentKindDef(_)
+            | Event::AgentTurn(_)
+            | Event::SystemPrompt(_)
+            | Event::ContextUsageEstimate(_) => {}
             Event::UserPrompt(prompt) => {
                 push_assistant(&mut context, &mut assistant);
                 context.push("user", user_prompt_envelope(&prompt.content));
@@ -6058,6 +6196,46 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn terminal_api_usage_appends_one_normalized_context_estimate() {
+        let mut edb = EventDataBase::new();
+        let prompt = edb.append_user_prompt("hello").unwrap();
+        let api = edb.append_api_requesting(prompt).unwrap();
+        let context = ModelContext {
+            messages: vec![
+                json!({"role":"system","content":"policy and tools"}),
+                json!({"role":"user","content":"hello"}),
+            ],
+            tools: vec![json!({"type":"function","function":{"name":"File.Read"}})],
+        };
+        let usage = ApiUsage {
+            input_tokens: 9_000,
+            output_tokens: 1_000,
+            total_tokens: 10_000,
+        };
+        let completed = append_api_terminal_with_context_usage(
+            &mut edb,
+            api,
+            prompt,
+            ApiState::Completed,
+            Some(usage),
+            "",
+            &context,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            edb.events().last(),
+            Some(Event::ContextUsageEstimate(estimate))
+                if estimate.api_state_event_id == completed
+                    && estimate.values.sum() == usage.total_tokens
+                    && estimate.values.system > 0
+                    && estimate.values.user > 0
+                    && estimate.values.model >= usage.output_tokens
+        ));
+        assert!(validate_context_usage_estimates(&edb).is_ok());
+    }
 
     fn append_file_result_for_scope_test(
         edb: &mut EventDataBase,
@@ -10318,6 +10496,61 @@ for line in sys.stdin:
         agent.restore(&edb, &mut models).unwrap();
         agent.reconcile_startup(&mut edb, &mut models).unwrap();
         assert_eq!(edb.len(), reconciled_len);
+    }
+
+    #[test]
+    fn startup_backfills_the_latest_legacy_usage_estimate_once() {
+        let mut edb = EventDataBase::new();
+        let mut agent = MainAgent::new(None);
+        initialize_main_for_test(&agent, &mut edb);
+        let prompt = edb.append_user_prompt("legacy request").unwrap();
+        let api = edb.append_api_requesting(prompt).unwrap();
+        edb.append_api_state(api, prompt, ApiState::Streaming, "")
+            .unwrap();
+        edb.append_assist_response(prompt, "legacy answer", true)
+            .unwrap();
+        let completed = edb
+            .append_api_state_with_usage(
+                api,
+                prompt,
+                ApiState::Completed,
+                Some(ApiUsage {
+                    input_tokens: 9_000,
+                    output_tokens: 1_000,
+                    total_tokens: 10_000,
+                }),
+                "",
+            )
+            .unwrap();
+        assert!(
+            !edb.events()
+                .iter()
+                .any(|event| matches!(event, Event::ContextUsageEstimate(_)))
+        );
+
+        reconcile_for_test(&mut agent, &mut edb);
+        let estimate_count = edb
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Event::ContextUsageEstimate(_)))
+            .count();
+        assert_eq!(estimate_count, 1);
+        assert!(matches!(
+            edb.events().last(),
+            Some(Event::ContextUsageEstimate(estimate))
+                if estimate.api_state_event_id == completed
+                    && estimate.values.sum() == 10_000
+                    && estimate.values.system > 0
+        ));
+
+        reconcile_for_test(&mut agent, &mut edb);
+        assert_eq!(
+            edb.events()
+                .iter()
+                .filter(|event| matches!(event, Event::ContextUsageEstimate(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]

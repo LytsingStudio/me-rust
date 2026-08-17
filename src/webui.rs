@@ -1562,6 +1562,8 @@ mod tests {
         assert!(INDEX_HTML.contains("id=\"compact-summary-backdrop\""));
         assert!(INDEX_HTML.contains("id=\"compact-summary-content\""));
         assert!(APP_JS.contains("function estimateContextBreakdown(events, usage, memoryContent)"));
+        assert!(APP_JS.contains("kind === \"ContextUsageEstimate\""));
+        assert!(APP_JS.contains("value.api_state_event_id === boundaryId"));
         assert!(APP_JS.contains("系统提示词"));
         assert!(APP_JS.contains("上下文压缩"));
         assert!(APP_JS.contains("label: \"记忆\""));
@@ -1572,12 +1574,7 @@ mod tests {
         assert!(APP_JS.contains("输出预留"));
         assert!(APP_JS.contains("model?.output_token_reservations?.[projection.effort]"));
         assert!(APP_JS.contains("category === \"reserve\" ? formatTokens(value)"));
-        assert!(APP_JS.contains(
-            "values.model += estimateTokenWeight(value.name) + estimateTokenWeight(value.arguments) + 12"
-        ));
-        assert!(APP_JS.contains("values.model += estimateTokenWeight(value.content)"));
-        assert!(!APP_JS.contains("values.tool += estimateTokenWeight(value.name)"));
-        assert!(!APP_JS.contains("values.system += estimateTokenWeight(value.content)"));
+        assert!(!APP_JS.contains("function estimateTokenWeight("));
         assert!(!INDEX_HTML.contains("分类由 WebUI 估算"));
         assert!(!APP_JS.contains("保留 system prompt"));
         assert!(APP_JS.contains(
@@ -1587,8 +1584,6 @@ mod tests {
         assert!(APP_JS.contains("command: \"clear_context\""));
         assert!(APP_JS.contains("category.key !== \"compact\" || hasCompact"));
         assert!(APP_JS.contains("category.key !== \"memory\" || hasMemory"));
-        assert!(APP_JS.contains("values.compact += estimateTokenWeight(value.content) + 12"));
-        assert!(APP_JS.contains("values.memory += estimateTokenWeight(memoryContent) + 12"));
         assert!(APP_JS.contains("state.contextCompactContent"));
         assert!(APP_JS.contains("state.contextMemoryContent"));
         assert!(APP_JS.contains("pre.textContent = content"));

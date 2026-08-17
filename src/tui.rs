@@ -404,6 +404,7 @@ impl ChatProjection {
                     ApiState::Streaming => {}
                 }
             }
+            Event::ContextUsageEstimate(_) => {}
             Event::ToolCall(call) => {
                 let presentation = tool_chat_presentation(&call.name);
                 if presentation == ChatToolPresentation::Hidden {
@@ -962,6 +963,7 @@ impl ContextTokenValues {
         }
     }
 
+    #[cfg(test)]
     fn sum(&self) -> u64 {
         self.system
             .saturating_add(self.compact)
@@ -969,6 +971,19 @@ impl ContextTokenValues {
             .saturating_add(self.user)
             .saturating_add(self.model)
             .saturating_add(self.tool)
+    }
+}
+
+impl From<crate::event::ContextTokenUsage> for ContextTokenValues {
+    fn from(values: crate::event::ContextTokenUsage) -> Self {
+        Self {
+            system: values.system,
+            compact: values.compact,
+            memory: values.memory,
+            user: values.user,
+            model: values.model,
+            tool: values.tool,
+        }
     }
 }
 
@@ -5027,106 +5042,42 @@ fn estimate_context_breakdown(
             can_clear,
         });
     };
-    let mut values = ContextTokenValues::default();
-    let mut active_compact_content = None;
-    let mut active_memory_content = None;
-    for event in effective_conversation_events(&events[..=boundary])? {
-        match event {
-            Event::UserPrompt(prompt) => {
-                values.user = values
-                    .user
-                    .saturating_add(estimate_token_weight(&prompt.content).saturating_add(8));
-            }
-            Event::ManagerPrompt(prompt) => {
-                values.user = values
-                    .user
-                    .saturating_add(estimate_token_weight(&prompt.content).saturating_add(8));
-            }
-            Event::ParentAgentPrompt(prompt) => {
-                values.user = values
-                    .user
-                    .saturating_add(estimate_token_weight(&prompt.content).saturating_add(8));
-            }
-            Event::FollowUpPrompt(prompt) => {
-                values.user = values
-                    .user
-                    .saturating_add(estimate_token_weight(&prompt.content).saturating_add(8));
-            }
-            Event::AssistResponse(response) => {
-                values.model = values
-                    .model
-                    .saturating_add(estimate_token_weight(&response.content));
-            }
-            Event::ToolCall(call) => {
-                values.model = values
-                    .model
-                    .saturating_add(estimate_token_weight(&call.name))
-                    .saturating_add(estimate_token_weight(&call.arguments))
-                    .saturating_add(12);
-            }
-            Event::ToolInfoUpdate(update) => {
-                let content = match &update.content {
-                    ToolInfoContent::Text(content) => content.clone(),
-                    ToolInfoContent::Terminal(_) => serde_json::to_string(&update.content)?,
-                };
-                values.tool = values
-                    .tool
-                    .saturating_add(estimate_token_weight(&content).saturating_add(6));
-            }
-            Event::ToolCallResult(result) => {
-                values.tool = values
-                    .tool
-                    .saturating_add(estimate_token_weight(&result.detail).saturating_add(8));
-            }
-            Event::ModelContextItem(item) => {
-                values.model = values
-                    .model
-                    .saturating_add(estimate_token_weight(&item.content));
-            }
-            Event::CompactStateUpdate(update) if update.state == CompactState::Completed => {
-                active_compact_content = Some(update.content.clone());
-                values.compact = values
-                    .compact
-                    .saturating_add(estimate_token_weight(&update.content).saturating_add(12));
-                if let Some(memory) = &memory_content {
-                    active_memory_content = Some(memory.clone());
-                    values.memory = values
-                        .memory
-                        .saturating_add(estimate_token_weight(memory).saturating_add(12));
-                }
-            }
-            _ => {}
+    let api_state_event_id = events[boundary].id();
+    if let Some(estimate) = events.iter().find_map(|event| match event {
+        Event::ContextUsageEstimate(estimate)
+            if estimate.api_state_event_id == api_state_event_id
+                && estimate.values.sum() == usage.total_tokens =>
+        {
+            Some(estimate)
         }
-    }
-    let known = values.sum();
-    if known <= usage.total_tokens {
-        values.system = values
-            .system
-            .saturating_add(usage.total_tokens.saturating_sub(known));
-    } else if known > 0 {
-        let scaled = |value: u64| {
-            value
-                .saturating_mul(usage.total_tokens)
-                .checked_div(known)
-                .unwrap_or(0)
-        };
-        values.system = scaled(values.system);
-        values.compact = scaled(values.compact);
-        values.memory = scaled(values.memory);
-        values.user = scaled(values.user);
-        values.model = scaled(values.model);
-        values.tool = scaled(values.tool);
-        values.system = values
-            .system
-            .saturating_add(usage.total_tokens.saturating_sub(values.sum()));
+        _ => None,
+    }) {
+        return Ok(ContextUsageBreakdown {
+            total: Some(usage.total_tokens),
+            limit,
+            reserve,
+            values: estimate.values.into(),
+            compact_content: compact_content.clone(),
+            memory_content: compact_content
+                .is_some()
+                .then_some(memory_content)
+                .flatten(),
+            can_clear,
+        });
     }
     Ok(ContextUsageBreakdown {
         total: Some(usage.total_tokens),
         limit,
         reserve,
-        values,
-        compact_content: active_compact_content,
-        memory_content: active_memory_content,
+        values: ContextTokenValues {
+            system: usage.total_tokens,
+            ..ContextTokenValues::default()
+        },
+        compact_content: compact_content.clone(),
+        memory_content: compact_content
+            .is_some()
+            .then_some(memory_content)
+            .flatten(),
         can_clear,
     })
 }
@@ -5155,24 +5106,6 @@ fn latest_usage_boundary(events: &[Event], expected: ApiUsage) -> Result<Option<
         return Ok(None);
     }
     Ok(events.iter().position(|event| event.id() == event_id))
-}
-
-fn estimate_token_weight(text: &str) -> u64 {
-    if text.is_empty() {
-        return 0;
-    }
-    let mut ascii = 0_u64;
-    let mut non_ascii = 0_u64;
-    for character in text.chars() {
-        if character.is_ascii() {
-            ascii += 1;
-        } else {
-            non_ascii += 1;
-        }
-    }
-    ((ascii.saturating_add(3)) / 4)
-        .saturating_add(non_ascii)
-        .max(1)
 }
 
 fn format_context_tokens(tokens: Option<u64>) -> String {
@@ -9791,8 +9724,21 @@ mod tests {
             output_tokens: 1_000,
             total_tokens: 40_000,
         };
-        edb.append_api_state_with_usage(final_api, second, ApiState::Completed, Some(usage), "")
+        let completed = edb
+            .append_api_state_with_usage(final_api, second, ApiState::Completed, Some(usage), "")
             .unwrap();
+        edb.append_context_usage_estimate(
+            completed,
+            crate::event::ContextTokenUsage {
+                system: 20_000,
+                compact: 4_000,
+                memory: 3_000,
+                user: 5_000,
+                model: 4_000,
+                tool: 4_000,
+            },
+        )
+        .unwrap();
 
         let memory = turn_history::latest_snapshot(edb.events()).unwrap();
         let breakdown = estimate_context_breakdown(
@@ -9839,6 +9785,38 @@ mod tests {
         let bar = context_usage_bar_row(&breakdown, 80);
         assert_eq!(display_width(&bar.text), 80);
         assert_eq!(context_usage_summary(&breakdown), "40.0k / 100k  ·  40%");
+    }
+
+    #[test]
+    fn context_breakdown_prefers_the_persisted_normalized_estimate() {
+        let mut edb = EventDataBase::new();
+        edb.append_initial_model("model").unwrap();
+        let prompt = edb.append_user_prompt("tiny prompt").unwrap();
+        let api = edb.append_api_requesting(prompt).unwrap();
+        let usage = ApiUsage {
+            input_tokens: 9_000,
+            output_tokens: 1_000,
+            total_tokens: 10_000,
+        };
+        let completed = edb
+            .append_api_state_with_usage(api, prompt, ApiState::Completed, Some(usage), "")
+            .unwrap();
+        let expected = crate::event::ContextTokenUsage {
+            system: 6_000,
+            compact: 0,
+            memory: 0,
+            user: 2_000,
+            model: 1_000,
+            tool: 1_000,
+        };
+        edb.append_context_usage_estimate(completed, expected)
+            .unwrap();
+
+        let breakdown =
+            estimate_context_breakdown(edb.events(), Some(usage), Some(100_000), 0, None, true)
+                .unwrap();
+        assert_eq!(breakdown.values, expected.into());
+        assert_eq!(breakdown.values.sum(), usage.total_tokens);
     }
 
     #[test]

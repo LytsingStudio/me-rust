@@ -20,6 +20,7 @@ function loadProjectionRuntime() {
       consumeWorkMapEvents,
       workerActivityIndex,
       applyCompactApiActivity,
+      estimateContextBreakdown,
     };`);
   const runtime = factory(
     { querySelector: () => null },
@@ -61,6 +62,30 @@ function assertIncrementalChatMatchesReplay(runtime, events) {
 }
 
 describe("WebUI incremental event projections", () => {
+  test("uses the persisted normalized context categories", () => {
+    const runtime = loadProjectionRuntime();
+    const usage = { input_tokens: 9_000, output_tokens: 1_000, total_tokens: 10_000 };
+    const events = [
+      event("ModelChanged", 1, { model: "model-a", cause: "Initial" }),
+      event("UserPrompt", 2, { content: "tiny prompt" }),
+      event("ApiStateUpdate", 3, {
+        api_call_id: 3, prompt_id: 2, state: "Completed", usage,
+      }),
+      event("ContextUsageEstimate", 4, {
+        api_state_event_id: 3,
+        values: { system: 6_000, compact: 0, memory: 0, user: 2_000, model: 1_000, tool: 1_000 },
+      }),
+    ];
+    expect(runtime.estimateContextBreakdown(events, usage, null).values).toEqual({
+      system: 6_000,
+      compact: 0,
+      memory: 0,
+      user: 2_000,
+      model: 1_000,
+      tool: 1_000,
+    });
+  });
+
   test("matches full replay throughout a streamed tool turn", () => {
     const runtime = loadProjectionRuntime();
     assertIncrementalChatMatchesReplay(runtime, [

@@ -2353,15 +2353,6 @@ const CONTEXT_CATEGORIES = [
   { key: "reserve", label: "输出预留", color: "var(--context-reserve)" },
 ];
 
-function estimateTokenWeight(value) {
-  const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
-  let ascii = 0, nonAscii = 0;
-  for (const character of text) {
-    if (character.codePointAt(0) <= 0x7f) ascii += 1; else nonAscii += 1;
-  }
-  return text.length ? Math.max(1, Math.ceil(ascii / 4 + nonAscii)) : 0;
-}
-
 function latestCommittedUsageBoundary(events, expectedUsage) {
   if (!expectedUsage) return null;
   const effective = effectiveConversationEvents(events);
@@ -2389,40 +2380,34 @@ function estimateContextBreakdown(events, usage, memoryContent) {
   if (!Number.isFinite(total) || total < 0) return { total: null, values: empty, compactContent: currentCompactContent, memoryContent };
   const boundary = latestCommittedUsageBoundary(events, usage);
   if (boundary == null || boundary < 0) return { total, values: { ...empty, system: total }, compactContent: currentCompactContent, memoryContent };
-  const values = { ...empty };
-  let compactContent = null;
-  let activeMemoryContent = null;
-  for (const event of effectiveConversationEvents(events.slice(0, boundary + 1))) {
-    const [kind, value] = eventParts(event);
-    if (kind === "UserPrompt" || kind === "ManagerPrompt"
-        || kind === "ParentAgentPrompt" || kind === "FollowUpPrompt") {
-      values.user += estimateTokenWeight(value.content) + 8;
-    } else if (kind === "AssistResponse") {
-      values.model += estimateTokenWeight(value.content);
-    } else if (kind === "ToolCall") {
-      values.model += estimateTokenWeight(value.name) + estimateTokenWeight(value.arguments) + 12;
-    } else if (kind === "ToolInfoUpdate") {
-      values.tool += estimateTokenWeight(value.content) + 6;
-    } else if (kind === "ToolCallResult") {
-      values.tool += estimateTokenWeight(value.detail) + 8;
-    } else if (kind === "ModelContextItem") {
-      values.model += estimateTokenWeight(value.content);
-    } else if (kind === "CompactStateUpdate" && value.state === "Completed") {
-      compactContent = value.content;
-      values.compact += estimateTokenWeight(value.content) + 12;
-      if (memoryContent !== null) {
-        activeMemoryContent = memoryContent;
-        values.memory += estimateTokenWeight(memoryContent) + 12;
-      }
+  const boundaryId = eventParts(events[boundary])[1].id;
+  const persistedEstimate = events.map(eventParts).find(([kind, value]) =>
+    kind === "ContextUsageEstimate" && value.api_state_event_id === boundaryId)?.[1];
+  if (persistedEstimate) {
+    const values = {
+      system: Number(persistedEstimate.values?.system || 0),
+      compact: Number(persistedEstimate.values?.compact || 0),
+      memory: Number(persistedEstimate.values?.memory || 0),
+      user: Number(persistedEstimate.values?.user || 0),
+      model: Number(persistedEstimate.values?.model || 0),
+      tool: Number(persistedEstimate.values?.tool || 0),
+    };
+    const estimatedTotal = Object.values(values).reduce((sum, value) => sum + value, 0);
+    if (Object.values(values).every(Number.isFinite) && estimatedTotal === total) {
+      return {
+        total,
+        values,
+        compactContent: currentCompactContent,
+        memoryContent: currentCompactContent === null ? null : memoryContent,
+      };
     }
   }
-  const known = Object.values(values).reduce((sum, value) => sum + value, 0);
-  if (known <= total) values.system += total - known;
-  else if (known > 0) {
-    const scale = total / known;
-    for (const category of Object.keys(values)) values[category] *= scale;
-  }
-  return { total, values, compactContent, memoryContent: activeMemoryContent };
+  return {
+    total,
+    values: { ...empty, system: total },
+    compactContent: currentCompactContent,
+    memoryContent: currentCompactContent === null ? null : memoryContent,
+  };
 }
 
 function renderContextDrawer() {

@@ -58,6 +58,7 @@ pub enum EventKind {
     FollowUpPrompt,
     AssistResponse,
     ApiStateUpdate,
+    ContextUsageEstimate,
     UserTurnAborted,
     ToolCall,
     ToolInfoUpdate,
@@ -88,6 +89,7 @@ impl std::fmt::Display for EventKind {
             Self::FollowUpPrompt => "follow-up-prompt",
             Self::AssistResponse => "assist-response",
             Self::ApiStateUpdate => "api-state-update",
+            Self::ContextUsageEstimate => "context-usage-estimate",
             Self::UserTurnAborted => "user-turn-aborted",
             Self::ToolCall => "tool-call",
             Self::ToolInfoUpdate => "tool-info-update",
@@ -644,6 +646,81 @@ pub struct ApiStateUpdateEvent {
     pub detail: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ContextTokenUsage {
+    pub system: u64,
+    pub compact: u64,
+    pub memory: u64,
+    pub user: u64,
+    pub model: u64,
+    pub tool: u64,
+}
+
+impl ContextTokenUsage {
+    pub fn sum(self) -> u64 {
+        self.system
+            .saturating_add(self.compact)
+            .saturating_add(self.memory)
+            .saturating_add(self.user)
+            .saturating_add(self.model)
+            .saturating_add(self.tool)
+    }
+
+    pub(crate) fn normalize_to(&mut self, target: u64) {
+        let source = self.sum();
+        if source == 0 {
+            *self = Self {
+                system: target,
+                ..Self::default()
+            };
+            return;
+        }
+        let raw = [
+            self.system,
+            self.compact,
+            self.memory,
+            self.user,
+            self.model,
+            self.tool,
+        ];
+        let source = u128::from(source);
+        let target_wide = u128::from(target);
+        let mut scaled = [0_u64; 6];
+        let mut remainders = [(0_u128, 0_usize); 6];
+        for (index, value) in raw.into_iter().enumerate() {
+            let product = u128::from(value).saturating_mul(target_wide);
+            scaled[index] = u64::try_from(product / source).unwrap_or(u64::MAX);
+            remainders[index] = (product % source, index);
+        }
+        let assigned = scaled.iter().copied().fold(0_u64, u64::saturating_add);
+        let mut remainder = target.saturating_sub(assigned);
+        remainders.sort_by(|left, right| right.cmp(left));
+        for (_, index) in remainders {
+            if remainder == 0 {
+                break;
+            }
+            scaled[index] = scaled[index].saturating_add(1);
+            remainder -= 1;
+        }
+        [
+            self.system,
+            self.compact,
+            self.memory,
+            self.user,
+            self.model,
+            self.tool,
+        ] = scaled;
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ContextUsageEstimateEvent {
+    pub id: EventId,
+    pub timestamp_ms: u64,
+    pub api_state_event_id: EventId,
+    pub values: ContextTokenUsage,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UserTurnAbortedEvent {
     pub id: EventId,
@@ -907,6 +984,7 @@ pub enum Event {
     FollowUpPrompt(FollowUpPromptEvent),
     AssistResponse(AssistResponseEvent),
     ApiStateUpdate(ApiStateUpdateEvent),
+    ContextUsageEstimate(ContextUsageEstimateEvent),
     UserTurnAborted(UserTurnAbortedEvent),
     ToolCall(ToolCallEvent),
     ToolInfoUpdate(ToolInfoUpdateEvent),
@@ -950,6 +1028,7 @@ impl Event {
             Self::FollowUpPrompt(event) => event.id,
             Self::AssistResponse(event) => event.id,
             Self::ApiStateUpdate(event) => event.id,
+            Self::ContextUsageEstimate(event) => event.id,
             Self::UserTurnAborted(event) => event.id,
             Self::ToolCall(event) => event.id,
             Self::ToolInfoUpdate(event) => event.id,
@@ -980,6 +1059,7 @@ impl Event {
             Self::FollowUpPrompt(_) => EventKind::FollowUpPrompt,
             Self::AssistResponse(_) => EventKind::AssistResponse,
             Self::ApiStateUpdate(_) => EventKind::ApiStateUpdate,
+            Self::ContextUsageEstimate(_) => EventKind::ContextUsageEstimate,
             Self::UserTurnAborted(_) => EventKind::UserTurnAborted,
             Self::ToolCall(_) => EventKind::ToolCall,
             Self::ToolInfoUpdate(_) => EventKind::ToolInfoUpdate,
@@ -1010,6 +1090,7 @@ impl Event {
             Self::FollowUpPrompt(event) => event.timestamp_ms,
             Self::AssistResponse(event) => event.timestamp_ms,
             Self::ApiStateUpdate(event) => event.timestamp_ms,
+            Self::ContextUsageEstimate(event) => event.timestamp_ms,
             Self::UserTurnAborted(event) => event.timestamp_ms,
             Self::ToolCall(event) => event.timestamp_ms,
             Self::ToolInfoUpdate(event) => event.timestamp_ms,
@@ -1407,6 +1488,73 @@ impl EventBase for ApiStateUpdateEvent {
             self.retry_limit,
             api_usage_string(self.usage),
             quoted(&self.detail)
+        )
+    }
+}
+
+#[allow(non_snake_case)]
+impl EventBase for ContextUsageEstimateEvent {
+    fn getID(&self) -> EventId {
+        self.id
+    }
+
+    fn getTimestamp(&self) -> u64 {
+        self.timestamp_ms
+    }
+
+    fn getEventKind(&self) -> EventKind {
+        EventKind::ContextUsageEstimate
+    }
+
+    fn getHash(&self) -> String {
+        let mut metadata = Vec::new();
+        for value in [
+            self.values.system,
+            self.values.compact,
+            self.values.memory,
+            self.values.user,
+            self.values.model,
+            self.values.tool,
+        ] {
+            encode_varint(value, &mut metadata);
+        }
+        stable_hash(
+            self.id,
+            self.timestamp_ms,
+            26,
+            &[self.api_state_event_id],
+            &metadata,
+            &[],
+        )
+    }
+
+    fn getBriefString(&self) -> String {
+        format!(
+            "ContextUsageEstimateEvent(api_state_event_id={}, total={}, system={}, compact={}, memory={}, user={}, model={}, tool={})",
+            self.api_state_event_id,
+            self.values.sum(),
+            self.values.system,
+            self.values.compact,
+            self.values.memory,
+            self.values.user,
+            self.values.model,
+            self.values.tool,
+        )
+    }
+
+    fn getDetailString(&self) -> String {
+        format!(
+            "ContextUsageEstimateEvent(id={}, timestamp_ms={}, api_state_event_id={}, total={}, system={}, compact={}, memory={}, user={}, model={}, tool={})",
+            self.id,
+            self.timestamp_ms,
+            self.api_state_event_id,
+            self.values.sum(),
+            self.values.system,
+            self.values.compact,
+            self.values.memory,
+            self.values.user,
+            self.values.model,
+            self.values.tool,
         )
     }
 }
@@ -2162,6 +2310,7 @@ impl EventBase for Event {
             Self::FollowUpPrompt(event) => event.getID(),
             Self::AssistResponse(event) => event.getID(),
             Self::ApiStateUpdate(event) => event.getID(),
+            Self::ContextUsageEstimate(event) => event.getID(),
             Self::UserTurnAborted(event) => event.getID(),
             Self::ToolCall(event) => event.getID(),
             Self::ToolInfoUpdate(event) => event.getID(),
@@ -2196,6 +2345,7 @@ impl EventBase for Event {
             Self::FollowUpPrompt(event) => event.getEventKind(),
             Self::AssistResponse(event) => event.getEventKind(),
             Self::ApiStateUpdate(event) => event.getEventKind(),
+            Self::ContextUsageEstimate(event) => event.getEventKind(),
             Self::UserTurnAborted(event) => event.getEventKind(),
             Self::ToolCall(event) => event.getEventKind(),
             Self::ToolInfoUpdate(event) => event.getEventKind(),
@@ -2226,6 +2376,7 @@ impl EventBase for Event {
             Self::FollowUpPrompt(event) => event.getHash(),
             Self::AssistResponse(event) => event.getHash(),
             Self::ApiStateUpdate(event) => event.getHash(),
+            Self::ContextUsageEstimate(event) => event.getHash(),
             Self::UserTurnAborted(event) => event.getHash(),
             Self::ToolCall(event) => event.getHash(),
             Self::ToolInfoUpdate(event) => event.getHash(),
@@ -2256,6 +2407,7 @@ impl EventBase for Event {
             Self::FollowUpPrompt(event) => event.getBriefString(),
             Self::AssistResponse(event) => event.getBriefString(),
             Self::ApiStateUpdate(event) => event.getBriefString(),
+            Self::ContextUsageEstimate(event) => event.getBriefString(),
             Self::UserTurnAborted(event) => event.getBriefString(),
             Self::ToolCall(event) => event.getBriefString(),
             Self::ToolInfoUpdate(event) => event.getBriefString(),
@@ -2286,6 +2438,7 @@ impl EventBase for Event {
             Self::FollowUpPrompt(event) => event.getDetailString(),
             Self::AssistResponse(event) => event.getDetailString(),
             Self::ApiStateUpdate(event) => event.getDetailString(),
+            Self::ContextUsageEstimate(event) => event.getDetailString(),
             Self::UserTurnAborted(event) => event.getDetailString(),
             Self::ToolCall(event) => event.getDetailString(),
             Self::ToolInfoUpdate(event) => event.getDetailString(),
@@ -2655,6 +2808,58 @@ impl EventDataBase {
             detail: detail.into(),
         });
         self.append(event)?;
+        Ok(id)
+    }
+
+    pub fn append_context_usage_estimate(
+        &mut self,
+        api_state_event_id: EventId,
+        values: ContextTokenUsage,
+    ) -> Result<EventId> {
+        let Some(Event::ApiStateUpdate(update)) = self.get(api_state_event_id) else {
+            return Err(format!(
+                "context usage estimate references non-API event {api_state_event_id}"
+            )
+            .into());
+        };
+        let Some(usage) = update.usage else {
+            return Err(format!(
+                "context usage estimate references API state {api_state_event_id} without usage"
+            )
+            .into());
+        };
+        if !matches!(update.state, ApiState::Completed | ApiState::Interrupted) {
+            return Err(format!(
+                "context usage estimate references non-committed API state {}",
+                update.state
+            )
+            .into());
+        }
+        if values.sum() != usage.total_tokens {
+            return Err(format!(
+                "context usage estimate total {} does not match API usage {}",
+                values.sum(),
+                usage.total_tokens
+            )
+            .into());
+        }
+        if self.events.iter().any(|event| {
+            matches!(event, Event::ContextUsageEstimate(estimate)
+                if estimate.api_state_event_id == api_state_event_id)
+        }) {
+            return Err(format!(
+                "API state {api_state_event_id} already has a context usage estimate"
+            )
+            .into());
+        }
+        let id = self.next_event_id;
+        let timestamp_ms = self.next_timestamp_ms()?;
+        self.append(Event::ContextUsageEstimate(ContextUsageEstimateEvent {
+            id,
+            timestamp_ms,
+            api_state_event_id,
+            values,
+        }))?;
         Ok(id)
     }
 
@@ -3645,13 +3850,17 @@ pub(crate) fn effective_history_events(
 }
 
 pub fn latest_context_usage(events: &[Event]) -> Option<ApiUsage> {
+    latest_context_usage_event(events).and_then(|event| event.usage)
+}
+
+pub fn latest_context_usage_event(events: &[Event]) -> Option<&ApiStateUpdateEvent> {
     let effective = effective_conversation_events(events).ok()?;
     let model_event_id = events.iter().rev().find_map(|event| match event {
         Event::ModelChanged(changed) => Some(changed.id),
         _ => None,
     })?;
     let mut errored = BTreeSet::new();
-    let mut usage = None;
+    let mut boundary = None;
     for event in effective {
         let Event::ApiStateUpdate(update) = event else {
             continue;
@@ -3660,12 +3869,12 @@ pub fn latest_context_usage(events: &[Event]) -> Option<ApiUsage> {
             continue;
         }
         match update.state {
-            ApiState::Completed => usage = update.usage,
+            ApiState::Completed => boundary = update.usage.map(|_| update),
             ApiState::Error => {
                 errored.insert(update.api_call_id);
             }
             ApiState::Interrupted if !errored.contains(&update.api_call_id) => {
-                usage = update.usage;
+                boundary = update.usage.map(|_| update);
             }
             ApiState::Requesting
             | ApiState::Streaming
@@ -3673,7 +3882,7 @@ pub fn latest_context_usage(events: &[Event]) -> Option<ApiUsage> {
             | ApiState::Interrupted => {}
         }
     }
-    usage
+    boundary
 }
 
 pub fn completed_compact_count(events: &[Event]) -> u64 {
@@ -4226,6 +4435,23 @@ fn encode_event_body(event: &Event) -> Vec<u8> {
                 encode_varint(usage.total_tokens, &mut raw);
             }
             raw.extend_from_slice(event.detail.as_bytes());
+            raw
+        }
+        Event::ContextUsageEstimate(event) => {
+            let mut raw = Vec::with_capacity(64);
+            raw.push(26);
+            encode_varint(event.timestamp_ms, &mut raw);
+            encode_varint(event.api_state_event_id, &mut raw);
+            for value in [
+                event.values.system,
+                event.values.compact,
+                event.values.memory,
+                event.values.user,
+                event.values.model,
+                event.values.tool,
+            ] {
+                encode_varint(value, &mut raw);
+            }
             raw
         }
         Event::UserTurnAborted(event) => {
@@ -4929,6 +5155,32 @@ fn decode_event_with_format(
                 retry_limit,
                 usage,
                 detail: String::from_utf8(detail.to_vec())?,
+            }))
+        }
+        26 => {
+            let (api_state_event_id, consumed) = decode_varint(body)?;
+            let mut body = &body[consumed..];
+            let mut values = [0_u64; 6];
+            for value in &mut values {
+                let (decoded, consumed) = decode_varint(body)?;
+                *value = decoded;
+                body = &body[consumed..];
+            }
+            if !body.is_empty() {
+                return Err("invalid ContextUsageEstimateEvent payload".into());
+            }
+            Ok(Event::ContextUsageEstimate(ContextUsageEstimateEvent {
+                id,
+                timestamp_ms,
+                api_state_event_id,
+                values: ContextTokenUsage {
+                    system: values[0],
+                    compact: values[1],
+                    memory: values[2],
+                    user: values[3],
+                    model: values[4],
+                    tool: values[5],
+                },
             }))
         }
         15 => {
@@ -5950,6 +6202,73 @@ mod tests {
     }
 
     #[test]
+    fn context_usage_estimate_is_validated_and_round_trips() {
+        let directory = temporary_path("context-usage-estimate");
+        let path = directory.join("main.edb");
+        let estimate_id;
+        let expected = ContextTokenUsage {
+            system: 30,
+            compact: 10,
+            memory: 5,
+            user: 20,
+            model: 25,
+            tool: 10,
+        };
+        {
+            let mut edb = EventDataBase::open(&path).unwrap();
+            let prompt = edb.append_user_prompt("hello").unwrap();
+            let api = edb.append_api_requesting(prompt).unwrap();
+            let completed = edb
+                .append_api_state_with_usage(
+                    api,
+                    prompt,
+                    ApiState::Completed,
+                    Some(ApiUsage {
+                        input_tokens: 80,
+                        output_tokens: 20,
+                        total_tokens: 100,
+                    }),
+                    "",
+                )
+                .unwrap();
+            assert!(
+                edb.append_context_usage_estimate(
+                    completed,
+                    ContextTokenUsage {
+                        system: 99,
+                        ..ContextTokenUsage::default()
+                    },
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("does not match API usage")
+            );
+            estimate_id = edb
+                .append_context_usage_estimate(completed, expected)
+                .unwrap();
+            assert!(
+                edb.append_context_usage_estimate(completed, expected)
+                    .is_err()
+            );
+        }
+
+        let edb = EventDataBase::open(&path).unwrap();
+        assert!(matches!(
+            edb.get(estimate_id),
+            Some(Event::ContextUsageEstimate(event))
+                if event.api_state_event_id + 1 == estimate_id && event.values == expected
+        ));
+        assert!(
+            edb.get(estimate_id)
+                .unwrap()
+                .getDetailString()
+                .contains("system=30")
+        );
+        drop(edb);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn api_usage_is_rejected_on_non_terminal_states_and_affects_hash() {
         let usage = ApiUsage {
             input_tokens: 8,
@@ -6918,7 +7237,7 @@ mod tests {
                     |update| update.kind == CompactKind::WorkerSingleTurn && update.stage.is_none()
                 )
         );
-        assert_eq!(fs::read(&path).unwrap()[4], 38);
+        assert_eq!(fs::read(&path).unwrap()[4], 39);
         drop(migrated);
         fs::remove_dir_all(directory).unwrap();
     }
@@ -6976,7 +7295,7 @@ mod tests {
                 Some(Event::CompactStateUpdate(update))
                     if update.kind == expected && update.total_stages == 6
             ));
-            assert_eq!(fs::read(&path).unwrap()[4], 38);
+            assert_eq!(fs::read(&path).unwrap()[4], 39);
             drop(migrated);
             fs::remove_dir_all(directory).unwrap();
         }
@@ -7013,7 +7332,7 @@ mod tests {
             migrated.get(compact),
             Some(Event::CompactStateUpdate(update)) if update.total_stages == 6
         ));
-        assert_eq!(fs::read(&path).unwrap()[4], 38);
+        assert_eq!(fs::read(&path).unwrap()[4], 39);
         drop(migrated);
         fs::remove_dir_all(directory).unwrap();
     }
