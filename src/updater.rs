@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    error::Error as StdError,
+    fs,
     fs::File,
     io::{BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -19,6 +21,10 @@ use crate::Result;
 pub const RELEASE_REPOSITORY: &str = "LytsingStudio/me-rust";
 const CHECKSUM_ASSET: &str = "SHA256SUMS";
 const UPDATE_USER_AGENT: &str = concat!("me-rust/", env!("CARGO_PKG_VERSION"));
+const METADATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[cfg(any(windows, test))]
 const WINDOWS_UPDATE_POWERSHELL_ARGS: [&str; 3] = ["-NoLogo", "-NoProfile", "-NonInteractive"];
@@ -53,8 +59,8 @@ impl UpdatePlatform {
 
 pub fn update() -> Result<()> {
     let platform = UpdatePlatform::detect()?;
-    let client = update_client()?;
-    let release = latest_release(&client)?;
+    let metadata_client = update_metadata_client()?;
+    let release = latest_release(&metadata_client)?;
     let latest_tag = release.tag_name.as_str();
     let current_tag = format!("v{}", env!("CARGO_PKG_VERSION"));
     if latest_tag == current_tag {
@@ -69,8 +75,9 @@ pub fn update() -> Result<()> {
     }
 
     println!("updating me: {current_tag} -> {latest_tag}");
+    let download_client = update_download_client()?;
     let temporary = UpdateTempDirectory::create()?;
-    download_release(&client, &release, platform.asset, temporary.path())?;
+    download_release(&download_client, &release, platform.asset, temporary.path())?;
 
     let executable = temporary.path().join(platform.asset);
     let checksums = temporary.path().join(CHECKSUM_ASSET);
@@ -93,24 +100,51 @@ pub fn update() -> Result<()> {
     Ok(())
 }
 
-fn update_client() -> Result<reqwest::blocking::Client> {
+fn update_metadata_client() -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(30 * 60))
+        .connect_timeout(METADATA_CONNECT_TIMEOUT)
+        .timeout(METADATA_REQUEST_TIMEOUT)
+        .user_agent(UPDATE_USER_AGENT)
+        .build()?)
+}
+
+fn update_download_client() -> Result<reqwest::blocking::Client> {
+    Ok(reqwest::blocking::Client::builder()
+        .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
+        .timeout(DOWNLOAD_REQUEST_TIMEOUT)
         .user_agent(UPDATE_USER_AGENT)
         .build()?)
 }
 
 fn latest_release(client: &reqwest::blocking::Client) -> Result<PublicRelease> {
-    let url = format!("https://github.com/{RELEASE_REPOSITORY}/releases/latest");
-    latest_release_from_url(client, &url)
+    let public_url = format!("https://github.com/{RELEASE_REPOSITORY}/releases/latest");
+    let api_url = format!("https://api.github.com/repos/{RELEASE_REPOSITORY}/releases/latest");
+    latest_release_from_sources(client, &public_url, &api_url)
+}
+
+fn latest_release_from_sources(
+    client: &reqwest::blocking::Client,
+    public_url: &str,
+    api_url: &str,
+) -> Result<PublicRelease> {
+    let public_error = match latest_release_from_url(client, public_url) {
+        Ok(release) => return Ok(release),
+        Err(error) => error,
+    };
+    match latest_release_from_api(client, api_url) {
+        Ok(release) => Ok(release),
+        Err(api_error) => Err(format!(
+            "cannot query the latest public me release; public redirect failed: {public_error}; GitHub API fallback failed: {api_error}"
+        )
+        .into()),
+    }
 }
 
 fn latest_release_from_url(client: &reqwest::blocking::Client, url: &str) -> Result<PublicRelease> {
     let response = client
         .get(url)
         .send()
-        .map_err(|error| format!("cannot query the latest public me release: {error}"))?;
+        .map_err(|error| request_error("public release redirect", &error))?;
     let status = response.status();
     if !status.is_success() {
         let detail = response.text().unwrap_or_default();
@@ -122,6 +156,44 @@ fn latest_release_from_url(client: &reqwest::blocking::Client, url: &str) -> Res
     }
     let tag_name = release_tag_from_url(response.url())?;
     Ok(PublicRelease { tag_name })
+}
+
+fn latest_release_from_api(client: &reqwest::blocking::Client, url: &str) -> Result<PublicRelease> {
+    let response = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .map_err(|error| request_error("GitHub release API", &error))?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().unwrap_or_default();
+        return Err(format!("HTTP {status}{}", response_detail(&detail)).into());
+    }
+    let body = response
+        .json::<serde_json::Value>()
+        .map_err(|error| format!("invalid GitHub release response: {error}"))?;
+    let tag_name = body
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|tag| !tag.is_empty())
+        .ok_or("GitHub release response has no tag_name")?;
+    release_version(tag_name)?;
+    Ok(PublicRelease {
+        tag_name: tag_name.to_owned(),
+    })
+}
+
+fn request_error(operation: &str, error: &reqwest::Error) -> String {
+    let mut details = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(error) = source {
+        let detail = error.to_string();
+        if !detail.is_empty() && details.last() != Some(&detail) {
+            details.push(detail);
+        }
+        source = error.source();
+    }
+    format!("{operation}: {}", details.join(": "))
 }
 
 fn download_release(
@@ -567,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_release_uses_the_public_redirect_instead_of_the_github_api() {
+    fn latest_release_public_redirect_resolves_without_api_metadata() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -595,10 +667,91 @@ mod tests {
             .build()
             .unwrap();
 
-        let release =
-            latest_release_from_url(&client, &format!("http://{address}/releases/latest")).unwrap();
+        let release = latest_release_from_sources(
+            &client,
+            &format!("http://{address}/releases/latest"),
+            "http://127.0.0.1:9/api-must-not-be-called",
+        )
+        .unwrap();
         server.join().unwrap();
         assert_eq!(release.tag_name, "v0.0.274");
+    }
+
+    #[test]
+    fn latest_release_falls_back_to_the_api_after_a_public_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /latest "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndown",
+                )
+                .unwrap();
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /api/latest "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("accept: application/vnd.github+json")
+            );
+            let body = r#"{"tag_name":"v0.0.307"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let release = latest_release_from_sources(
+            &client,
+            &format!("http://{address}/latest"),
+            &format!("http://{address}/api/latest"),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(release.tag_name, "v0.0.307");
+    }
+
+    #[test]
+    fn metadata_checks_are_bounded_separately_from_large_downloads() {
+        assert_eq!(METADATA_CONNECT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(METADATA_REQUEST_TIMEOUT, Duration::from_secs(8));
+        assert!(DOWNLOAD_CONNECT_TIMEOUT > METADATA_CONNECT_TIMEOUT);
+        assert!(DOWNLOAD_REQUEST_TIMEOUT > METADATA_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn metadata_timeout_returns_a_diagnostic_error_instead_of_hanging() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(250));
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let error = latest_release_from_url(&client, &format!("http://{address}/latest"))
+            .unwrap_err()
+            .to_string();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("public release redirect"), "{error}");
+        assert!(error.to_ascii_lowercase().contains("timed out"), "{error}");
+        server.join().unwrap();
     }
 
     #[test]
