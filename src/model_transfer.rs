@@ -127,7 +127,14 @@ fn initialize_global_at(
 pub fn export_models(global: &GlobalConfig, password: &str) -> Result<ExportResult> {
     let output_directory = std::env::current_dir()?;
     let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
-    export_models_at(global, &output_directory, password, &timestamp)
+    let codex_auth_file = config_home()?.join("codex/auth.json");
+    export_models_at(
+        global,
+        &output_directory,
+        password,
+        &timestamp,
+        &codex_auth_file,
+    )
 }
 
 fn export_models_at(
@@ -135,6 +142,7 @@ fn export_models_at(
     output_directory: &Path,
     password: &str,
     timestamp: &str,
+    codex_auth_file: &Path,
 ) -> Result<ExportResult> {
     validate_password(password)?;
     global.validate()?;
@@ -150,13 +158,18 @@ fn export_models_at(
         });
     }
 
+    let codex_auth = read_optional_text(codex_auth_file)?
+        .filter(|content| !content.trim().is_empty())
+        .map(validate_codex_auth)
+        .transpose()?;
+    let codex_credential = codex_auth.is_some();
     let payload = ArchivePayload {
         version: PAYLOAD_VERSION,
         exported_at_ms: now_ms(),
         global_version: global.version,
         default_model: global.default_model.clone(),
         models,
-        codex_auth: None,
+        codex_auth,
     };
     let plaintext = serde_json::to_vec(&payload)?;
     let encrypted = encrypt(&plaintext, password)?;
@@ -166,7 +179,7 @@ fn export_models_at(
         file,
         models: global.models.len(),
         model_credentials,
-        codex_credential: false,
+        codex_credential,
     })
 }
 
@@ -214,6 +227,7 @@ fn import_models_at(home: &Path, file: &Path, password: &str) -> Result<ImportRe
         imported_models.push(model);
     }
 
+    let codex_auth = payload.codex_auth.map(validate_codex_auth).transpose()?;
     let imported = GlobalConfig {
         version: payload.global_version,
         default_model: payload.default_model,
@@ -261,7 +275,15 @@ fn import_models_at(home: &Path, file: &Path, password: &str) -> Result<ImportRe
     for (path, content) in &credential_writes {
         write_private_atomic(path, content)?;
     }
-    let codex_credential = false;
+    let codex_auth_file = home.join("codex/auth.json");
+    let codex_credential = if !codex_auth_file.exists()
+        && let Some(codex_auth) = codex_auth
+    {
+        write_private_atomic(&codex_auth_file, codex_auth.as_bytes())?;
+        true
+    } else {
+        false
+    };
     merged.save(&config_file)?;
 
     Ok(ImportResult {
@@ -272,6 +294,15 @@ fn import_models_at(home: &Path, file: &Path, password: &str) -> Result<ImportRe
         codex_credential,
         default_model: merged.default_model,
     })
+}
+
+fn validate_codex_auth(content: String) -> Result<String> {
+    let document: serde_json::Value =
+        serde_json::from_str(&content).map_err(|_| "Codex OAuth credential is not valid JSON")?;
+    if !document.is_object() {
+        return Err("Codex OAuth credential root must be a JSON object".into());
+    }
+    Ok(content)
 }
 
 fn effective_model_credential(model: &ModelConfig) -> Result<Option<String>> {
@@ -523,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_export_import_merges_models_but_keeps_codex_login_device_local() {
+    fn encrypted_export_import_merges_models_without_overwriting_target_codex_login() {
         let source = temporary_directory("source");
         let target = temporary_directory("target");
         let export_directory = temporary_directory("exports");
@@ -542,11 +573,15 @@ mod tests {
             default_model: "second".into(),
             models: vec![first, second],
         };
+        let source_auth = source.join("codex/auth.json");
+        let exported_auth = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"exported-oauth"}}"#;
+        write_private_atomic(&source_auth, exported_auth.as_bytes()).unwrap();
         let exported = export_models_at(
             &global,
             &export_directory,
             "correct horse battery staple",
             "20260728-160356",
+            &source_auth,
         )
         .unwrap();
         assert_eq!(
@@ -555,16 +590,21 @@ mod tests {
         );
         assert_eq!(exported.models, 2);
         assert_eq!(exported.model_credentials, 2);
-        assert!(!exported.codex_credential);
+        assert!(exported.codex_credential);
         let encrypted = fs::read(&exported.file).unwrap();
-        let mut payload: ArchivePayload =
+        let payload: ArchivePayload =
             serde_json::from_slice(&decrypt(&encrypted, "correct horse battery staple").unwrap())
                 .unwrap();
-        assert!(payload.codex_auth.is_none());
+        assert_eq!(payload.codex_auth.as_deref(), Some(exported_auth));
         assert!(
             !encrypted
                 .windows(b"shared-secret".len())
                 .any(|window| window == b"shared-secret")
+        );
+        assert!(
+            !encrypted
+                .windows(b"exported-oauth".len())
+                .any(|window| window == b"exported-oauth")
         );
         let mut old_second = model("second", "second-old");
         old_second.api_key = Some("old-secret".into());
@@ -581,21 +621,8 @@ mod tests {
         )
         .unwrap();
 
-        payload.codex_auth =
-            Some(r#"{"auth_mode":"chatgpt","tokens":{"access_token":"legacy-oauth"}}"#.into());
-        let legacy_export = export_directory.join("legacy-export-with-codex-auth");
-        write_private_new(
-            &legacy_export,
-            &encrypt(
-                &serde_json::to_vec(&payload).unwrap(),
-                "correct horse battery staple",
-            )
-            .unwrap(),
-        )
-        .unwrap();
-
         let imported =
-            import_models_at(&target, &legacy_export, "correct horse battery staple").unwrap();
+            import_models_at(&target, &exported.file, "correct horse battery staple").unwrap();
         assert_eq!(imported.added, 1);
         assert_eq!(imported.overwritten, 1);
         assert_eq!(imported.model_credentials, 2);
@@ -628,6 +655,34 @@ mod tests {
     }
 
     #[test]
+    fn import_restores_codex_login_only_when_target_has_none() {
+        let source = temporary_directory("codex-restore-source");
+        let target = temporary_directory("codex-restore-target");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let global = GlobalConfig {
+            version: 1,
+            default_model: "first".into(),
+            models: vec![model("first", "first-api")],
+        };
+        let source_auth = source.join("codex/auth.json");
+        let expected = r#"{"auth_mode":"chatgpt","tokens":{"access_token":"restored-oauth"}}"#;
+        write_private_atomic(&source_auth, expected.as_bytes()).unwrap();
+        let exported =
+            export_models_at(&global, &source, "password", "codex-restore", &source_auth).unwrap();
+
+        let imported = import_models_at(&target, &exported.file, "password").unwrap();
+        assert!(imported.codex_credential);
+        assert_eq!(
+            fs::read_to_string(target.join("codex/auth.json")).unwrap(),
+            expected
+        );
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(target).unwrap();
+    }
+
+    #[test]
     fn wrong_password_corruption_and_unsafe_reset_do_not_mutate_config() {
         let source = temporary_directory("failure-source");
         let target = temporary_directory("failure-target");
@@ -640,7 +695,14 @@ mod tests {
             default_model: "secured".into(),
             models: vec![secured],
         };
-        let exported = export_models_at(&global, &source, "right", "fixed").unwrap();
+        let exported = export_models_at(
+            &global,
+            &source,
+            "right",
+            "fixed",
+            &source.join("codex/auth.json"),
+        )
+        .unwrap();
         let existing = GlobalConfig {
             version: 1,
             default_model: "existing".into(),
@@ -666,7 +728,16 @@ mod tests {
         if let Some(home) = user_home() {
             assert!(ensure_safe_reset_target(&home).is_err());
         }
-        assert!(export_models_at(&global, &source, "", "empty-password").is_err());
+        assert!(
+            export_models_at(
+                &global,
+                &source,
+                "",
+                "empty-password",
+                &source.join("codex/auth.json"),
+            )
+            .is_err()
+        );
 
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(target).unwrap();
@@ -690,7 +761,14 @@ mod tests {
             default_model: "first".into(),
             models: vec![first, second],
         };
-        let exported = export_models_at(&global, &source, "password", "bootstrap").unwrap();
+        let exported = export_models_at(
+            &global,
+            &source,
+            "password",
+            "bootstrap",
+            &source.join("codex/auth.json"),
+        )
+        .unwrap();
 
         let existing_auth = target.join("codex/auth.json");
         write_private_atomic(

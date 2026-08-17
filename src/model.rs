@@ -688,7 +688,7 @@ mod tests {
         ModelConfig {
             name: "gpt-5.6-sol".into(),
             provider: ProviderType::CodexOauth,
-            reserve_output_context: false,
+            reserve_output_context: true,
             base_url: "https://chatgpt.com/backend-api/codex".into(),
             endpoint: "/responses".into(),
             api_key: None,
@@ -698,6 +698,8 @@ mod tests {
             source_url: None,
             timeout_seconds: 1,
             capabilities: ModelCapabilities {
+                context_window: 1_000_000,
+                max_output_tokens: Some(128_000),
                 reasoning_efforts: vec!["high".into()],
                 ..ModelCapabilities::default()
             },
@@ -731,7 +733,7 @@ mod tests {
         assert_eq!(api.output_token_reservation(Some("high")), 16);
 
         let mut codex = codex_config();
-        codex.parameters = toml::from_str("max_output_tokens = 999").unwrap();
+        codex.reserve_output_context = false;
         assert_eq!(
             ModelApi::new(codex)
                 .unwrap()
@@ -739,8 +741,15 @@ mod tests {
             0
         );
 
+        let capability_reserved = codex_config();
+        assert_eq!(
+            ModelApi::new(capability_reserved)
+                .unwrap()
+                .output_token_reservation(Some("high")),
+            128_000
+        );
+
         let mut explicitly_reserved = codex_config();
-        explicitly_reserved.reserve_output_context = true;
         explicitly_reserved.parameters = toml::from_str("max_output_tokens = 999").unwrap();
         assert_eq!(
             ModelApi::new(explicitly_reserved)

@@ -238,7 +238,7 @@ me model test example-model
 me model select-default example-model
 ```
 
-Codex OAuth 不需要手写预设。运行 `me codex login` 后，可用模型会自动出现在模型列表中。
+Codex OAuth 不需要手写预设。运行 `me codex login` 后，可用模型会自动出现在模型列表中。模型导出包会加密包含 Codex OAuth 凭据；导入时仅在当前设备尚未登录 Codex 时恢复，不会覆盖已有登录。
 
 ## 开发
 

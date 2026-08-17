@@ -348,7 +348,7 @@ fn model_configs(credential_file: PathBuf) -> Vec<ModelConfig> {
             ModelConfig {
                 name: name.to_owned(),
                 provider: ProviderType::CodexOauth,
-                reserve_output_context: false,
+                reserve_output_context: true,
                 base_url: CODEX_BASE_URL.to_owned(),
                 endpoint: "/responses".to_owned(),
                 api_key: None,
@@ -358,8 +358,8 @@ fn model_configs(credential_file: PathBuf) -> Vec<ModelConfig> {
                 source_url: Some(MODEL_SOURCE_URL.to_owned()),
                 timeout_seconds: 300,
                 capabilities: ModelCapabilities {
-                    context_window: 272_000,
-                    max_output_tokens: None,
+                    context_window: 1_000_000,
+                    max_output_tokens: Some(128_000),
                     input_modalities: vec!["text".into(), "image".into()],
                     output_modalities: vec!["text".into()],
                     reasoning_modes: Vec::new(),
@@ -751,13 +751,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             MODEL_NAMES
         );
-        assert_eq!(models[0].capabilities.context_window, 272_000);
+        assert_eq!(models[0].capabilities.context_window, 1_000_000);
         assert!(
             models
                 .iter()
-                .all(|model| model.capabilities.max_output_tokens.is_none())
+                .all(|model| model.capabilities.max_output_tokens == Some(128_000))
         );
-        assert_eq!(models[2].capabilities.context_window, 272_000);
+        assert_eq!(models[2].capabilities.context_window, 1_000_000);
+        assert!(models.iter().all(|model| model.reserve_output_context));
+        assert!(
+            models
+                .iter()
+                .all(|model| model.output_token_reservation(Some("unset")) == 128_000)
+        );
         assert!(models.iter().all(|model| model.parameters.is_empty()));
         assert!(
             models[0]
@@ -824,7 +830,7 @@ mod tests {
                 .models
                 .iter()
                 .filter(|model| model.provider == ProviderType::CodexOauth)
-                .all(|model| model.api_key.is_none() && !model.reserve_output_context)
+                .all(|model| model.api_key.is_none() && model.reserve_output_context)
         );
 
         fs::remove_dir_all(directory).unwrap();

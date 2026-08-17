@@ -125,6 +125,7 @@ impl ModelConfig {
             .and_then(|effort| self.effort_parameters.get(effort))
             .and_then(request_output_limit)
             .or_else(|| request_output_limit(&self.parameters))
+            .or(self.capabilities.max_output_tokens)
             .unwrap_or(0)
     }
 }
