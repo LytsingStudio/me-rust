@@ -994,6 +994,7 @@ struct ContextUsageBreakdown {
     reserve: u64,
     values: ContextTokenValues,
     compact_content: Option<String>,
+    compact_analysis: Option<String>,
     memory_content: Option<String>,
     can_clear: bool,
 }
@@ -2296,7 +2297,7 @@ pub fn run(
                                 return Err("context action requires its context panel".into());
                             };
                             let content = match action {
-                                ContextAction::CompactDetail => breakdown.compact_content.clone(),
+                                ContextAction::CompactDetail => compact_detail_content(&breakdown),
                                 ContextAction::MemoryDetail => breakdown.memory_content.clone(),
                                 ContextAction::Clear => None,
                             }
@@ -5009,11 +5010,24 @@ fn estimate_context_breakdown(
     can_clear: bool,
 ) -> Result<ContextUsageBreakdown> {
     let effective = effective_conversation_events(events)?;
-    let compact_content = effective.iter().find_map(|event| match event {
+    let current_compact = effective.iter().find_map(|event| match event {
         Event::CompactStateUpdate(update) if update.state == CompactState::Completed => {
-            Some(update.content.clone())
+            Some((update.compact_id, update.content.clone()))
         }
         _ => None,
+    });
+    let compact_content = current_compact.as_ref().map(|(_, content)| content.clone());
+    let compact_analysis = current_compact.as_ref().and_then(|(compact_id, _)| {
+        events.iter().find_map(|event| match event {
+            Event::CompactStateUpdate(update)
+                if update.compact_id == *compact_id
+                    && update.state == CompactState::StageCompleted
+                    && update.stage == Some(crate::event::CompactStage::Analysis) =>
+            {
+                Some(update.content.clone())
+            }
+            _ => None,
+        })
     });
     let Some(usage) = usage else {
         return Ok(ContextUsageBreakdown {
@@ -5022,6 +5036,7 @@ fn estimate_context_breakdown(
             reserve,
             values: ContextTokenValues::default(),
             compact_content,
+            compact_analysis,
             memory_content,
             can_clear,
         });
@@ -5036,6 +5051,7 @@ fn estimate_context_breakdown(
                 ..ContextTokenValues::default()
             },
             compact_content,
+            compact_analysis,
             memory_content,
             can_clear,
         });
@@ -5056,6 +5072,7 @@ fn estimate_context_breakdown(
             reserve,
             values: estimate.values.into(),
             compact_content: compact_content.clone(),
+            compact_analysis: compact_analysis.clone(),
             memory_content: compact_content
                 .is_some()
                 .then_some(memory_content)
@@ -5072,11 +5089,20 @@ fn estimate_context_breakdown(
             ..ContextTokenValues::default()
         },
         compact_content: compact_content.clone(),
+        compact_analysis,
         memory_content: compact_content
             .is_some()
             .then_some(memory_content)
             .flatten(),
         can_clear,
+    })
+}
+
+fn compact_detail_content(breakdown: &ContextUsageBreakdown) -> Option<String> {
+    let summary = breakdown.compact_content.as_ref()?;
+    Some(match breakdown.compact_analysis.as_deref() {
+        Some(analysis) => format!("## Analysis\n\n{analysis}\n\n---\n\n## 压缩摘要\n\n{summary}"),
+        None => format!("## 压缩摘要\n\n{summary}"),
     })
 }
 
@@ -9653,15 +9679,26 @@ mod tests {
         edb.append_tool_result(compact_call, ToolResultState::Succeeded, None, "ok")
             .unwrap();
         let compact = edb
-            .append_compact_started(compact_call, first, CompactKind::WorkerSingleTurn)
+            .append_compact_started(compact_call, first, CompactKind::MainAgentMultiTurn)
             .unwrap();
-        edb.append_compact_terminal(
-            compact,
-            CompactState::Completed,
-            "## Summary\nkept state",
-            "",
-        )
-        .unwrap();
+        let compact_stages = [
+            "reviewed earlier context before producing the summary",
+            "1. Primary Request and Intent\nintent",
+            "2. Key Technical Context and Decisions\ndecisions",
+            "3. Files, Code, and Artifacts\nfiles",
+            "4. Problems, Investigations, and Resolutions\nproblems",
+            "5. Current State and Continuation Plan\nnext",
+        ];
+        for (stage, content) in crate::event::CompactStage::MULTI_TURN
+            .into_iter()
+            .zip(compact_stages)
+        {
+            edb.append_compact_stage(compact, stage, content).unwrap();
+        }
+        let compact_summary =
+            crate::compact::merge_multi_turn_summary(compact_stages.into_iter().skip(1));
+        edb.append_compact_terminal(compact, CompactState::Completed, compact_summary, "")
+            .unwrap();
 
         let second = edb.append_user_prompt("second request").unwrap();
         let tool_api = edb.append_api_requesting(second).unwrap();
@@ -9731,8 +9768,15 @@ mod tests {
                 .compact_content
                 .as_deref()
                 .unwrap()
-                .contains("Summary")
+                .contains("Primary Request")
         );
+        assert_eq!(
+            breakdown.compact_analysis.as_deref(),
+            Some("reviewed earlier context before producing the summary")
+        );
+        let detail = compact_detail_content(&breakdown).unwrap();
+        assert!(detail.starts_with("## Analysis\n\nreviewed earlier context"));
+        assert!(detail.contains("## 压缩摘要\n\n1. Primary Request and Intent"));
         assert!(
             breakdown
                 .memory_content
@@ -9796,6 +9840,7 @@ mod tests {
                 ..ContextTokenValues::default()
             },
             compact_content: Some("summary".into()),
+            compact_analysis: Some("analysis".into()),
             memory_content: None,
             can_clear: false,
         };

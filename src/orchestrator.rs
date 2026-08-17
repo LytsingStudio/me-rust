@@ -12050,7 +12050,7 @@ data: [DONE]
             drop(trigger);
 
             let stages = [
-                "preparation analysis for compressed-state-marker",
+                "ANALYSIS-ONLY-MARKER preparation analysis for compressed-state-marker",
                 "1. Primary Request and Intent\ncompressed-state-marker",
                 "2. Key Technical Context and Decisions\nkeep architecture",
                 "3. Files, Code, and Artifacts\nkeep files",
@@ -12073,6 +12073,7 @@ data: [DONE]
                 assert!(summary_json.contains("source of information, never as a template"));
                 if index > 0 {
                     assert!(summary_json.contains("preparation analysis"));
+                    assert!(summary_json.contains("ANALYSIS-ONLY-MARKER"));
                 }
                 write_sse_content(&mut summary, content);
             }
@@ -12082,6 +12083,7 @@ data: [DONE]
             let continuation_json = continuation_request.to_string();
             assert!(continuation_json.contains("compact_summary"));
             assert!(continuation_json.contains("compressed-state-marker"));
+            assert!(!continuation_json.contains("ANALYSIS-ONLY-MARKER"));
             assert!(continuation_json.contains("call WorkMap.Read"));
             assert!(
                 continuation_json

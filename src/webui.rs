@@ -1602,9 +1602,15 @@ mod tests {
         assert!(APP_JS.contains("category.key !== \"compact\" || hasCompact"));
         assert!(APP_JS.contains("category.key !== \"memory\" || hasMemory"));
         assert!(APP_JS.contains("state.contextCompactContent"));
+        assert!(APP_JS.contains("state.contextCompactAnalysis"));
         assert!(APP_JS.contains("state.contextMemoryContent"));
+        assert!(APP_JS.contains("function latestCompactPreview(events)"));
+        assert!(APP_JS.contains("value.stage === \"Analysis\""));
+        assert!(APP_JS.contains("function compactPreviewMarkdown(analysis, summary)"));
+        assert!(APP_JS.contains("## Analysis"));
+        assert!(APP_JS.contains("## 压缩摘要"));
         assert!(APP_JS.contains("pre.textContent = content"));
-        assert!(APP_JS.contains("openContextDetail(\"上下文压缩\""));
+        assert!(APP_JS.contains("\"上下文压缩\","));
         assert!(APP_JS.contains("openContextDetail(\"记忆\""));
         assert!(STYLE_CSS.contains(".context-ring-segment"));
         assert!(STYLE_CSS.contains(".context-percent"));

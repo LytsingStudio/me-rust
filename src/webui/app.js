@@ -49,6 +49,7 @@ const state = {
   contextDrawerOpen: false,
   contextDrawerSignature: null,
   contextCompactContent: null,
+  contextCompactAnalysis: null,
   contextMemoryContent: null,
   authRequired: false,
   authenticated: false,
@@ -2442,16 +2443,28 @@ function latestCommittedUsageBoundary(events, expectedUsage) {
   return events.findIndex((event) => eventParts(event)[1].id === boundary.id);
 }
 
+function latestCompactPreview(events) {
+  const completed = effectiveConversationEvents(events)
+    .map(eventParts)
+    .find(([kind, value]) => kind === "CompactStateUpdate" && value.state === "Completed")?.[1];
+  if (!completed) return { content: null, analysis: null };
+  const analysis = events.map(eventParts).find(([kind, value]) =>
+    kind === "CompactStateUpdate"
+      && value.compact_id === completed.compact_id
+      && value.state === "StageCompleted"
+      && value.stage === "Analysis")?.[1].content ?? null;
+  return { content: completed.content, analysis };
+}
+
 function estimateContextBreakdown(events, usage, memoryContent) {
   const empty = { system: 0, compact: 0, memory: 0, user: 0, model: 0, tool: 0 };
-  const currentCompact = effectiveConversationEvents(events)
-    .map(eventParts)
-    .find(([kind, value]) => kind === "CompactStateUpdate" && value.state === "Completed");
-  const currentCompactContent = currentCompact?.[1].content ?? null;
+  const currentCompact = latestCompactPreview(events);
+  const currentCompactContent = currentCompact.content;
+  const currentCompactAnalysis = currentCompact.analysis;
   const total = Number(usage?.total_tokens);
-  if (!Number.isFinite(total) || total < 0) return { total: null, values: empty, compactContent: currentCompactContent, memoryContent };
+  if (!Number.isFinite(total) || total < 0) return { total: null, values: empty, compactContent: currentCompactContent, compactAnalysis: currentCompactAnalysis, memoryContent };
   const boundary = latestCommittedUsageBoundary(events, usage);
-  if (boundary == null || boundary < 0) return { total, values: { ...empty, system: total }, compactContent: currentCompactContent, memoryContent };
+  if (boundary == null || boundary < 0) return { total, values: { ...empty, system: total }, compactContent: currentCompactContent, compactAnalysis: currentCompactAnalysis, memoryContent };
   const boundaryId = eventParts(events[boundary])[1].id;
   const persistedEstimate = events.map(eventParts).find(([kind, value]) =>
     kind === "ContextUsageEstimate" && value.api_state_event_id === boundaryId)?.[1];
@@ -2470,6 +2483,7 @@ function estimateContextBreakdown(events, usage, memoryContent) {
         total,
         values,
         compactContent: currentCompactContent,
+        compactAnalysis: currentCompactAnalysis,
         memoryContent: currentCompactContent === null ? null : memoryContent,
       };
     }
@@ -2478,6 +2492,7 @@ function estimateContextBreakdown(events, usage, memoryContent) {
     total,
     values: { ...empty, system: total },
     compactContent: currentCompactContent,
+    compactAnalysis: currentCompactAnalysis,
     memoryContent: currentCompactContent === null ? null : memoryContent,
   };
 }
@@ -2486,13 +2501,14 @@ function renderContextDrawer() {
   const projection = currentProjection();
   const model = state.snapshot.models.find((candidate) => candidate.name === projection.model);
   const limit = Number(model?.context_window);
-  const { total, values: usageValues, compactContent, memoryContent } = estimateContextBreakdown(currentStore()?.events || [], projection.apiUsage, currentStore()?.turnHistory ?? null);
+  const { total, values: usageValues, compactContent, compactAnalysis, memoryContent } = estimateContextBreakdown(currentStore()?.events || [], projection.apiUsage, currentStore()?.turnHistory ?? null);
   const configuredReserve = Number(model?.output_token_reservations?.[projection.effort] ?? 0);
   const outputReserve = Number.isFinite(configuredReserve) && configuredReserve > 0 ? configuredReserve : 0;
   const values = { ...usageValues, reserve: outputReserve };
   const hasCompact = compactContent !== null;
   const hasMemory = memoryContent !== null;
   state.contextCompactContent = compactContent;
+  state.contextCompactAnalysis = compactAnalysis;
   state.contextMemoryContent = memoryContent;
   const validLimit = Number.isFinite(limit) && limit > 0 ? limit : null;
   const percent = total == null || !validLimit ? null : total / validLimit * 100;
@@ -2543,6 +2559,7 @@ function closeContextDrawer() {
   state.contextDrawerOpen = false;
   state.contextDrawerSignature = null;
   state.contextCompactContent = null;
+  state.contextCompactAnalysis = null;
   state.contextMemoryContent = null;
   elements.statusContextTrigger.setAttribute("aria-expanded", "false");
   elements.contextDrawerBackdrop.classList.add("hidden");
@@ -2561,6 +2578,13 @@ function openContextDetail(title, content, markdown = false) {
   }
   elements.compactSummaryBackdrop.classList.remove("hidden");
   elements.compactSummaryClose.focus();
+}
+
+function compactPreviewMarkdown(analysis, summary) {
+  const sections = [];
+  if (analysis !== null) sections.push(`## Analysis\n\n${analysis}`);
+  sections.push(`## 压缩摘要\n\n${summary}`);
+  return sections.join("\n\n---\n\n");
 }
 
 function closeCompactSummary() {
@@ -3278,7 +3302,11 @@ elements.contextDrawerBackdrop.addEventListener("click", (event) => { if (event.
 elements.contextBreakdown.addEventListener("click", (event) => {
   const button = event.target.closest(".context-detail-help");
   if (button?.dataset.detail === "compact" && state.contextCompactContent !== null) {
-    openContextDetail("上下文压缩", state.contextCompactContent, true);
+    openContextDetail(
+      "上下文压缩",
+      compactPreviewMarkdown(state.contextCompactAnalysis, state.contextCompactContent),
+      true,
+    );
   } else if (button?.dataset.detail === "memory" && state.contextMemoryContent !== null) {
     openContextDetail("记忆", state.contextMemoryContent);
   }
