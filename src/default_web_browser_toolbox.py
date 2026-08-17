@@ -627,15 +627,43 @@ class DependencyRuntime:
                 f"invalid PySide6 dependency version: {getattr(pyside, '__version__', None)!r}",
                 True,
             )
-        if not self.browser_marker.is_file():
+        if not self.browser_is_valid():
+            self.browser_marker.unlink(missing_ok=True)
             with install_lock(self.runtime_root, progress):
-                if not self.browser_marker.is_file():
+                if not self.browser_is_valid():
                     progress(
                         "Installing Camoufox browser "
                         f"{CAMOUFOX_BROWSER_VERSION} in ME-RUST global storage"
                     )
                     self._install_browser()
         self._cleanup_legacy_runtime()
+
+    def browser_executable(self) -> Path | None:
+        try:
+            from camoufox.multiversion import get_active_path
+            from camoufox.pkgman import launch_path
+
+            active = get_active_path()
+            if active is None:
+                return None
+            metadata = json.loads((active / "version.json").read_text(encoding="utf-8"))
+            if (
+                metadata.get("version") != CAMOUFOX_BROWSER_VERSION.rsplit("-", 1)[0]
+                or metadata.get("build") != CAMOUFOX_BROWSER_VERSION.rsplit("-", 1)[1]
+            ):
+                return None
+            executable = Path(launch_path(active))
+            properties = (
+                active / "Camoufox.app" / "Contents" / "Resources" / "properties.json"
+                if platform.system() == "Darwin"
+                else active / "properties.json"
+            )
+            return executable if executable.is_file() and properties.is_file() else None
+        except (ImportError, OSError, ValueError, TypeError, KeyError):
+            return None
+
+    def browser_is_valid(self) -> bool:
+        return self.browser_marker.is_file() and self.browser_executable() is not None
 
     def _install_package(self) -> None:
         parent = self.site_packages.parent
@@ -722,6 +750,16 @@ class DependencyRuntime:
             ) from exc
         if completed.returncode != 0:
             raise ToolError("browser_install_failed", command_error(command, completed), True)
+        executable = self.browser_executable()
+        if executable is None:
+            details = command_error(command, completed)
+            raise ToolError(
+                "browser_install_failed",
+                "Camoufox reported success without installing the requested browser. "
+                "This usually means its repository request failed.\n"
+                + details,
+                True,
+            )
         self.browser_marker.write_text(
             json.dumps(
                 {
@@ -2001,6 +2039,7 @@ class BrowserRuntime:
         self.human_action_active = False
 
     def _launch(self) -> None:
+        from camoufox.addons import ADDONS_DIR, DefaultAddons
         from camoufox.sync_api import Camoufox
 
         target_os = host_fingerprint_os()
@@ -2014,10 +2053,24 @@ class BrowserRuntime:
         fingerprint_preset, webgl_config = compatible_fingerprint_preset(target_os)
         presentation = create_browser_presentation(test_headless)
         presentation.start()
+        executable = self.dependencies.browser_executable()
+        if executable is None:
+            presentation.shutdown()
+            raise ToolError(
+                "browser_unavailable",
+                "the verified Camoufox browser executable is unavailable; retry Create to repair it",
+                True,
+            )
+        ubo_manifest = Path(ADDONS_DIR) / DefaultAddons.UBO.name / "manifest.json"
+        excluded_addons = [] if ubo_manifest.is_file() else list(DefaultAddons)
         manager = None
         try:
             manager = Camoufox(
+                # A validated, installed version name keeps Camoufox's own path
+                # layout handling intact without permitting an implicit download.
                 browser=CAMOUFOX_BROWSER_VERSION,
+                ff_version=int(CAMOUFOX_BROWSER_VERSION.split(".", 1)[0]),
+                exclude_addons=excluded_addons,
                 headless=test_headless,
                 os=target_os,
                 fingerprint_preset=fingerprint_preset,

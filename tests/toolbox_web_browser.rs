@@ -208,6 +208,28 @@ assert not lock.exists()
 os.environ["ME_WEB_BROWSER_TEST_CREATE_TIMEOUT_MS"] = "321"
 assert module.request_hard_timeout_ms({"cmd": "execute", "tool": "Create", "input": {}}) == 321
 assert module.request_hard_timeout_ms({"cmd": "execute", "tool": "RequireHumanAction", "input": {}}) is None
+
+os.environ["ME_CONFIG_HOME"] = str(root / "global")
+runtime = module.DependencyRuntime()
+runtime.browser_marker.parent.mkdir(parents=True, exist_ok=True)
+runtime.browser_marker.write_text("false success", encoding="utf-8")
+assert not runtime.browser_is_valid(), "a marker without a browser must not be trusted"
+
+original_run = module.subprocess.run
+module.subprocess.run = lambda *args, **kwargs: module.subprocess.CompletedProcess(
+    args[0], 0, "repository sync failed", ""
+)
+runtime.browser_executable = lambda: None
+try:
+    runtime._install_browser()
+except module.ToolError as error:
+    assert error.code == "browser_install_failed"
+    assert "reported success without installing" in error.message
+    assert "repository sync failed" in error.message
+else:
+    raise AssertionError("a false-success Camoufox fetch was accepted")
+finally:
+    module.subprocess.run = original_run
 print("ok")
 "#;
     let output = Command::new(python)
@@ -263,6 +285,9 @@ fn generated_web_browser_describes_the_raw_snapshot_protocol_without_installing(
     assert!(source.contains("boxes=True"));
     assert!(source.contains("aria-ref="));
     assert!(source.contains("operation_timeout"));
+    assert!(source.contains("executable = self.dependencies.browser_executable()"));
+    assert!(source.contains("browser=CAMOUFOX_BROWSER_VERSION"));
+    assert!(source.contains("Camoufox reported success without installing"));
     assert!(!source.contains("READABLE_MARKDOWN_JS"));
     assert!(!source.contains("INTERACTIVE_SELECTOR"));
     assert!(!source.contains("save_img"));
