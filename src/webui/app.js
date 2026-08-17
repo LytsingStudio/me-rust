@@ -63,6 +63,7 @@ const state = {
   syncWatchdog: null,
   reconnectTimer: null,
   reconnectAttempt: 0,
+  connectionFailure: null,
   nextRequestId: 1,
   pendingSocketRequests: new Map(),
   terminalFrames: new Map(),
@@ -151,6 +152,11 @@ const elements = {
 function eventParts(event) {
   const entry = Object.entries(event)[0];
   return entry || ["Unknown", {}];
+}
+
+function replaceElementChildren(element, ...children) {
+  while (element.firstChild) element.removeChild(element.firstChild);
+  for (const child of children) element.appendChild(child);
 }
 
 function agentMeta() {
@@ -272,6 +278,7 @@ function connectRealtime() {
   state.reconnectTimer = null;
   state.connected = false;
   state.connecting = true;
+  state.connectionFailure = null;
   renderConnection();
   showConnectionOverlay(
     state.reconnectAttempt ? "正在重新连接" : "正在连接",
@@ -292,10 +299,10 @@ function connectRealtime() {
     handleRealtimeMessage(event.data);
   });
   socket.addEventListener("error", () => {
-    if (generation === state.socketGeneration) socket.close();
+    if (generation === state.socketGeneration) state.connectionFailure = "WebSocket 连接发生错误";
   });
-  socket.addEventListener("close", () => {
-    if (generation === state.socketGeneration) handleRealtimeDisconnect();
+  socket.addEventListener("close", (event) => {
+    if (generation === state.socketGeneration) handleRealtimeDisconnect(event);
   });
 }
 
@@ -314,7 +321,7 @@ function stopRealtime() {
   rejectPendingSocketRequests("连接已关闭，操作状态未知");
 }
 
-function handleRealtimeDisconnect() {
+function handleRealtimeDisconnect(event = null) {
   clearTimeout(state.syncTimer);
   clearTimeout(state.syncWatchdog);
   state.syncTimer = null;
@@ -330,7 +337,7 @@ function handleRealtimeDisconnect() {
   const delay = Math.min(RECONNECT_MAX_MS, 250 * (2 ** Math.min(state.reconnectAttempt - 1, 5)));
   showConnectionOverlay(
     "正在重新连接",
-    `连接已断开，将在 ${Math.max(1, Math.ceil(delay / 1000))} 秒内重试。`,
+    `${state.connectionFailure || websocketCloseDescription(event)}，将在 ${Math.max(1, Math.ceil(delay / 1000))} 秒内重试。`,
   );
   const generation = state.socketGeneration;
   state.reconnectTimer = setTimeout(async () => {
@@ -349,6 +356,34 @@ function handleRealtimeDisconnect() {
     }
     connectRealtime();
   }, delay);
+}
+
+function websocketCloseDescription(event) {
+  if (event?.reason) return `连接已断开：${event.reason}`;
+  if (event?.code && event.code !== 1006) return `连接已断开（代码 ${event.code}）`;
+  return "连接已断开";
+}
+
+function failRealtime(title, error) {
+  const detail = error instanceof Error ? error.message : String(error || "未知错误");
+  console.error(title, error);
+  clearTimeout(state.syncTimer);
+  clearTimeout(state.syncWatchdog);
+  clearTimeout(state.reconnectTimer);
+  state.syncTimer = null;
+  state.syncWatchdog = null;
+  state.reconnectTimer = null;
+  state.syncInFlight = false;
+  state.connected = false;
+  state.connecting = false;
+  state.connectionFailure = detail;
+  const socket = state.socket;
+  state.socketGeneration += 1;
+  state.socket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(4001, "webui sync failed");
+  rejectPendingSocketRequests("界面同步失败，操作状态未知");
+  renderConnection();
+  showConnectionOverlay(title, `${detail}。请点击“立即重试”。`);
 }
 
 function rejectPendingSocketRequests(message) {
@@ -396,10 +431,13 @@ function requestRealtimeSync() {
       terminal_revision: terminalKey ? state.terminalRevisions.get(terminalKey) ?? null : null,
     }));
     clearTimeout(state.syncWatchdog);
-    state.syncWatchdog = setTimeout(() => state.socket?.close(), REALTIME_SYNC_TIMEOUT_MS);
-  } catch (_) {
+    state.syncWatchdog = setTimeout(() => {
+      state.connectionFailure = "界面同步超时";
+      state.socket?.close();
+    }, REALTIME_SYNC_TIMEOUT_MS);
+  } catch (error) {
     state.syncInFlight = false;
-    state.socket?.close();
+    failRealtime("无法发送同步请求", error);
   }
 }
 
@@ -412,16 +450,16 @@ function requestRealtimeSyncNow() {
 function handleRealtimeMessage(raw) {
   let message;
   try { message = JSON.parse(raw); }
-  catch (_) { return state.socket?.close(); }
+  catch (error) { return failRealtime("无法解析界面数据", error); }
   if (message.type === "state") {
     clearTimeout(state.syncWatchdog);
     state.syncWatchdog = null;
     state.syncInFlight = false;
     try {
       applyRealtimeState(message);
-      scheduleRealtimeSync();
-    } catch (_) {
-      state.socket?.close();
+      scheduleRealtimeSync(message.more_events ? 0 : REALTIME_SYNC_MS);
+    } catch (error) {
+      failRealtime("无法更新界面", error);
     }
     return;
   }
@@ -429,7 +467,7 @@ function handleRealtimeMessage(raw) {
     clearTimeout(state.syncWatchdog);
     state.syncWatchdog = null;
     state.syncInFlight = false;
-    return state.socket?.close();
+    return failRealtime("界面同步失败", message.error || "服务端未能生成界面状态");
   }
   if (message.type === "command_result" || message.type === "query_result") {
     const pending = state.pendingSocketRequests.get(Number(message.request_id));
@@ -440,7 +478,7 @@ function handleRealtimeMessage(raw) {
     requestRealtimeSyncNow();
     return;
   }
-  state.socket?.close();
+  failRealtime("界面协议错误", `无法识别服务端消息：${message.type || "unknown"}`);
 }
 
 function sendSocketQuery(type, fields = {}) {
@@ -561,7 +599,7 @@ function syncApiActivity(next) {
 
 function requestRender(update) {
   for (const key of Object.keys(state.pendingRender)) {
-    state.pendingRender[key] ||= Boolean(update[key]);
+    if (!state.pendingRender[key]) state.pendingRender[key] = Boolean(update[key]);
   }
 }
 
@@ -644,7 +682,9 @@ function syncAgentEvents(meta, payload) {
     observePromptSubmission(meta, store);
     return { agentId: meta.id, changed, summaryChanged: false };
   }
-  if (!payload) throw new Error(`Agent ${meta.id} 的增量状态不完整`);
+  // A large initial replay is transferred in bounded batches. Agents without a
+  // batch in this response remain pending and are requested again immediately.
+  if (!payload) return { agentId: meta.id, changed, summaryChanged: false };
   const previousSummary = JSON.stringify(store.summary);
   if (payload.reset) {
     store.events = payload.events;
@@ -970,7 +1010,8 @@ function consumeChatEvents(projection, events) {
         if (stateName === "completed") {
           const assistant = projection._lastAssistantByPrompt.get(value.prompt_id);
           const started = projection._turnStartedAt.get(value.prompt_id);
-          if (assistant && started != null && projection.messages.at(-1) === assistant
+          if (assistant && started != null
+              && projection.messages[projection.messages.length - 1] === assistant
               && assistant.content.trim()) {
             appendProjectedMessage(projection, changes, {
               key: `turn-toolbar:${value.turn_id}`, revision: value.id, kind: "turn-toolbar",
@@ -1492,8 +1533,10 @@ function createTranscriptBottomFollower(viewport, content, onPositionChange, run
   const cancelFrame = runtime.cancelFrame || ((id) => cancelAnimationFrame(id));
   const setDelay = runtime.setDelay || ((callback, delay) => setTimeout(callback, delay));
   const clearDelay = runtime.clearDelay || ((id) => clearTimeout(id));
-  const createResizeObserver = runtime.createResizeObserver
-    || ((callback) => new ResizeObserver(callback));
+  const createResizeObserver = runtime.createResizeObserver || ((callback) => {
+    if (typeof ResizeObserver === "function") return new ResizeObserver(callback);
+    return { observe() {}, disconnect() {} };
+  });
   const threshold = runtime.threshold ?? TRANSCRIPT_BOTTOM_THRESHOLD_PX;
   let following = true;
   let interacting = false;
@@ -1588,7 +1631,7 @@ function renderAgents() {
     }
     return;
   }
-  if (elements.agents.querySelector(":scope > .empty-state")) elements.agents.replaceChildren();
+  if (elements.agents.querySelector(":scope > .empty-state")) replaceElementChildren(elements.agents);
   for (let index = 0; index < agents.length; index += 1) {
     const agent = agents[index];
     const summary = state.stores.get(agent.id)?.summary;
@@ -1721,12 +1764,14 @@ function renderTranscript(forceFull = false, changedFrom = 0) {
     }
     return;
   }
-  if (forceFull) elements.transcriptContent.replaceChildren();
+  if (forceFull) replaceElementChildren(elements.transcriptContent);
   reconcileTranscript(messages, forceFull ? 0 : changedFrom);
 }
 
 function reconcileTranscript(messages, changedFrom = 0) {
-  if (elements.transcriptContent.querySelector(":scope > .empty-state")) elements.transcriptContent.replaceChildren();
+  if (elements.transcriptContent.querySelector(":scope > .empty-state")) {
+    replaceElementChildren(elements.transcriptContent);
+  }
   const start = Math.max(0, Math.min(changedFrom, messages.length));
   let previousKind = previousVisibleRenderedKind(start);
   for (let index = start; index < messages.length; index += 1) {
@@ -2574,7 +2619,7 @@ function openContextDetail(title, content, markdown = false) {
     const pre = document.createElement("pre");
     pre.className = "context-detail-raw";
     pre.textContent = content;
-    elements.compactSummaryContent.replaceChildren(pre);
+    replaceElementChildren(elements.compactSummaryContent, pre);
   }
   elements.compactSummaryBackdrop.classList.remove("hidden");
   elements.compactSummaryClose.focus();
@@ -2589,7 +2634,7 @@ function compactPreviewMarkdown(analysis, summary) {
 
 function closeCompactSummary() {
   elements.compactSummaryBackdrop.classList.add("hidden");
-  elements.compactSummaryContent.replaceChildren();
+  replaceElementChildren(elements.compactSummaryContent);
 }
 
 function confirmContextClear() {
@@ -3156,9 +3201,9 @@ function planSymbol(value) { return ({ planned: "□", active: "■", completed:
 function objectiveSymbol(value) { return ({ active: "■", completed: "✓", cancelled: "×", superseded: "×" })[normalize(value)] || "·"; }
 function memoryLabel(memory) {
   if (memory.kind === "agreement") return "AGREEMENT";
-  return `FACT${memory.basis ? ` · ${memory.basis.replaceAll("_", " ").toUpperCase()}` : ""}`;
+  return `FACT${memory.basis ? ` · ${memory.basis.split("_").join(" ").toUpperCase()}` : ""}`;
 }
-function normalize(value) { return String(value || "").replace(/([a-z])([A-Z])/g, "$1-$2").replaceAll("_", "-").toLowerCase(); }
+function normalize(value) { return String(value || "").replace(/([a-z])([A-Z])/g, "$1-$2").split("_").join("-").toLowerCase(); }
 function collapse(value) { return String(value || "").trim().replace(/\s+/g, " ").slice(0, 120); }
 function formatBytes(value) { if (value < 1024) return `${value} B`; if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KiB`; return `${(value / 1024 ** 2).toFixed(1)} MiB`; }
 function formatDuration(ms) { if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`; return `${(ms / 1000).toFixed(ms % 1000 ? 1 : 0)}s`; }
@@ -3185,9 +3230,10 @@ function formatTurnCompletedAt(timestamp, now = Date.now()) {
 
 function completedTurnContextGrowth(completedApiUsage, promptId, contextBaseline) {
   const calls = [...completedApiUsage.values()].filter((entry) => entry.promptId === promptId);
-  if (!calls.length || !calls[0].usage || !calls.at(-1).usage) return null;
+  const latest = calls[calls.length - 1];
+  if (!calls.length || !calls[0].usage || !latest.usage) return null;
   const baseline = contextBaseline ?? calls[0].usage.input_tokens;
-  return Math.max(0, Number(calls.at(-1).usage.total_tokens) - Number(baseline));
+  return Math.max(0, Number(latest.usage.total_tokens) - Number(baseline));
 }
 
 function formatTurnTokens(tokens) {
@@ -3226,7 +3272,11 @@ elements.addAgent.addEventListener("click", () => { closeMobileSidebar(); openAd
 elements.mobileDeleteAgent.addEventListener("click", () => { closeMobileSidebar(); openDeleteAgent(); });
 elements.mobileSidebarToggle.addEventListener("click", openMobileSidebar);
 elements.mobileSidebarBackdrop.addEventListener("click", closeMobileSidebar);
-PORTRAIT_LAYOUT.addEventListener("change", closeMobileSidebar);
+if (typeof PORTRAIT_LAYOUT.addEventListener === "function") {
+  PORTRAIT_LAYOUT.addEventListener("change", closeMobileSidebar);
+} else if (typeof PORTRAIT_LAYOUT.addListener === "function") {
+  PORTRAIT_LAYOUT.addListener(closeMobileSidebar);
+}
 elements.deleteAgentMenu.addEventListener("click", () => {
   const menu = state.agentMenu;
   closeAgentMenu();

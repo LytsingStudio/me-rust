@@ -39,6 +39,7 @@ const MARKDOWN_IT_JS: &str = include_str!("webui/vendor/markdown-it.min.js");
 const STYLE_CSS: &str = include_str!("webui/style.css");
 const MAX_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_WEBSOCKET_MESSAGE_BYTES: usize = MAX_COMMAND_BYTES + 64 * 1024;
+const MAX_EVENT_BATCH_BYTES: usize = 512 * 1024;
 const MAX_LOGIN_BYTES: usize = 4096;
 const SESSION_COOKIE: &str = "me_webui_session";
 
@@ -438,12 +439,23 @@ fn websocket_state_payload(
 ) -> Result<serde_json::Value> {
     let snapshot = backend.snapshot()?;
     let snapshot_changed = snapshot_revision != Some(snapshot.revision);
+    let selected_agent = selected_agent
+        .map(AgentId::new)
+        .transpose()?
+        .filter(|agent| snapshot.contains(agent));
     let cursors = cursors
         .into_iter()
         .map(|cursor| (cursor.id.clone(), cursor))
         .collect::<HashMap<_, _>>();
     let mut event_updates = Vec::new();
-    for agent in &snapshot.agents {
+    let mut remaining_event_bytes = MAX_EVENT_BATCH_BYTES;
+    let mut more_events = false;
+    let mut agent_indexes = (0..snapshot.agents.len()).collect::<Vec<_>>();
+    agent_indexes.sort_by_key(|index| {
+        usize::from(selected_agent.as_ref() != Some(&snapshot.agents[*index].id))
+    });
+    for index in agent_indexes {
+        let agent = &snapshot.agents[index];
         let cursor = cursors.get(agent.id.as_str());
         if !snapshot_changed
             && cursor.is_some_and(|cursor| {
@@ -465,7 +477,19 @@ fn websocket_state_payload(
         if !reset && start == agent.events.len() {
             continue;
         }
-        let events = &agent.events[start..];
+        let available = &agent.events[start..];
+        if available.is_empty() {
+            continue;
+        }
+        if remaining_event_bytes == 0 {
+            more_events = true;
+            continue;
+        }
+        let (event_count, encoded_bytes) =
+            event_prefix_within_budget(available, remaining_event_bytes)?;
+        let events = &available[..event_count];
+        remaining_event_bytes = remaining_event_bytes.saturating_sub(encoded_bytes);
+        more_events |= event_count < available.len();
         let turn_history_updated = turn_history_needs_refresh(reset, start, events);
         let turn_history = if turn_history_updated && agent.orchestrator_name != "worker-agent" {
             turn_history::latest_snapshot(&agent.events)?
@@ -483,10 +507,6 @@ fn websocket_state_payload(
         }));
     }
 
-    let selected_agent = selected_agent
-        .map(AgentId::new)
-        .transpose()?
-        .filter(|agent| snapshot.contains(agent));
     let api_activity = selected_agent
         .as_ref()
         .map(|agent| backend.api_activity(agent))
@@ -515,6 +535,7 @@ fn websocket_state_payload(
         "request_id": request_id,
         "snapshot": snapshot_payload,
         "event_updates": event_updates,
+        "more_events": more_events,
         "selected_agent": selected_agent_id,
         "api_activity": {
             "active": api_activity.active,
@@ -525,6 +546,26 @@ fn websocket_state_payload(
         "terminal_frame_updated": terminal_frame_updated,
         "terminal_frame": terminal_frame,
     }))
+}
+
+fn event_prefix_within_budget(events: &[Event], budget: usize) -> Result<(usize, usize)> {
+    if events.is_empty() || budget == 0 {
+        return Ok((0, 0));
+    }
+    let mut count = 0;
+    let mut encoded_bytes = 0_usize;
+    for event in events {
+        let event_bytes = serde_json::to_vec(event)?.len() + usize::from(count > 0);
+        if count > 0 && encoded_bytes.saturating_add(event_bytes) > budget {
+            break;
+        }
+        count += 1;
+        encoded_bytes = encoded_bytes.saturating_add(event_bytes);
+        if encoded_bytes >= budget {
+            break;
+        }
+    }
+    Ok((count, encoded_bytes))
 }
 
 fn serve(
@@ -1158,14 +1199,51 @@ fn no_store() -> Header {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, net::TcpListener, thread};
+    use std::{fs, net::TcpListener, path::PathBuf, thread};
 
     use super::*;
     use crate::{
         config::{ModelCapabilities, ModelConfig, ProviderType, WorkspaceConfig},
-        ui_backend::workflow_ui_ports,
+        event::UserPromptEvent,
+        ui_backend::{UiAgentSnapshot, UiApiActivity, UiEnvironment, workflow_ui_ports},
         workflow::Workflow,
     };
+
+    #[derive(Clone)]
+    struct SnapshotBackend(UiSnapshot);
+
+    impl UiBackend for SnapshotBackend {
+        fn snapshot(&self) -> Result<UiSnapshot> {
+            Ok(self.0.clone())
+        }
+
+        fn api_activity(&self, _agent_id: &AgentId) -> Result<UiApiActivity> {
+            Ok(UiApiActivity::default())
+        }
+
+        fn terminal_sessions(
+            &self,
+            _agent_id: &AgentId,
+        ) -> Result<Vec<crate::terminal::TerminalSessionPreview>> {
+            Ok(Vec::new())
+        }
+
+        fn terminal_frame(
+            &self,
+            _agent_id: &AgentId,
+            _session_id: &str,
+        ) -> Result<Option<crate::terminal::TerminalFrame>> {
+            Ok(None)
+        }
+
+        fn terminal_backend(&self, _agent_id: &AgentId) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn deletion_blocker(&self, _agent_id: &AgentId) -> Result<Option<String>> {
+            Ok(None)
+        }
+    }
 
     fn model() -> ModelConfig {
         ModelConfig {
@@ -1369,6 +1447,86 @@ mod tests {
     }
 
     #[test]
+    fn websocket_event_batches_are_bounded_without_splitting_events() {
+        let events = (1..=4)
+            .map(|id| {
+                Event::UserPrompt(UserPromptEvent {
+                    id,
+                    timestamp_ms: id,
+                    content: "x".repeat(200),
+                })
+            })
+            .collect::<Vec<_>>();
+        let first_size = serde_json::to_vec(&events[0]).unwrap().len();
+        let (count, bytes) = event_prefix_within_budget(&events, first_size + 1).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(bytes, first_size);
+
+        let (count, bytes) = event_prefix_within_budget(&events, 1).unwrap();
+        assert_eq!(count, 1, "one atomic event must always make progress");
+        assert_eq!(bytes, first_size);
+        assert_eq!(event_prefix_within_budget(&events, 0).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn websocket_initial_replay_prioritizes_the_selected_agent_in_small_batches() {
+        fn agent(id: &str, first_event_id: u64) -> UiAgentSnapshot {
+            let events = (0..4_000)
+                .map(|offset| {
+                    Event::UserPrompt(UserPromptEvent {
+                        id: first_event_id + offset,
+                        timestamp_ms: first_event_id + offset,
+                        content: "large public WebUI history ".repeat(24),
+                    })
+                })
+                .collect::<Vec<_>>();
+            UiAgentSnapshot {
+                id: AgentId::new(id).unwrap(),
+                title: None,
+                kind: crate::event::AgentKind::SubAgent,
+                parent_agent_id: None,
+                orchestrator_name: "worker-agent".into(),
+                edb_path: PathBuf::from(format!("{id}.edb")),
+                edb_size_bytes: 0,
+                mutation_revision: 0,
+                last_mutation: None,
+                prompt_submission_revision: 0,
+                input_draft: String::new(),
+                input_draft_revision: 0,
+                events: events.into(),
+            }
+        }
+
+        let backend = SnapshotBackend(UiSnapshot {
+            revision: 1,
+            environment: Arc::new(UiEnvironment {
+                workspace: PathBuf::from("."),
+                os: "test".into(),
+                arch: "test".into(),
+            }),
+            agents: vec![agent("first", 1), agent("selected", 10_000)],
+            models: Arc::from([]),
+            orchestrators: Arc::from([]),
+            default_orchestrator: "main-agent".into(),
+        });
+        let payload = websocket_state_payload(
+            &backend,
+            1,
+            None,
+            Vec::new(),
+            Some("selected".into()),
+            None,
+            None,
+        )
+        .unwrap();
+        let updates = payload["event_updates"].as_array().unwrap();
+        assert_eq!(updates[0]["agent_id"], "selected");
+        assert!(payload["more_events"].as_bool().unwrap());
+        assert!(updates[0]["events"].as_array().unwrap().len() < 4_000);
+        assert!(serde_json::to_vec(&payload).unwrap().len() < MAX_EVENT_BATCH_BYTES + 32 * 1024);
+    }
+
+    #[test]
     fn embedded_webui_switches_to_the_mobile_layout_in_portrait() {
         assert!(INDEX_HTML.contains("interactive-widget=resizes-content"));
         assert!(INDEX_HTML.contains("viewport-fit=cover"));
@@ -1386,6 +1544,19 @@ mod tests {
         assert!(APP_JS.contains("visible && enterSubmitsInCurrentLayout(event)"));
         assert!(APP_JS.contains("agent.title || agent.id"));
         assert!(APP_JS.contains("function toolIsChatVisible(name)"));
+    }
+
+    #[test]
+    fn embedded_webui_keeps_legacy_webkit_startup_compatible() {
+        assert!(!APP_JS.contains(".at(-1)"));
+        assert!(!APP_JS.contains(".replaceAll("));
+        assert!(!APP_JS.contains(".replaceChildren("));
+        assert!(!MARKDOWN_JS.contains(".at(-1)"));
+        assert!(!MARKDOWN_JS.contains(".replaceAll("));
+        assert!(APP_JS.contains("typeof PORTRAIT_LAYOUT.addEventListener === \"function\""));
+        assert!(APP_JS.contains("typeof PORTRAIT_LAYOUT.addListener === \"function\""));
+        assert!(APP_JS.contains("if (typeof ResizeObserver === \"function\")"));
+        assert!(APP_JS.contains("return { observe() {}, disconnect() {} };"));
     }
 
     #[test]
@@ -1475,7 +1646,7 @@ mod tests {
         assert!(MARKDOWN_JS.contains("markdown-table-wrap"));
         assert!(MARKDOWN_JS.contains("function normalizeCjkEmphasis(source)"));
         assert!(MARKDOWN_JS.contains("insideLinkTarget(source, cursor)"));
-        assert!(MARKDOWN_JS.contains("replaceAll(CJK_EMPHASIS_SENTINEL, \"\")"));
+        assert!(MARKDOWN_JS.contains("split(CJK_EMPHASIS_SENTINEL).join(\"\")"));
         assert!(APP_JS.contains("return globalThis.MeMarkdown.render(source)"));
         assert!(!APP_JS.contains("function inlineMarkdown"));
         assert!(STYLE_CSS.contains(".markdown li::marker"));
@@ -1733,7 +1904,11 @@ mod tests {
         assert!(APP_JS.contains("new WebSocket(websocketUrl())"));
         assert!(APP_JS.contains("if (state.syncInFlight"));
         assert!(APP_JS.contains("REALTIME_SYNC_TIMEOUT_MS"));
-        assert!(APP_JS.contains("state.socket?.close(), REALTIME_SYNC_TIMEOUT_MS"));
+        assert!(APP_JS.contains("state.connectionFailure = \"界面同步超时\""));
+        assert!(APP_JS.contains("function failRealtime(title, error)"));
+        assert!(APP_JS.contains("scheduleRealtimeSync(message.more_events ? 0"));
+        assert!(APP_JS.contains("typeof PORTRAIT_LAYOUT.addListener === \"function\""));
+        assert!(!APP_JS.contains(".at(-1)"));
         assert!(APP_JS.contains("elements.app.inert = true"));
         assert!(APP_JS.contains("elements.app.inert = false"));
         assert!(APP_JS.contains("snapshot_revision:"));
@@ -1882,7 +2057,9 @@ mod tests {
         assert!(APP_JS.contains("_lastAssistantByPrompt: new Map()"));
         assert!(APP_JS.contains("case \"AgentTurn\""));
         assert!(APP_JS.contains("if (stateName === \"completed\")"));
-        assert!(APP_JS.contains("projection.messages.at(-1) === assistant"));
+        assert!(
+            APP_JS.contains("projection.messages[projection.messages.length - 1] === assistant")
+        );
         assert!(APP_JS.contains("kind: \"turn-toolbar\""));
         assert!(APP_JS.contains("function formatTurnElapsed(ms)"));
         assert!(APP_JS.contains("function formatTurnCompletedAt(timestamp, now = Date.now())"));

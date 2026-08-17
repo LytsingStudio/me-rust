@@ -108,7 +108,8 @@
           && source[cursor - 1] !== "*" && source[cursor + 2] !== "*"
           && !isEscaped(source, cursor)
           && !insideLinkTarget(source, cursor)) {
-        const previous = Array.from(source.slice(0, cursor)).at(-1) || "";
+        const preceding = Array.from(source.slice(0, cursor));
+        const previous = preceding[preceding.length - 1] || "";
         const next = Array.from(source.slice(cursor + 2))[0] || "";
         const previousWhitespace = !previous || /\s/u.test(previous);
         const nextWhitespace = !next || /\s/u.test(next);
@@ -183,7 +184,7 @@
 
   function render(source) {
     const normalized = normalizeCjkEmphasis(String(source || "").replace(/\r\n?/g, "\n"));
-    return parser.render(normalized).replaceAll(CJK_EMPHASIS_SENTINEL, "");
+    return parser.render(normalized).split(CJK_EMPHASIS_SENTINEL).join("");
   }
 
   return Object.freeze({
