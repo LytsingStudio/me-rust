@@ -13,6 +13,8 @@ const TOOLBOX_BRIEF: &str = r#"Compact replaces the conversation accumulated so 
 Call Compact only after the runtime explicitly warns that context space is running low, and only at a safe point: finish the current atomic action, persist any valuable WorkMap state, and make Compact the only tool call in that model response. Compact has no arguments. The runtime rejects Compact when no warning is active and reports the current context usage. After accepting the request, the runtime will perform context compaction, activate the resulting continuation summary only after successful completion, then continue the same Agent turn. WorkMap survives compaction independently of the summary; after compaction succeeds, call WorkMap.Read before any further non-WorkMap action and repeat any final audit. Do not call Compact merely to shorten a healthy context, and do not narrate or imitate compaction in assistant text."#;
 
 const INSTRUCTIONS: &str = r#"Call with an empty object only after the runtime explicitly issues a context-low warning. Compact must be the sole tool call in the response. A call made without an active warning is rejected with the current context usage. After the tool is accepted, the runtime performs context compaction automatically; do not issue other tools in that response."#;
+const LOW_CONTEXT_WINDOW_MAX: u64 = 384_000;
+const MEDIUM_CONTEXT_WINDOW_MAX: u64 = 680_000;
 const ROUTE: &str = "Compress the accumulated conversation at a safe point only after the runtime explicitly warns that context is running low. It must be the sole tool call in the response.";
 const EXAMPLES: &str = r#"Input: {}
 Meaning: request context compaction at the current safe point."#;
@@ -392,11 +394,7 @@ fn collapse_blank_lines(value: &str) -> String {
 
 pub fn advisory(used_tokens: u64, context_window: u64, output_reservation: u64) -> Option<String> {
     let remaining = usable_remaining(used_tokens, context_window, output_reservation);
-    let (mild, urgent) = if context_window < 500_000 {
-        (48_000, 32_000)
-    } else {
-        (176_000, 128_000)
-    };
+    let (mild, urgent) = compact_thresholds(context_window);
     if remaining < urgent {
         Some(format!(
             "Only {remaining} usable context tokens remain after reserving the response budget. Context is nearly exhausted. At the next safe point, you must call Compact immediately as the sole tool call before continuing further work."
@@ -420,16 +418,22 @@ pub fn emergency_output_limit(
     if configured_output == 0 {
         return None;
     }
-    let safety_margin = if context_window < 500_000 {
-        32_000
-    } else {
-        128_000
-    };
+    let (_, safety_margin) = compact_thresholds(context_window);
     let safe_limit = context_window
         .saturating_sub(used_tokens)
         .saturating_sub(safety_margin)
         .max(1);
     (safe_limit < configured_output).then_some(safe_limit)
+}
+
+fn compact_thresholds(context_window: u64) -> (u64, u64) {
+    if context_window <= LOW_CONTEXT_WINDOW_MAX {
+        (48_000, 32_000)
+    } else if context_window <= MEDIUM_CONTEXT_WINDOW_MAX {
+        (72_000, 64_000)
+    } else {
+        (152_000, 128_000)
+    }
 }
 
 #[cfg(test)]
@@ -575,15 +579,25 @@ mod tests {
     }
 
     #[test]
-    fn advisory_uses_both_context_window_classes() {
+    fn advisory_uses_all_context_window_classes() {
         assert!(advisory(140_000, 272_000, 0).is_none());
         assert!(advisory(224_000, 272_000, 0).is_none());
         assert!(advisory(224_001, 272_000, 0).is_some());
         assert!(advisory(52_001, 100_000, 0).is_some());
         assert!(advisory(52_000, 100_000, 0).is_none());
         assert!(advisory(68_001, 100_000, 0).unwrap().contains("must call"));
+        assert!(advisory(336_000, 384_000, 0).is_none());
+        assert!(advisory(336_001, 384_000, 0).unwrap().contains("Consider"));
+        assert!(advisory(352_001, 384_000, 0).unwrap().contains("must call"));
+        assert!(advisory(313_000, 385_000, 0).is_none());
+        assert!(advisory(313_001, 385_000, 0).unwrap().contains("Consider"));
+        assert!(advisory(440_000, 512_000, 0).is_none());
+        assert!(advisory(440_001, 512_000, 0).unwrap().contains("Consider"));
+        assert!(advisory(448_001, 512_000, 0).unwrap().contains("must call"));
+        assert!(advisory(608_000, 680_000, 0).is_none());
+        assert!(advisory(529_000, 681_000, 0).is_none());
         assert!(
-            advisory(824_001, 1_000_000, 0)
+            advisory(848_001, 1_000_000, 0)
                 .unwrap()
                 .contains("Consider")
         );
@@ -598,9 +612,9 @@ mod tests {
     fn advisory_subtracts_the_reserved_output_budget() {
         let context_window = 1_000_000;
         let output_reservation = 393_216;
-        assert!(advisory(430_784, context_window, output_reservation).is_none());
+        assert!(advisory(454_784, context_window, output_reservation).is_none());
         assert!(
-            advisory(430_785, context_window, output_reservation)
+            advisory(454_785, context_window, output_reservation)
                 .unwrap()
                 .contains("running low")
         );
@@ -623,6 +637,26 @@ mod tests {
         );
         assert_eq!(emergency_output_limit(100_000, 1_000_000, 393_216), None);
         assert_eq!(emergency_output_limit(99_000, 100_000, 64_000), Some(1));
+        assert_eq!(
+            emergency_output_limit(300_000, 384_000, 128_000),
+            Some(52_000)
+        );
+        assert_eq!(
+            emergency_output_limit(300_000, 385_000, 128_000),
+            Some(21_000)
+        );
+        assert_eq!(
+            emergency_output_limit(400_000, 512_000, 128_000),
+            Some(48_000)
+        );
+        assert_eq!(
+            emergency_output_limit(500_000, 680_000, 128_000),
+            Some(116_000)
+        );
+        assert_eq!(
+            emergency_output_limit(500_000, 681_000, 128_000),
+            Some(53_000)
+        );
         assert_eq!(emergency_output_limit(90_000, 100_000, 0), None);
     }
 }

@@ -11905,9 +11905,9 @@ for line in sys.stdin:
             prior_prompt,
             ApiState::Completed,
             Some(ApiUsage {
-                input_tokens: 405_633,
+                input_tokens: 425_633,
                 output_tokens: 34_398,
-                total_tokens: 440_031,
+                total_tokens: 460_031,
             }),
             "",
         )
