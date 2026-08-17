@@ -1,7 +1,8 @@
 "use strict";
 
-const REALTIME_SYNC_MS = 200;
-const REALTIME_SYNC_TIMEOUT_MS = 15000;
+const HTTP_SYNC_ACTIVE_MS = 250;
+const HTTP_SYNC_IDLE_MS = 1000;
+const HTTP_SYNC_TIMEOUT_MS = 15000;
 const RECONNECT_MAX_MS = 5000;
 const INPUT_ANIMATION_QUIET_MS = 250;
 const TRANSCRIPT_BOTTOM_THRESHOLD_PX = 24;
@@ -56,16 +57,12 @@ const state = {
   connected: false,
   connecting: false,
   snapshotInitialized: false,
-  socket: null,
-  socketGeneration: 0,
+  syncGeneration: 0,
+  syncController: null,
   syncInFlight: false,
   syncTimer: null,
-  syncWatchdog: null,
   reconnectTimer: null,
   reconnectAttempt: 0,
-  connectionFailure: null,
-  nextRequestId: 1,
-  pendingSocketRequests: new Map(),
   terminalFrames: new Map(),
   terminalFramesUnavailable: new Set(),
   pageClosing: false,
@@ -209,7 +206,7 @@ async function api(path, options = {}) {
 }
 
 function showLogin(message = "") {
-  stopRealtime();
+  stopHttpPolling();
   state.authenticated = false;
   state.connected = false;
   hideConnectionOverlay();
@@ -236,7 +233,7 @@ async function initializeAuthentication() {
     }
     showApplication();
     restoreDraft();
-    connectRealtime();
+    startHttpPolling();
   } catch (error) {
     showLogin(`无法读取登录状态：${error.message}`);
   }
@@ -256,7 +253,7 @@ async function submitLogin(event) {
     state.authenticated = true;
     showApplication();
     restoreDraft();
-    connectRealtime();
+    startHttpPolling();
   } catch (error) {
     showLogin(error.message);
     elements.loginPassword.select();
@@ -265,20 +262,13 @@ async function submitLogin(event) {
   }
 }
 
-function websocketUrl() {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/api/ws`;
-}
-
-function connectRealtime() {
+function startHttpPolling() {
   if (state.pageClosing || (state.authRequired && !state.authenticated)) return;
-  if (state.socket?.readyState === WebSocket.OPEN
-      || state.socket?.readyState === WebSocket.CONNECTING) return;
+  if (state.syncInFlight) return;
   clearTimeout(state.reconnectTimer);
   state.reconnectTimer = null;
   state.connected = false;
   state.connecting = true;
-  state.connectionFailure = null;
   renderConnection();
   showConnectionOverlay(
     state.reconnectAttempt ? "正在重新连接" : "正在连接",
@@ -286,66 +276,46 @@ function connectRealtime() {
       ? `连接已断开，正在进行第 ${state.reconnectAttempt + 1} 次重试。`
       : "正在同步当前界面，请稍候。",
   );
-  const generation = ++state.socketGeneration;
-  const socket = new WebSocket(websocketUrl());
-  state.socket = socket;
-  socket.addEventListener("open", () => {
-    if (generation !== state.socketGeneration) return;
-    state.syncInFlight = false;
-    requestRealtimeSync();
-  });
-  socket.addEventListener("message", (event) => {
-    if (generation !== state.socketGeneration) return;
-    handleRealtimeMessage(event.data);
-  });
-  socket.addEventListener("error", () => {
-    if (generation === state.socketGeneration) state.connectionFailure = "WebSocket 连接发生错误";
-  });
-  socket.addEventListener("close", (event) => {
-    if (generation === state.socketGeneration) handleRealtimeDisconnect(event);
-  });
+  state.syncGeneration += 1;
+  void requestHttpSync();
 }
 
-function stopRealtime() {
+function stopHttpPolling() {
   clearTimeout(state.syncTimer);
-  clearTimeout(state.syncWatchdog);
   clearTimeout(state.reconnectTimer);
   state.syncTimer = null;
-  state.syncWatchdog = null;
   state.reconnectTimer = null;
   state.syncInFlight = false;
-  state.socketGeneration += 1;
-  const socket = state.socket;
-  state.socket = null;
-  if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
-  rejectPendingSocketRequests("连接已关闭，操作状态未知");
+  state.syncGeneration += 1;
+  state.syncController?.abort();
+  state.syncController = null;
 }
 
-function handleRealtimeDisconnect(event = null) {
+function handlePollingFailure(error) {
   clearTimeout(state.syncTimer);
-  clearTimeout(state.syncWatchdog);
   state.syncTimer = null;
-  state.syncWatchdog = null;
-  state.socket = null;
+  state.syncGeneration += 1;
+  state.syncController?.abort();
   state.connected = false;
   state.connecting = false;
   state.syncInFlight = false;
-  rejectPendingSocketRequests("连接已断开，操作状态未知");
+  state.syncController = null;
   renderConnection();
   if (state.pageClosing || (state.authRequired && !state.authenticated)) return;
   state.reconnectAttempt += 1;
   const delay = Math.min(RECONNECT_MAX_MS, 250 * (2 ** Math.min(state.reconnectAttempt - 1, 5)));
+  const detail = error instanceof Error ? error.message : String(error || "网络连接不可用");
   showConnectionOverlay(
     "正在重新连接",
-    `${state.connectionFailure || websocketCloseDescription(event)}，将在 ${Math.max(1, Math.ceil(delay / 1000))} 秒内重试。`,
+    `${detail}，将在 ${Math.max(1, Math.ceil(delay / 1000))} 秒内重试。`,
   );
-  const generation = state.socketGeneration;
+  const generation = state.syncGeneration;
   state.reconnectTimer = setTimeout(async () => {
-    if (generation !== state.socketGeneration || state.pageClosing) return;
+    if (generation !== state.syncGeneration || state.pageClosing) return;
     if (state.authRequired) {
       try {
         const status = await api("/api/auth/status");
-        if (generation !== state.socketGeneration || state.pageClosing) return;
+        if (generation !== state.syncGeneration || state.pageClosing) return;
         if (!status.authenticated) {
           showLogin("登录已失效，请重新登录");
           return;
@@ -354,41 +324,25 @@ function handleRealtimeDisconnect(event = null) {
         // The server can be temporarily unreachable. Keep the reconnect loop active.
       }
     }
-    connectRealtime();
+    startHttpPolling();
   }, delay);
 }
 
-function websocketCloseDescription(event) {
-  if (event?.reason) return `连接已断开：${event.reason}`;
-  if (event?.code && event.code !== 1006) return `连接已断开（代码 ${event.code}）`;
-  return "连接已断开";
-}
-
-function failRealtime(title, error) {
+function failHttpSync(title, error) {
   const detail = error instanceof Error ? error.message : String(error || "未知错误");
   console.error(title, error);
   clearTimeout(state.syncTimer);
-  clearTimeout(state.syncWatchdog);
   clearTimeout(state.reconnectTimer);
   state.syncTimer = null;
-  state.syncWatchdog = null;
   state.reconnectTimer = null;
   state.syncInFlight = false;
   state.connected = false;
   state.connecting = false;
-  state.connectionFailure = detail;
-  const socket = state.socket;
-  state.socketGeneration += 1;
-  state.socket = null;
-  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(4001, "webui sync failed");
-  rejectPendingSocketRequests("界面同步失败，操作状态未知");
+  state.syncGeneration += 1;
+  state.syncController?.abort();
+  state.syncController = null;
   renderConnection();
   showConnectionOverlay(title, `${detail}。请点击“立即重试”。`);
-}
-
-function rejectPendingSocketRequests(message) {
-  for (const pending of state.pendingSocketRequests.values()) pending.reject(new Error(message));
-  state.pendingSocketRequests.clear();
 }
 
 function showConnectionOverlay(title, message) {
@@ -404,125 +358,78 @@ function hideConnectionOverlay() {
   elements.app.inert = false;
 }
 
-function scheduleRealtimeSync(delay = REALTIME_SYNC_MS) {
+function scheduleHttpSync(delay) {
   clearTimeout(state.syncTimer);
-  if (!state.connected && state.socket?.readyState !== WebSocket.OPEN) return;
-  state.syncTimer = setTimeout(requestRealtimeSync, delay);
+  if (!state.connected || state.pageClosing) return;
+  state.syncTimer = setTimeout(requestHttpSync, delay);
 }
 
-function requestRealtimeSync() {
-  if (state.syncInFlight || state.socket?.readyState !== WebSocket.OPEN) return;
-  const requestId = state.nextRequestId++;
+async function requestHttpSync() {
+  if (state.syncInFlight || state.pageClosing) return;
+  const generation = state.syncGeneration;
   const terminalKey = state.view.kind === "terminal" && state.selectedAgent && state.view.sessionId
     ? `${state.selectedAgent}:${state.view.sessionId}` : null;
   state.syncInFlight = true;
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  state.syncController = controller;
+  const timeout = setTimeout(() => controller?.abort(), HTTP_SYNC_TIMEOUT_MS);
   try {
-    state.socket.send(JSON.stringify({
-      type: "sync",
-      request_id: requestId,
-      snapshot_revision: state.snapshotInitialized ? state.snapshot.revision : null,
-      agents: [...state.stores].map(([id, store]) => ({
-        id,
-        event_count: store.events.length,
-        mutation_revision: store.mutationRevision,
-      })),
-      selected_agent: state.selectedAgent,
-      terminal_session: state.view.kind === "terminal" ? state.view.sessionId : null,
-      terminal_revision: terminalKey ? state.terminalRevisions.get(terminalKey) ?? null : null,
-    }));
-    clearTimeout(state.syncWatchdog);
-    state.syncWatchdog = setTimeout(() => {
-      state.connectionFailure = "界面同步超时";
-      state.socket?.close();
-    }, REALTIME_SYNC_TIMEOUT_MS);
-  } catch (error) {
+    const message = await api("/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller?.signal,
+      body: JSON.stringify({
+        snapshot_revision: state.snapshotInitialized ? state.snapshot.revision : null,
+        agents: [...state.stores].map(([id, store]) => ({
+          id,
+          event_count: store.events.length,
+          mutation_revision: store.mutationRevision,
+        })),
+        selected_agent: state.selectedAgent,
+        terminal_session: state.view.kind === "terminal" ? state.view.sessionId : null,
+        terminal_revision: terminalKey ? state.terminalRevisions.get(terminalKey) ?? null : null,
+      }),
+    });
+    if (generation !== state.syncGeneration || state.pageClosing) return;
     state.syncInFlight = false;
-    failRealtime("无法发送同步请求", error);
+    state.syncController = null;
+    try {
+      applySyncState(message);
+    } catch (error) {
+      return failHttpSync("无法更新界面", error);
+    }
+    const delay = message.more_events || state.apiActivity.active || state.view.kind === "terminal"
+      ? HTTP_SYNC_ACTIVE_MS : HTTP_SYNC_IDLE_MS;
+    scheduleHttpSync(message.more_events ? 0 : delay);
+  } catch (error) {
+    if (generation !== state.syncGeneration || state.pageClosing) return;
+    state.syncInFlight = false;
+    state.syncController = null;
+    if (error.status === 401) return showLogin("登录已失效，请重新登录");
+    if (error.status && ![502, 503, 504].includes(error.status)) {
+      return failHttpSync("界面同步失败", error);
+    }
+    const failure = error.name === "AbortError" ? new Error("界面同步超时") : error;
+    handlePollingFailure(failure);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-function requestRealtimeSyncNow() {
+function requestHttpSyncNow() {
   clearTimeout(state.syncTimer);
   state.syncTimer = null;
-  if (!state.syncInFlight) requestRealtimeSync();
+  if (!state.syncInFlight && (state.connected || state.connecting)) void requestHttpSync();
 }
 
-function handleRealtimeMessage(raw) {
-  let message;
-  try { message = JSON.parse(raw); }
-  catch (error) { return failRealtime("无法解析界面数据", error); }
-  if (message.type === "state") {
-    clearTimeout(state.syncWatchdog);
-    state.syncWatchdog = null;
-    state.syncInFlight = false;
-    try {
-      applyRealtimeState(message);
-      scheduleRealtimeSync(message.more_events ? 0 : REALTIME_SYNC_MS);
-    } catch (error) {
-      failRealtime("无法更新界面", error);
-    }
-    return;
-  }
-  if (message.type === "sync_error") {
-    clearTimeout(state.syncWatchdog);
-    state.syncWatchdog = null;
-    state.syncInFlight = false;
-    return failRealtime("界面同步失败", message.error || "服务端未能生成界面状态");
-  }
-  if (message.type === "command_result" || message.type === "query_result") {
-    const pending = state.pendingSocketRequests.get(Number(message.request_id));
-    if (!pending) return;
-    state.pendingSocketRequests.delete(Number(message.request_id));
-    if (message.ok) pending.resolve(message);
-    else pending.reject(new Error(message.error || "操作失败"));
-    requestRealtimeSyncNow();
-    return;
-  }
-  failRealtime("界面协议错误", `无法识别服务端消息：${message.type || "unknown"}`);
-}
-
-function sendSocketQuery(type, fields = {}) {
-  if (!state.connected || state.socket?.readyState !== WebSocket.OPEN) {
-    return Promise.reject(new Error("连接尚未恢复，请稍候"));
-  }
-  const requestId = state.nextRequestId++;
-  return new Promise((resolve, reject) => {
-    state.pendingSocketRequests.set(requestId, { resolve, reject });
-    try {
-      state.socket.send(JSON.stringify({ type, request_id: requestId, ...fields }));
-    } catch (error) {
-      state.pendingSocketRequests.delete(requestId);
-      reject(error);
-      state.socket?.close();
-    }
-  });
-}
-
-function sendSocketCommand(payload) {
-  if (!state.connected || state.socket?.readyState !== WebSocket.OPEN) {
-    return Promise.reject(new Error("连接尚未恢复，请稍候"));
-  }
-  const requestId = state.nextRequestId++;
-  return new Promise((resolve, reject) => {
-    state.pendingSocketRequests.set(requestId, { resolve, reject });
-    try {
-      state.socket.send(JSON.stringify({ type: "command", request_id: requestId, payload }));
-    } catch (error) {
-      state.pendingSocketRequests.delete(requestId);
-      reject(error);
-      state.socket?.close();
-    }
-  });
-}
-
-function applyRealtimeState(payload) {
+function applySyncState(payload) {
   const previousSnapshot = state.snapshot;
   const wasConnected = state.connected;
   if (payload.snapshot) {
     state.snapshot = payload.snapshot;
     state.snapshotInitialized = true;
   }
-  if (!state.snapshotInitialized) throw new Error("实时连接未提供初始状态");
+  if (!state.snapshotInitialized) throw new Error("同步响应未提供初始状态");
   const presentationChanged = snapshotPresentationSignature(previousSnapshot)
     !== snapshotPresentationSignature(state.snapshot);
   const selectionChanged = reconcileAgents();
@@ -563,7 +470,7 @@ function applyRealtimeState(payload) {
   for (const [agentId, sync] of state.draftSync) {
     if (sync.sent !== sync.desired) void runDraftSync(agentId, sync);
   }
-  if (!responseMatchesSelection) requestRealtimeSyncNow();
+  if (!responseMatchesSelection) requestHttpSyncNow();
 }
 
 function inputHasPriority() {
@@ -1702,7 +1609,7 @@ function selectAgent(id) {
   delete elements.terminalScreen.dataset.revision;
   restoreDraft();
   renderAll();
-  requestRealtimeSyncNow();
+  requestHttpSyncNow();
 }
 
 function renderTabs() {
@@ -2653,7 +2560,7 @@ function renderTerminal() {
     showTerminalMessage(state.terminalFramesUnavailable.has(revisionKey)
       ? `Terminal ${sessionId} 已不可用`
       : `正在同步 Terminal ${sessionId}…`);
-    requestRealtimeSyncNow();
+    requestHttpSyncNow();
     return;
   }
   if (state.view.kind !== "terminal" || state.view.sessionId !== sessionId) return;
@@ -2835,7 +2742,7 @@ async function openDeleteAgent(agentId = state.selectedAgent) {
     const agent = state.snapshot.agents.find((candidate) => candidate.id === agentId);
     if (!agent) return toast("该会话已不存在", true);
     const label = agent.title || agent.id;
-    const payload = await sendSocketQuery("deletion_blocker", { agent_id: agentId });
+    const payload = await api(`/api/deletion-blocker/${encodeURIComponent(agentId)}`);
     if (payload.blocker) return openConfirm("无法删除会话", `“${label}”当前不可删除：${payload.blocker}`, "返回", async () => {});
     openConfirm("删除会话？", `将永久删除“${label}”及其全部记录。此操作不可恢复。`, "永久删除", async () => {
       await sendCommand({ command: "delete_agent", agent_id: agentId });
@@ -2933,7 +2840,20 @@ async function confirmModal() {
 }
 
 async function sendCommand(payload) {
-  return sendSocketCommand(payload);
+  if (!state.connected) throw new Error("连接尚未恢复，请稍候");
+  try {
+    const response = await api("/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    requestHttpSyncNow();
+    return response;
+  } catch (error) {
+    if (error.status === 401) showLogin("登录已失效，请重新登录");
+    else if (!error.status || [502, 503, 504].includes(error.status)) handlePollingFailure(error);
+    throw error;
+  }
 }
 
 async function submitPrompt() {
@@ -3152,18 +3072,21 @@ function flushDraftBeforePageCloses() {
   }
   for (const [agentId, content] of drafts) {
     const expectedRevision = state.stores.get(agentId)?.inputDraftRevision ?? 0;
-    if (state.socket?.readyState !== WebSocket.OPEN) continue;
+    const body = JSON.stringify({
+      command: "update_input_draft",
+      agent_id: agentId,
+      expected_revision: expectedRevision,
+      content,
+    });
     try {
-      state.socket.send(JSON.stringify({
-        type: "command",
-        request_id: state.nextRequestId++,
-        payload: {
-          command: "update_input_draft",
-          agent_id: agentId,
-          expected_revision: expectedRevision,
-          content,
-        },
-      }));
+      const data = typeof Blob === "function" ? new Blob([body], { type: "application/json" }) : null;
+      if (data && navigator.sendBeacon?.("/api/command", data)) continue;
+      void fetch("/api/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        keepalive: true,
+      });
     } catch (_) {}
   }
 }
@@ -3256,17 +3179,14 @@ elements.tabs.querySelectorAll("button[data-view]").forEach((button) => button.a
 elements.loginForm.addEventListener("submit", submitLogin);
 elements.connectionRetry.addEventListener("click", () => {
   clearTimeout(state.reconnectTimer);
-  clearTimeout(state.syncWatchdog);
   state.reconnectTimer = null;
-  state.syncWatchdog = null;
-  const socket = state.socket;
-  state.socketGeneration += 1;
-  state.socket = null;
+  state.syncGeneration += 1;
+  state.syncController?.abort();
+  state.syncController = null;
   state.connected = false;
   state.connecting = false;
   state.syncInFlight = false;
-  if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
-  connectRealtime();
+  startHttpPolling();
 });
 elements.addAgent.addEventListener("click", () => { closeMobileSidebar(); openAddAgent(); });
 elements.mobileDeleteAgent.addEventListener("click", () => { closeMobileSidebar(); openDeleteAgent(); });
@@ -3388,7 +3308,7 @@ window.addEventListener("pagehide", () => {
 });
 window.addEventListener("pageshow", () => {
   state.pageClosing = false;
-  if ((!state.authRequired || state.authenticated) && !state.connected) connectRealtime();
+  if ((!state.authRequired || state.authenticated) && !state.connected) startHttpPolling();
 });
 const transcriptBottomFollower = createTranscriptBottomFollower(
   elements.transcript,

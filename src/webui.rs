@@ -13,11 +13,6 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_ha
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
-use tungstenite::{
-    Message, WebSocket,
-    handshake::derive_accept_key,
-    protocol::{Role, WebSocketConfig},
-};
 
 use crate::{
     Result,
@@ -38,7 +33,6 @@ const MARKDOWN_JS: &str = include_str!("webui/markdown.js");
 const MARKDOWN_IT_JS: &str = include_str!("webui/vendor/markdown-it.min.js");
 const STYLE_CSS: &str = include_str!("webui/style.css");
 const MAX_COMMAND_BYTES: usize = 1024 * 1024;
-const MAX_WEBSOCKET_MESSAGE_BYTES: usize = MAX_COMMAND_BYTES + 64 * 1024;
 const MAX_EVENT_BATCH_BYTES: usize = 512 * 1024;
 const MAX_LOGIN_BYTES: usize = 4096;
 const SESSION_COOKIE: &str = "me_webui_session";
@@ -210,21 +204,7 @@ fn start_with_server(
                         let _ = thread::Builder::new()
                             .name("me-webui-request".into())
                             .spawn(move || {
-                                if websocket_requested(&request) {
-                                    serve_websocket(
-                                        request,
-                                        backend.as_ref(),
-                                        commands.as_ref(),
-                                        auth.as_ref(),
-                                    );
-                                } else {
-                                    serve(
-                                        request,
-                                        backend.as_ref(),
-                                        commands.as_ref(),
-                                        auth.as_ref(),
-                                    );
-                                }
+                                serve(request, backend.as_ref(), commands.as_ref(), auth.as_ref());
                             });
                     }
                     Ok(None) => {}
@@ -243,196 +223,27 @@ fn start_with_server(
     })
 }
 
-fn websocket_requested(request: &Request) -> bool {
-    split_url(request.url()).0 == "/api/ws"
-        && request.method() == &Method::Get
-        && request.headers().iter().any(|header| {
-            header.field.equiv("Upgrade") && header.value.as_str().eq_ignore_ascii_case("websocket")
-        })
+#[derive(Deserialize)]
+struct SyncRequest {
+    snapshot_revision: Option<u64>,
+    #[serde(default)]
+    agents: Vec<SyncAgentCursor>,
+    selected_agent: Option<String>,
+    terminal_session: Option<String>,
+    terminal_revision: Option<u64>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case", tag = "type")]
-enum WebSocketClientMessage {
-    Sync {
-        request_id: u64,
-        snapshot_revision: Option<u64>,
-        #[serde(default)]
-        agents: Vec<WebSocketAgentCursor>,
-        selected_agent: Option<String>,
-        terminal_session: Option<String>,
-        terminal_revision: Option<u64>,
-    },
-    Command {
-        request_id: u64,
-        payload: WebCommand,
-    },
-    DeletionBlocker {
-        request_id: u64,
-        agent_id: String,
-    },
-}
-
-#[derive(Deserialize)]
-struct WebSocketAgentCursor {
+struct SyncAgentCursor {
     id: String,
     event_count: usize,
     mutation_revision: u64,
 }
 
-fn serve_websocket(
-    request: Request,
+fn sync_state_payload(
     backend: &dyn UiBackend,
-    commands: &dyn UiCommandGateway,
-    auth: &WebAuth,
-) {
-    if !auth.authorized(&request) {
-        let _ = request.respond(unauthorized_response());
-        return;
-    }
-    let Some(key) = request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv("Sec-WebSocket-Key"))
-        .map(|header| header.value.as_str().as_bytes().to_vec())
-    else {
-        let _ = request.respond(json_response(
-            StatusCode(400),
-            &json!({"ok": false, "error": "missing Sec-WebSocket-Key"}),
-        ));
-        return;
-    };
-    let response = Response::empty(StatusCode(101))
-        .with_header(Header::from_bytes("Upgrade", "websocket").expect("static header"))
-        .with_header(Header::from_bytes("Connection", "Upgrade").expect("static header"))
-        .with_header(
-            Header::from_bytes("Sec-WebSocket-Accept", derive_accept_key(&key))
-                .expect("WebSocket accept key is ASCII"),
-        );
-    let stream = request.upgrade("websocket", response);
-    let config = WebSocketConfig::default()
-        .write_buffer_size(0)
-        .max_message_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES))
-        .max_frame_size(Some(MAX_WEBSOCKET_MESSAGE_BYTES));
-    let mut socket = WebSocket::from_raw_socket(stream, Role::Server, Some(config));
-    loop {
-        let message = match socket.read() {
-            Ok(message) => message,
-            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
-            Err(_) => break,
-        };
-        match message {
-            Message::Text(text) => {
-                let parsed = serde_json::from_str::<WebSocketClientMessage>(text.as_str());
-                let response = match parsed {
-                    Ok(WebSocketClientMessage::Sync {
-                        request_id,
-                        snapshot_revision,
-                        agents,
-                        selected_agent,
-                        terminal_session,
-                        terminal_revision,
-                    }) => websocket_state_payload(
-                        backend,
-                        request_id,
-                        snapshot_revision,
-                        agents,
-                        selected_agent,
-                        terminal_session,
-                        terminal_revision,
-                    )
-                    .unwrap_or_else(|error| {
-                        json!({
-                            "type": "sync_error",
-                            "request_id": request_id,
-                            "error": error.to_string(),
-                        })
-                    }),
-                    Ok(WebSocketClientMessage::Command {
-                        request_id,
-                        payload,
-                    }) => match into_ui_command(payload)
-                        .and_then(|command| commands.submit(command))
-                    {
-                        Ok(receipt) => json!({
-                            "type": "command_result",
-                            "request_id": request_id,
-                            "ok": true,
-                            "receipt": receipt_json(receipt),
-                        }),
-                        Err(error) => json!({
-                            "type": "command_result",
-                            "request_id": request_id,
-                            "ok": false,
-                            "error": error.to_string(),
-                        }),
-                    },
-                    Ok(WebSocketClientMessage::DeletionBlocker {
-                        request_id,
-                        agent_id,
-                    }) => match AgentId::new(agent_id)
-                        .and_then(|agent_id| backend.deletion_blocker(&agent_id))
-                    {
-                        Ok(blocker) => json!({
-                            "type": "query_result",
-                            "request_id": request_id,
-                            "ok": true,
-                            "blocker": blocker,
-                        }),
-                        Err(error) => json!({
-                            "type": "query_result",
-                            "request_id": request_id,
-                            "ok": false,
-                            "error": error.to_string(),
-                        }),
-                    },
-                    Err(error) => json!({
-                        "type": "protocol_error",
-                        "error": format!("invalid WebSocket message: {error}"),
-                    }),
-                };
-                if send_websocket_json(&mut socket, &response).is_err() {
-                    break;
-                }
-            }
-            Message::Ping(payload) => {
-                if socket.send(Message::Pong(payload)).is_err() {
-                    break;
-                }
-            }
-            Message::Close(_) => {
-                let _ = socket.close(None);
-                break;
-            }
-            Message::Binary(_) => {
-                if send_websocket_json(
-                    &mut socket,
-                    &json!({"type": "protocol_error", "error": "binary messages are unsupported"}),
-                )
-                .is_err()
-                {
-                    break;
-                }
-            }
-            Message::Pong(_) | Message::Frame(_) => {}
-        }
-    }
-}
-
-fn send_websocket_json(
-    socket: &mut WebSocket<Box<dyn tiny_http::ReadWrite + Send>>,
-    value: &serde_json::Value,
-) -> Result<()> {
-    let text = serde_json::to_string(value)?;
-    socket.send(Message::Text(text.into()))?;
-    Ok(())
-}
-
-fn websocket_state_payload(
-    backend: &dyn UiBackend,
-    request_id: u64,
     snapshot_revision: Option<u64>,
-    cursors: Vec<WebSocketAgentCursor>,
+    cursors: Vec<SyncAgentCursor>,
     selected_agent: Option<String>,
     terminal_session: Option<String>,
     terminal_revision: Option<u64>,
@@ -531,8 +342,8 @@ fn websocket_state_payload(
     let snapshot_payload = snapshot_changed.then(|| snapshot_metadata(snapshot));
     let selected_agent_id = selected_agent.as_ref().map(ToString::to_string);
     Ok(json!({
+        "ok": true,
         "type": "state",
-        "request_id": request_id,
         "snapshot": snapshot_payload,
         "event_updates": event_updates,
         "more_events": more_events,
@@ -625,6 +436,7 @@ fn route(
             StatusCode(200),
             &json!({"ok": true, "service": "me-webui"}),
         )),
+        (&Method::Post, "/api/sync") => sync_response(request, backend),
         (&Method::Get, "/api/snapshot") => snapshot_response(backend),
         (&Method::Get, path) if path.starts_with("/api/api-activity/") => {
             let id = parse_agent_path(path, "/api/api-activity/")?;
@@ -672,6 +484,56 @@ fn route(
             &json!({"ok": false, "error": "not found"}),
         )),
     }
+}
+
+fn sync_response(request: &mut Request, backend: &dyn UiBackend) -> Result<HttpResponse> {
+    let content_type = request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv("Content-Type"))
+        .map(|header| header.value.as_str());
+    if content_type.is_none_or(|value| !value.starts_with("application/json")) {
+        return Ok(json_response(
+            StatusCode(415),
+            &json!({"ok": false, "error": "Content-Type must be application/json"}),
+        ));
+    }
+    let length = request.body_length().unwrap_or(0);
+    if length > MAX_COMMAND_BYTES {
+        return Ok(json_response(
+            StatusCode(413),
+            &json!({"ok": false, "error": "sync body is too large"}),
+        ));
+    }
+    let mut body = Vec::with_capacity(length.min(MAX_COMMAND_BYTES));
+    request
+        .as_reader()
+        .take((MAX_COMMAND_BYTES + 1) as u64)
+        .read_to_end(&mut body)?;
+    if body.len() > MAX_COMMAND_BYTES {
+        return Ok(json_response(
+            StatusCode(413),
+            &json!({"ok": false, "error": "sync body is too large"}),
+        ));
+    }
+    let sync: SyncRequest = match serde_json::from_slice(&body) {
+        Ok(sync) => sync,
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode(400),
+                &json!({"ok": false, "error": format!("invalid sync request: {error}")}),
+            ));
+        }
+    };
+    let payload = sync_state_payload(
+        backend,
+        sync.snapshot_revision,
+        sync.agents,
+        sync.selected_agent,
+        sync.terminal_session,
+        sync.terminal_revision,
+    )?;
+    Ok(json_response(StatusCode(200), &payload))
 }
 
 #[derive(Serialize)]
@@ -1414,10 +1276,8 @@ mod tests {
     }
 
     #[test]
-    fn websocket_protocol_requires_explicit_revisions_and_request_ids() {
-        let parsed: WebSocketClientMessage = serde_json::from_value(json!({
-            "type": "sync",
-            "request_id": 17,
+    fn http_sync_protocol_requires_agent_revisions() {
+        let parsed: SyncRequest = serde_json::from_value(json!({
             "snapshot_revision": 4,
             "agents": [{"id": "main", "event_count": 9, "mutation_revision": 2}],
             "selected_agent": "main",
@@ -1425,19 +1285,11 @@ mod tests {
             "terminal_revision": null,
         }))
         .unwrap();
-        assert!(matches!(
-            parsed,
-            WebSocketClientMessage::Sync {
-                request_id: 17,
-                snapshot_revision: Some(4),
-                ..
-            }
-        ));
+        assert_eq!(parsed.snapshot_revision, Some(4));
         assert!(
-            serde_json::from_value::<WebSocketClientMessage>(json!({
-                "type": "sync",
+            serde_json::from_value::<SyncRequest>(json!({
                 "snapshot_revision": null,
-                "agents": [],
+                "agents": [{"id": "main", "event_count": 9}],
                 "selected_agent": null,
                 "terminal_session": null,
                 "terminal_revision": null,
@@ -1447,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_event_batches_are_bounded_without_splitting_events() {
+    fn http_sync_event_batches_are_bounded_without_splitting_events() {
         let events = (1..=4)
             .map(|id| {
                 Event::UserPrompt(UserPromptEvent {
@@ -1469,7 +1321,7 @@ mod tests {
     }
 
     #[test]
-    fn websocket_initial_replay_prioritizes_the_selected_agent_in_small_batches() {
+    fn http_sync_initial_replay_prioritizes_the_selected_agent_in_small_batches() {
         fn agent(id: &str, first_event_id: u64) -> UiAgentSnapshot {
             let events = (0..4_000)
                 .map(|offset| {
@@ -1509,9 +1361,8 @@ mod tests {
             orchestrators: Arc::from([]),
             default_orchestrator: "main-agent".into(),
         });
-        let payload = websocket_state_payload(
+        let payload = sync_state_payload(
             &backend,
-            1,
             None,
             Vec::new(),
             Some("selected".into()),
@@ -1888,32 +1739,33 @@ mod tests {
         assert!(APP_JS.contains("async function pauseDraftSyncForSubmission(agentId)"));
         assert!(APP_JS.contains("window.addEventListener(\"pagehide\", () =>"));
         assert!(APP_JS.contains("flushDraftBeforePageCloses();"));
-        assert!(!APP_JS.contains("navigator.sendBeacon"));
-        assert!(!APP_JS.contains("fetch(\"/api/command\""));
+        assert!(APP_JS.contains("navigator.sendBeacon?.(\"/api/command\""));
+        assert!(APP_JS.contains("fetch(\"/api/command\""));
         assert!(APP_JS.contains("receipt?.prompt_submission_revision"));
         assert!(APP_JS.contains("store.promptSubmissionRevision = Math.max"));
     }
 
     #[test]
-    fn embedded_webui_uses_one_recoverable_realtime_connection() {
+    fn embedded_webui_uses_recoverable_incremental_http_polling() {
         assert!(INDEX_HTML.contains("id=\"connection-overlay\""));
         assert!(INDEX_HTML.contains("id=\"connection-retry\""));
         assert!(
             STYLE_CSS.contains(".connection-overlay { position: fixed; inset: 0; z-index: 120;")
         );
-        assert!(APP_JS.contains("new WebSocket(websocketUrl())"));
+        assert!(APP_JS.contains("api(\"/api/sync\""));
+        assert!(!APP_JS.contains("new WebSocket"));
         assert!(APP_JS.contains("if (state.syncInFlight"));
-        assert!(APP_JS.contains("REALTIME_SYNC_TIMEOUT_MS"));
-        assert!(APP_JS.contains("state.connectionFailure = \"界面同步超时\""));
-        assert!(APP_JS.contains("function failRealtime(title, error)"));
-        assert!(APP_JS.contains("scheduleRealtimeSync(message.more_events ? 0"));
+        assert!(APP_JS.contains("HTTP_SYNC_TIMEOUT_MS"));
+        assert!(APP_JS.contains("function failHttpSync(title, error)"));
+        assert!(APP_JS.contains("scheduleHttpSync(message.more_events ? 0"));
+        assert!(APP_JS.contains("HTTP_SYNC_ACTIVE_MS = 250"));
+        assert!(APP_JS.contains("HTTP_SYNC_IDLE_MS = 1000"));
         assert!(APP_JS.contains("typeof PORTRAIT_LAYOUT.addListener === \"function\""));
         assert!(!APP_JS.contains(".at(-1)"));
         assert!(APP_JS.contains("elements.app.inert = true"));
         assert!(APP_JS.contains("elements.app.inert = false"));
         assert!(APP_JS.contains("snapshot_revision:"));
         assert!(APP_JS.contains("mutation_revision: store.mutationRevision"));
-        assert!(APP_JS.contains("rejectPendingSocketRequests(\"连接已断开，操作状态未知\")"));
         assert!(APP_JS.contains("Math.min(RECONNECT_MAX_MS"));
     }
 
@@ -1973,8 +1825,9 @@ mod tests {
         assert!(APP_JS.contains("workmap._records.clear()"));
         assert!(APP_JS.contains("chatAppendNeedsReplay(appended)"));
         assert!(APP_JS.contains("function renderIncremental(request)"));
-        assert!(APP_JS.contains("new WebSocket(websocketUrl())"));
-        assert!(APP_JS.contains("type: \"sync\""));
+        assert!(APP_JS.contains("api(\"/api/sync\""));
+        assert!(APP_JS.contains("method: \"POST\""));
+        assert!(!APP_JS.contains("new WebSocket"));
         assert!(!APP_JS.contains("/api/api-activity/"));
         assert!(!APP_JS.contains("/api/events/"));
         assert!(!APP_JS.contains("/api/terminals/"));
@@ -2121,13 +1974,18 @@ mod tests {
             .unwrap();
         assert_eq!(status["required"], true);
         assert_eq!(status["authenticated"], false);
-        let websocket = address.replace("http://", "ws://");
-        let websocket_error = tungstenite::connect(format!("{websocket}/api/ws")).unwrap_err();
-        assert!(matches!(
-            websocket_error,
-            tungstenite::Error::Http(response)
-                if response.status() == tungstenite::http::StatusCode::UNAUTHORIZED
-        ));
+        assert_eq!(
+            client
+                .post(format!("{address}/api/sync"))
+                .json(&json!({
+                    "snapshot_revision": null, "agents": [], "selected_agent": null,
+                    "terminal_session": null, "terminal_revision": null,
+                }))
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
         assert_eq!(
             client
                 .get(format!("{address}/api/snapshot"))
@@ -2189,13 +2047,36 @@ mod tests {
                 .status()
                 .is_success()
         );
+        let synchronized: serde_json::Value = client
+            .post(format!("{address}/api/sync"))
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&json!({
+                "snapshot_revision": null, "agents": [], "selected_agent": null,
+                "terminal_session": null, "terminal_revision": null,
+            }))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(synchronized["type"], "state");
+        assert_eq!(
+            client
+                .get(format!("{address}/api/ws"))
+                .header(reqwest::header::COOKIE, cookie)
+                .send()
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
 
         drop(server);
         fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn websocket_reconnect_resumes_from_revisions_and_observes_shared_drafts() {
+    fn http_polling_resumes_from_revisions_and_synchronizes_shared_drafts() {
         let directory = workspace();
         let workflow = Workflow::open(
             &directory,
@@ -2212,57 +2093,49 @@ mod tests {
         let server = start_from(backend, commands, 0, None).unwrap();
         let address = server
             .address()
-            .replace("http://0.0.0.0:", "ws://127.0.0.1:");
-        let (mut socket, response) = tungstenite::connect(format!("{address}/api/ws")).unwrap();
-        assert_eq!(
-            response.status(),
-            tungstenite::http::StatusCode::SWITCHING_PROTOCOLS
-        );
+            .replace("http://0.0.0.0:", "http://127.0.0.1:");
+        let client = reqwest::blocking::Client::new();
+        let sync = |client: &reqwest::blocking::Client, body: serde_json::Value| {
+            client
+                .post(format!("{address}/api/sync"))
+                .json(&body)
+                .send()
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<serde_json::Value>()
+                .unwrap()
+        };
 
-        socket
-            .send(Message::Text(
-                json!({
-                    "type": "sync", "request_id": 1, "snapshot_revision": null,
-                    "agents": [], "selected_agent": null, "terminal_session": null,
-                    "terminal_revision": null,
-                })
-                .to_string()
-                .into(),
-            ))
-            .unwrap();
-        let initial: serde_json::Value =
-            serde_json::from_str(socket.read().unwrap().into_text().unwrap().as_str()).unwrap();
+        let initial = sync(
+            &client,
+            json!({
+                "snapshot_revision": null, "agents": [], "selected_agent": null,
+                "terminal_session": null, "terminal_revision": null,
+            }),
+        );
         assert_eq!(initial["type"], "state");
         let initial_revision = initial["snapshot"]["revision"].as_u64().unwrap();
 
-        socket
-            .send(Message::Text(
-                json!({
-                    "type": "command", "request_id": 2,
-                    "payload": {"command": "add_agent", "orchestrator": "chatbot"},
-                })
-                .to_string()
-                .into(),
-            ))
+        let created: serde_json::Value = client
+            .post(format!("{address}/api/command"))
+            .json(&json!({"command": "add_agent", "orchestrator": "chatbot"}))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
             .unwrap();
-        let created: serde_json::Value =
-            serde_json::from_str(socket.read().unwrap().into_text().unwrap().as_str()).unwrap();
         let agent_id = created["receipt"]["agent_id"].as_str().unwrap().to_owned();
 
-        socket
-            .send(Message::Text(
-                json!({
-                    "type": "sync", "request_id": 3,
-                    "snapshot_revision": initial_revision, "agents": [],
-                    "selected_agent": agent_id, "terminal_session": null,
-                    "terminal_revision": null,
-                })
-                .to_string()
-                .into(),
-            ))
-            .unwrap();
-        let after_create: serde_json::Value =
-            serde_json::from_str(socket.read().unwrap().into_text().unwrap().as_str()).unwrap();
+        let after_create = sync(
+            &client,
+            json!({
+                "snapshot_revision": initial_revision, "agents": [],
+                "selected_agent": agent_id, "terminal_session": null,
+                "terminal_revision": null,
+            }),
+        );
         let snapshot_revision = after_create["snapshot"]["revision"].as_u64().unwrap();
         let agent = after_create["snapshot"]["agents"]
             .as_array()
@@ -2280,131 +2153,99 @@ mod tests {
                 .any(|update| { update["agent_id"] == agent_id && update["reset"] == true })
         );
 
-        socket
-            .send(Message::Text(
-                json!({
-                    "type": "sync", "request_id": 31,
-                    "snapshot_revision": snapshot_revision,
-                    "agents": [{
-                        "id": agent_id, "event_count": event_count,
-                        "mutation_revision": mutation_revision + 1,
-                    }],
-                    "selected_agent": agent_id, "terminal_session": null,
-                    "terminal_revision": null,
-                })
-                .to_string()
-                .into(),
-            ))
-            .unwrap();
-        let forced_replay: serde_json::Value =
-            serde_json::from_str(socket.read().unwrap().into_text().unwrap().as_str()).unwrap();
+        let forced_replay = sync(
+            &client,
+            json!({
+                "snapshot_revision": snapshot_revision,
+                "agents": [{
+                    "id": agent_id, "event_count": event_count,
+                    "mutation_revision": mutation_revision + 1,
+                }],
+                "selected_agent": agent_id, "terminal_session": null,
+                "terminal_revision": null,
+            }),
+        );
         assert_eq!(forced_replay["snapshot"], serde_json::Value::Null);
         assert_eq!(forced_replay["event_updates"][0]["reset"], true);
 
-        socket
-            .send(Message::Text(
-                json!({
-                    "type": "command", "request_id": 4,
-                    "payload": {
-                        "command": "update_input_draft", "agent_id": agent_id,
-                        "expected_revision": 0, "content": "draft survives reconnect",
-                    },
-                })
-                .to_string()
-                .into(),
-            ))
+        let updated: serde_json::Value = client
+            .post(format!("{address}/api/command"))
+            .json(&json!({
+                "command": "update_input_draft", "agent_id": agent_id,
+                "expected_revision": 0, "content": "draft survives polling",
+            }))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
             .unwrap();
-        let updated: serde_json::Value =
-            serde_json::from_str(socket.read().unwrap().into_text().unwrap().as_str()).unwrap();
         assert_eq!(updated["receipt"]["accepted"], true);
-        // Simulate a public-network interruption without a WebSocket close frame.
-        drop(socket);
 
-        let (mut reconnected, _) = tungstenite::connect(format!("{address}/api/ws")).unwrap();
-        reconnected
-            .send(Message::Text(
-                json!({
-                    "type": "sync", "request_id": 5,
-                    "snapshot_revision": snapshot_revision,
-                    "agents": [{
-                        "id": agent_id, "event_count": event_count,
-                        "mutation_revision": mutation_revision,
-                    }],
-                    "selected_agent": agent_id, "terminal_session": null,
-                    "terminal_revision": null,
-                })
-                .to_string()
-                .into(),
-            ))
-            .unwrap();
-        let recovered: serde_json::Value =
-            serde_json::from_str(reconnected.read().unwrap().into_text().unwrap().as_str())
-                .unwrap();
+        // A new HTTP client resumes entirely from the caller's revision cursors.
+        let reconnected_client = reqwest::blocking::Client::new();
+        let recovered = sync(
+            &reconnected_client,
+            json!({
+                "snapshot_revision": snapshot_revision,
+                "agents": [{
+                    "id": agent_id, "event_count": event_count,
+                    "mutation_revision": mutation_revision,
+                }],
+                "selected_agent": agent_id, "terminal_session": null,
+                "terminal_revision": null,
+            }),
+        );
         let recovered_agent = recovered["snapshot"]["agents"]
             .as_array()
             .unwrap()
             .iter()
             .find(|agent| agent["id"] == agent_id)
             .unwrap();
-        assert_eq!(recovered_agent["input_draft"], "draft survives reconnect");
+        assert_eq!(recovered_agent["input_draft"], "draft survives polling");
         assert!(recovered_agent["input_draft_revision"].as_u64().unwrap() > 0);
         assert!(recovered["event_updates"].as_array().unwrap().is_empty());
 
         let recovered_revision = recovered["snapshot"]["revision"].as_u64().unwrap();
         let recovered_draft_revision = recovered_agent["input_draft_revision"].as_u64().unwrap();
-        let (mut observer, _) = tungstenite::connect(format!("{address}/api/ws")).unwrap();
-        observer
-            .send(Message::Text(
-                json!({
-                    "type": "sync", "request_id": 6, "snapshot_revision": null,
-                    "agents": [], "selected_agent": agent_id, "terminal_session": null,
-                    "terminal_revision": null,
-                })
-                .to_string()
-                .into(),
-            ))
-            .unwrap();
-        let observed_initial: serde_json::Value =
-            serde_json::from_str(observer.read().unwrap().into_text().unwrap().as_str()).unwrap();
+        let observer = reqwest::blocking::Client::new();
+        let observed_initial = sync(
+            &observer,
+            json!({
+                "snapshot_revision": null, "agents": [],
+                "selected_agent": agent_id, "terminal_session": null,
+                "terminal_revision": null,
+            }),
+        );
         assert_eq!(observed_initial["snapshot"]["revision"], recovered_revision);
 
-        reconnected
-            .send(Message::Text(
-                json!({
-                    "type": "command", "request_id": 7,
-                    "payload": {
-                        "command": "update_input_draft", "agent_id": agent_id,
-                        "expected_revision": recovered_draft_revision,
-                        "content": "shared between active WebUIs",
-                    },
-                })
-                .to_string()
-                .into(),
-            ))
+        let shared_update: serde_json::Value = reconnected_client
+            .post(format!("{address}/api/command"))
+            .json(&json!({
+                "command": "update_input_draft", "agent_id": agent_id,
+                "expected_revision": recovered_draft_revision,
+                "content": "shared between active WebUIs",
+            }))
+            .send()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
             .unwrap();
-        let shared_update: serde_json::Value =
-            serde_json::from_str(reconnected.read().unwrap().into_text().unwrap().as_str())
-                .unwrap();
         assert_eq!(shared_update["receipt"]["accepted"], true);
 
-        observer
-            .send(Message::Text(
-                json!({
-                    "type": "sync", "request_id": 8,
-                    "snapshot_revision": recovered_revision,
-                    "agents": [{
-                        "id": agent_id, "event_count": event_count,
-                        "mutation_revision": mutation_revision,
-                    }],
-                    "selected_agent": agent_id, "terminal_session": null,
-                    "terminal_revision": null,
-                })
-                .to_string()
-                .into(),
-            ))
-            .unwrap();
-        let observed_shared: serde_json::Value =
-            serde_json::from_str(observer.read().unwrap().into_text().unwrap().as_str()).unwrap();
+        let observed_shared = sync(
+            &observer,
+            json!({
+                "snapshot_revision": recovered_revision,
+                "agents": [{
+                    "id": agent_id, "event_count": event_count,
+                    "mutation_revision": mutation_revision,
+                }],
+                "selected_agent": agent_id, "terminal_session": null,
+                "terminal_revision": null,
+            }),
+        );
         let observed_agent = observed_shared["snapshot"]["agents"]
             .as_array()
             .unwrap()
@@ -2416,8 +2257,6 @@ mod tests {
             "shared between active WebUIs"
         );
 
-        observer.close(None).unwrap();
-        reconnected.close(None).unwrap();
         drop(server);
         fs::remove_dir_all(directory).unwrap();
     }
