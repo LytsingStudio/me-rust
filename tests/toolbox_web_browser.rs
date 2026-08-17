@@ -175,6 +175,58 @@ fn generated_web_browser_toolbox(workspace: &Path) -> PathBuf {
         .join("WebBrowser.py")
 }
 
+#[test]
+fn web_browser_bootstrap_recovers_abandoned_lock_and_bounds_create() {
+    let Some((python, arguments)) = python_312() else {
+        eprintln!("skipping WebBrowser bootstrap test because Python 3.12 is unavailable");
+        return;
+    };
+    let workspace = temporary_directory("bootstrap-workspace");
+    let script = generated_web_browser_toolbox(&workspace);
+    let lock_root = temporary_directory("bootstrap-lock");
+    let probe = r#"
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("me_web_browser_test", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+root = Path(sys.argv[2])
+lock = root / "install.lock"
+lock.mkdir()
+(lock / "owner.json").write_text(json.dumps({"pid": 2147483000, "time": 0}), encoding="utf-8")
+updates = []
+with module.install_lock(root, updates.append):
+    owner = json.loads((lock / "owner.json").read_text(encoding="utf-8"))
+    assert owner["pid"] == os.getpid()
+assert not lock.exists()
+
+os.environ["ME_WEB_BROWSER_TEST_CREATE_TIMEOUT_MS"] = "321"
+assert module.request_hard_timeout_ms({"cmd": "execute", "tool": "Create", "input": {}}) == 321
+assert module.request_hard_timeout_ms({"cmd": "execute", "tool": "RequireHumanAction", "input": {}}) is None
+print("ok")
+"#;
+    let output = Command::new(python)
+        .args(arguments)
+        .args(["-c", probe])
+        .arg(&script)
+        .arg(&lock_root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "bootstrap probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+    fs::remove_dir_all(workspace).unwrap();
+    fs::remove_dir_all(lock_root).unwrap();
+}
+
 fn output(frame: &Value) -> &Value {
     assert_eq!(frame["type"], "result", "{frame}");
     &frame["output"]

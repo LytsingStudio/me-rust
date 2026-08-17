@@ -58,6 +58,9 @@ CAMOUFOX_BROWSER_RELEASE = f"official/stable/{CAMOUFOX_BROWSER_VERSION}"
 MIN_SNAPSHOT_WAIT_MS = 1_000
 MAX_SNAPSHOT_WAIT_MS = 60_000
 DEFAULT_OPERATION_HARD_TIMEOUT_MS = 30_000
+DEFAULT_CREATE_HARD_TIMEOUT_MS = 20 * 60_000
+INSTALL_COMMAND_TIMEOUT_SECONDS = 10 * 60
+INSTALL_LOCK_WAIT_SECONDS = 2 * 60
 MAX_BROWSER_EVENTS = 100
 MAX_BROWSER_EVENT_TEXT = 4_000
 WORKER_MODE_ENV = "ME_WEB_BROWSER_WORKER"
@@ -86,6 +89,16 @@ def operation_hard_timeout_ms() -> int:
         return max(100, min(DEFAULT_OPERATION_HARD_TIMEOUT_MS, int(configured)))
     except ValueError:
         return DEFAULT_OPERATION_HARD_TIMEOUT_MS
+
+
+def create_hard_timeout_ms() -> int:
+    configured = os.environ.get("ME_WEB_BROWSER_TEST_CREATE_TIMEOUT_MS")
+    if configured is None:
+        return DEFAULT_CREATE_HARD_TIMEOUT_MS
+    try:
+        return max(100, min(DEFAULT_CREATE_HARD_TIMEOUT_MS, int(configured)))
+    except ValueError:
+        return DEFAULT_CREATE_HARD_TIMEOUT_MS
 
 
 class ToolError(Exception):
@@ -455,10 +468,47 @@ def private_directory(path: Path) -> None:
         path.chmod(0o700)
 
 
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.OpenProcess(
+            process_query_limited_information, 0, ctypes.c_ulong(pid)
+        )
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def install_lock_owner(lock: Path) -> int | None:
+    try:
+        value = json.loads((lock / "owner.json").read_text(encoding="utf-8"))
+        pid = value.get("pid")
+        return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None
+
+
 @contextlib.contextmanager
-def install_lock(root: Path) -> Iterator[None]:
+def install_lock(root: Path, progress: Callable[[str], None]) -> Iterator[None]:
     lock = root / "install.lock"
-    deadline = time.monotonic() + 3600
+    deadline = time.monotonic() + INSTALL_LOCK_WAIT_SECONDS
+    waiting_reported = False
     while True:
         try:
             lock.mkdir()
@@ -471,13 +521,23 @@ def install_lock(root: Path) -> Iterator[None]:
                 age = time.time() - lock.stat().st_mtime
             except FileNotFoundError:
                 continue
-            if age > 3600:
+            owner = install_lock_owner(lock)
+            if owner is not None and not process_is_alive(owner):
                 shutil.rmtree(lock, ignore_errors=True)
                 continue
+            if owner is None and age > 10:
+                shutil.rmtree(lock, ignore_errors=True)
+                continue
+            if not waiting_reported:
+                progress(
+                    "Waiting for another WebBrowser runtime installation to finish"
+                )
+                waiting_reported = True
             if time.monotonic() >= deadline:
                 raise ToolError(
                     "dependency_install_busy",
-                    "another WebBrowser runtime installation did not finish within one hour",
+                    "another WebBrowser runtime installation is still active after two minutes; "
+                    "close the other ME process or retry after its installation finishes",
                     True,
                 )
             time.sleep(0.25)
@@ -535,7 +595,7 @@ class DependencyRuntime:
 
     def ensure(self, progress: Callable[[str], None]) -> None:
         if not self.package_marker.is_file():
-            with install_lock(self.runtime_root):
+            with install_lock(self.runtime_root, progress):
                 if not self.package_marker.is_file():
                     progress(
                         "Installing WebBrowser runtime "
@@ -568,7 +628,7 @@ class DependencyRuntime:
                 True,
             )
         if not self.browser_marker.is_file():
-            with install_lock(self.runtime_root):
+            with install_lock(self.runtime_root, progress):
                 if not self.browser_marker.is_file():
                     progress(
                         "Installing Camoufox browser "
@@ -599,9 +659,20 @@ class DependencyRuntime:
             f"PySide6-Essentials=={PYSIDE6_VERSION}",
         ]
         try:
-            completed = subprocess.run(
-                command, text=True, capture_output=True, timeout=1800, check=False
-            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    timeout=INSTALL_COMMAND_TIMEOUT_SECONDS,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise ToolError(
+                    "dependency_install_timeout",
+                    "WebBrowser Python dependencies did not finish installing within ten minutes",
+                    True,
+                ) from exc
             if completed.returncode != 0:
                 raise ToolError(
                     "dependency_install_failed", command_error(command, completed), True
@@ -634,14 +705,21 @@ class DependencyRuntime:
             "fetch",
             CAMOUFOX_BROWSER_RELEASE,
         ]
-        completed = subprocess.run(
-            command,
-            env=environment,
-            text=True,
-            capture_output=True,
-            timeout=1800,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=INSTALL_COMMAND_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ToolError(
+                "browser_install_timeout",
+                "Camoufox browser did not finish installing within ten minutes",
+                True,
+            ) from exc
         if completed.returncode != 0:
             raise ToolError("browser_install_failed", command_error(command, completed), True)
         self.browser_marker.write_text(
@@ -657,7 +735,7 @@ class DependencyRuntime:
         )
 
     def reinstall_browser(self, progress: Callable[[str], None]) -> None:
-        with install_lock(self.runtime_root):
+        with install_lock(self.runtime_root, progress):
             self.browser_marker.unlink(missing_ok=True)
             progress("Repairing Camoufox browser in ME-RUST global storage")
             subprocess.run(
@@ -2921,7 +2999,9 @@ def request_hard_timeout_ms(request: dict[str, Any]) -> int | None:
     if request.get("cmd") != "execute":
         return operation_hard_timeout_ms()
     tool = request.get("tool")
-    if tool in ("Create", "RequireHumanAction"):
+    if tool == "Create":
+        return create_hard_timeout_ms()
+    if tool == "RequireHumanAction":
         return None
     if tool == "Snapshot":
         input_value = request.get("input")
