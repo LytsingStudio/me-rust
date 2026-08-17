@@ -21,6 +21,8 @@ function loadProjectionRuntime() {
       workerActivityIndex,
       applyCompactApiActivity,
       estimateContextBreakdown,
+      toolBrief,
+      renderToolCard,
     };`);
   const runtime = factory(
     { querySelector: () => null },
@@ -62,6 +64,45 @@ function assertIncrementalChatMatchesReplay(runtime, events) {
 }
 
 describe("WebUI incremental event projections", () => {
+  test("renders each ordinary tool as one summary line until clicked open", () => {
+    const runtime = loadProjectionRuntime();
+    runtime.state.selectedAgent = "main";
+    const tool = {
+      id: 7,
+      name: "File.Search",
+      args: { path: ".", query: "needle" },
+      started: 1_000,
+      queued: false,
+      output: "a long result\nwith another line",
+      result: { state: "Succeeded", detail: "{}", finished: 2_000 },
+    };
+
+    expect(runtime.toolBrief(tool)).toBe(". needle");
+    const collapsed = runtime.renderToolCard(tool);
+    expect(collapsed).toContain('class="tool-brief">. needle</span>');
+    expect(collapsed).not.toContain('class="tool-details"');
+
+    runtime.state.expandedTools.add("main:7");
+    const expanded = runtime.renderToolCard(tool);
+    expect(expanded).toContain('class="tool-details"');
+    expect(expanded).toContain("a long result\nwith another line");
+
+    const terminal = {
+      id: 8,
+      name: "Terminal.Interact",
+      sessionId: "pty-8",
+      args: {
+        session_id: "pty-8",
+        input: [{ type: "text", text: "pwd" }, { type: "key", key: "enter" }],
+      },
+      started: 1_000,
+      queued: false,
+      output: "",
+      result: null,
+    };
+    expect(runtime.toolBrief(terminal)).toBe("pty-8 pwd↵");
+  });
+
   test("uses the persisted normalized context categories", () => {
     const runtime = loadProjectionRuntime();
     const usage = { input_tokens: 9_000, output_tokens: 1_000, total_tokens: 10_000 };

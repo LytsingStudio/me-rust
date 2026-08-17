@@ -1430,6 +1430,22 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_tool_cards_are_single_line_summaries_until_expanded() {
+        assert!(APP_JS.contains("function toolCardView(tool)"));
+        assert!(APP_JS.contains("rows: expanded ? toolRows(tool, true) : []"));
+        assert!(APP_JS.contains("view.expanded ? renderToolDetails(view.rows) : \"\""));
+        assert!(APP_JS.contains("function updateToolCardNode(node, tool)"));
+        assert!(APP_JS.contains("if (message.kind === \"tool\")"));
+        assert!(APP_JS.contains("class=\"tool-name\""));
+        assert!(APP_JS.contains("class=\"tool-brief\""));
+        assert!(STYLE_CSS.contains(
+            ".tool-header { display: grid; grid-template-columns: 15px max-content minmax(0, 1fr)"
+        ));
+        assert!(STYLE_CSS.contains(".tool-brief { min-width: 0; overflow: hidden;"));
+        assert!(STYLE_CSS.contains("text-overflow: ellipsis; white-space: nowrap;"));
+    }
+
+    #[test]
     fn landscape_chat_surfaces_share_the_wider_content_boundary() {
         assert_eq!(STYLE_CSS.matches("calc((100% - 1200px) / 2)").count(), 3);
         assert!(!STYLE_CSS.contains("calc((100% - 900px) / 2)"));

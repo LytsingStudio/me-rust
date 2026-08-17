@@ -129,10 +129,12 @@ button { color: inherit; }
 .block-marker { color: var(--muted); font-size: 18px; line-height: 1.45; }
 .notice .block-marker, .session .block-marker { color: var(--dim); }
 .notice-content, .session-content { color: var(--muted); white-space: pre-wrap; overflow-wrap: anywhere; }
-.tool-card { contain: layout paint style; content-visibility: auto; contain-intrinsic-size: auto 80px; margin: 0 0 20px 0; border-radius: 10px; cursor: pointer; outline: none; }
+.tool-card { contain: layout paint style; content-visibility: auto; contain-intrinsic-size: auto 31px; margin: 0 0 20px 0; border-radius: 10px; cursor: pointer; outline: none; }
 .tool-card:hover, .tool-card:focus-visible { background: rgb(255 255 255 / 2.5%); }
-.tool-header { display: flex; align-items: center; gap: 9px; min-height: 31px; border: 0; background: transparent; padding: 0; cursor: pointer; font-weight: 750; }
-.tool-marker { width: 15px; color: var(--muted); font-size: 18px; }
+.tool-header { display: grid; grid-template-columns: 15px max-content minmax(0, 1fr); align-items: center; gap: 8px; min-height: 31px; min-width: 0; border: 0; background: transparent; padding: 0; cursor: pointer; }
+.tool-marker { width: 15px; color: var(--muted); font-size: 18px; line-height: 1; }
+.tool-name { color: var(--text); font-weight: 400; }
+.tool-brief { min-width: 0; overflow: hidden; color: var(--muted); font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
 .tool-card.running .tool-marker { color: var(--text); animation: tool-marker-breathe 900ms ease-in-out infinite; will-change: opacity; }
 .tool-card.succeeded .tool-marker { color: var(--green); }
 .tool-card.failed .tool-marker { color: var(--red); }

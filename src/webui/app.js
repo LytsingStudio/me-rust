@@ -1810,6 +1810,11 @@ function updateMessageNode(node, message, afterTool, index) {
     node.meRenderRevision = messageRenderRevision(message, afterTool);
     return;
   }
+  if (message.kind === "tool") {
+    updateToolCardNode(node, message.tool);
+    node.meRenderRevision = messageRenderRevision(message, afterTool);
+    return;
+  }
   node.replaceWith(createMessageNode(message, afterTool, index));
 }
 
@@ -1986,7 +1991,10 @@ function bindToolCard(card) {
     const messages = currentProjection().messages;
     const index = messages.findIndex((message) =>
       message.kind === "tool" && String(message.tool.id) === card.dataset.toolCard);
-    if (index >= 0) card.replaceWith(createMessageNode(messages[index], false, index));
+    if (index >= 0) {
+      updateToolCardNode(card, messages[index].tool);
+      card.meRenderRevision = messageRenderRevision(messages[index], false);
+    }
   };
   card.addEventListener("click", toggle);
   card.addEventListener("keydown", (event) => {
@@ -1995,16 +2003,46 @@ function bindToolCard(card) {
 }
 
 function renderToolCard(tool) {
-  const key = `${state.selectedAgent}:${tool.id}`;
-  const expanded = state.expandedTools.has(key);
-  const resultState = normalize(tool.result?.state || "");
-  const status = !tool.result ? "running" : resultState === "succeeded" ? "succeeded" : "failed";
+  const view = toolCardView(tool);
   const marker = "●";
-  const rows = toolRows(tool, expanded);
-  return `<div class="tool-card ${status} ${expanded ? "expanded" : ""}" data-tool-card="${escapeAttr(tool.id)}" role="button" tabindex="0" aria-expanded="${expanded}">
-    <div class="tool-header"><span class="tool-marker">${marker}</span><span>${escapeHtml(tool.name)}</span></div>
-    <div class="tool-details">${rows.map((row, index) => `<div class="tool-row"><span class="tool-tree">${index + 1 === rows.length ? "└" : "├"}─</span><span class="tool-key">${escapeHtml(row.key)}</span><${expanded && row.pre ? "pre" : "span"} class="tool-value ${row.pre ? "tool-output" : ""}"${row.runningStarted == null ? "" : ` data-running-started="${row.runningStarted}"`}>${escapeHtml(row.value)}</${expanded && row.pre ? "pre" : "span"}></div>`).join("")}</div>
+  return `<div class="tool-card ${view.status} ${view.expanded ? "expanded" : ""}" data-tool-card="${escapeAttr(tool.id)}" role="button" tabindex="0" aria-expanded="${view.expanded}">
+    <div class="tool-header"><span class="tool-marker">${marker}</span><span class="tool-name">${escapeHtml(tool.name)}</span><span class="tool-brief">${escapeHtml(view.brief)}</span></div>
+    ${view.expanded ? renderToolDetails(view.rows) : ""}
   </div>`;
+}
+
+function toolCardView(tool) {
+  const resultState = normalize(tool.result?.state || "");
+  const expanded = state.expandedTools.has(`${state.selectedAgent}:${tool.id}`);
+  return {
+    expanded,
+    status: !tool.result ? "running" : resultState === "succeeded" ? "succeeded" : "failed",
+    brief: toolBrief(tool),
+    rows: expanded ? toolRows(tool, true) : [],
+  };
+}
+
+function renderToolDetails(rows) {
+  return `<div class="tool-details">${rows.map((row, index) => `<div class="tool-row"><span class="tool-tree">${index + 1 === rows.length ? "└" : "├"}─</span><span class="tool-key">${escapeHtml(row.key)}</span><${row.pre ? "pre" : "span"} class="tool-value ${row.pre ? "tool-output" : ""}"${row.runningStarted == null ? "" : ` data-running-started="${row.runningStarted}"`}>${escapeHtml(row.value)}</${row.pre ? "pre" : "span"}></div>`).join("")}</div>`;
+}
+
+function updateToolCardNode(node, tool) {
+  const view = toolCardView(tool);
+  node.className = `tool-card ${view.status} ${view.expanded ? "expanded" : ""}`;
+  node.setAttribute("aria-expanded", String(view.expanded));
+  const name = node.querySelector(":scope > .tool-header .tool-name");
+  const brief = node.querySelector(":scope > .tool-header .tool-brief");
+  if (name.textContent !== tool.name) name.textContent = tool.name;
+  if (brief.textContent !== view.brief) brief.textContent = view.brief;
+  const details = node.querySelector(":scope > .tool-details");
+  if (!view.expanded) {
+    details?.remove();
+    return;
+  }
+  const template = document.createElement("template");
+  template.innerHTML = renderToolDetails(view.rows);
+  const replacement = template.content.firstElementChild;
+  if (details) details.replaceWith(replacement); else node.append(replacement);
 }
 
 function renderWorkerActivity(wait) {
@@ -2042,7 +2080,7 @@ function workerToolView(tool) {
   return {
     status: !tool.result ? "running"
       : normalize(tool.result.state) === "succeeded" ? "succeeded" : "failed",
-    brief: workerToolBrief(tool),
+    brief: toolBrief(tool),
   };
 }
 
@@ -2194,7 +2232,7 @@ function workerWaitIsVisible(wait) {
   return !wait.result || workerWaitState(wait) !== "running";
 }
 
-function workerToolBrief(tool) {
+function toolBrief(tool) {
   if (tool.result && normalize(tool.result.state) !== "succeeded") {
     const detail = String(tool.result.detail || "").trim().split(/\r?\n/, 1)[0];
     return detail ? `失败: ${detail}` : "失败";
@@ -2204,7 +2242,7 @@ function workerToolBrief(tool) {
   const terminalInput = tool.name.startsWith("Terminal.") ? toolInput(tool) : "";
   if (terminalInput) parts.push(toolPreview(terminalInput));
   if (tool.args) {
-    for (const key of ["path", "url", "page_id", "element_id", "query", "command", "name"]) {
+    for (const key of ["path", "url", "page_id", "element_id", "query", "command", "instruction", "name"]) {
       const value = tool.args[key];
       if (["string", "number", "boolean"].includes(typeof value) && String(value)
           && !parts.includes(String(value))) parts.push(String(value));
@@ -2241,10 +2279,42 @@ function toolInput(tool) {
   if (!args || Object.keys(args).length === 0) return "";
   if (typeof args.content === "string") return args.content;
   if (typeof args.input === "string") return args.input;
+  if (tool.name.startsWith("Terminal.") && Array.isArray(args.input)) {
+    return args.input.map(terminalInputActionLabel).join("");
+  }
   if (Array.isArray(args.events)) return args.events.map((event) => event.text || event.key || JSON.stringify(event)).join("");
   const copy = { ...args };
   delete copy.session_id;
   return Object.keys(copy).length ? JSON.stringify(copy, null, 2) : "";
+}
+
+function terminalInputActionLabel(action) {
+  if (action?.type === "text") {
+    return Array.from(String(action.text || ""), (character) => {
+      if (character === "\r" || character === "\n") return "↵";
+      if (character === "\t") return "⇥";
+      if (character === "\u001b") return "Esc";
+      if (character === "\u007f") return "Del";
+      const code = character.codePointAt(0);
+      return code < 32 ? `\\u{${code.toString(16).padStart(4, "0")}}` : character;
+    }).join("");
+  }
+  if (action?.type !== "key" || typeof action.key !== "string") return "";
+  const modifiers = new Set(Array.isArray(action.modifiers) ? action.modifiers : []);
+  const prefix = [["ctrl", "Ctrl"], ["alt", "Alt"], ["shift", "Shift"]]
+    .filter(([modifier]) => modifiers.has(modifier))
+    .map(([, label]) => `${label}+`).join("");
+  const plain = modifiers.size === 0;
+  const labels = plain ? {
+    enter: "↵", escape: "Esc", tab: "⇥", backspace: "⌫", delete: "Del",
+    up: "↑", down: "↓", left: "←", right: "→",
+  } : {};
+  let key = labels[action.key];
+  if (!key) key = action.key.length === 1
+    ? action.key.toUpperCase()
+    : action.key.replace(/(^|_)(.)/g, (_match, _separator, letter) => letter.toUpperCase());
+  const repeat = Number(action.repeat) > 1 ? `×${Number(action.repeat)}` : "";
+  return `${prefix}${key}${repeat}`;
 }
 
 function renderObjective() {

@@ -3260,7 +3260,6 @@ impl TranscriptRenderer {
             .filter_map(|message| message.tool.as_ref())
             .filter(|tool| tool.result.is_none() && !tool.queued)
             .collect::<Vec<_>>();
-        debug_assert_eq!(status_distances.len(), running_tools.len());
         let tool_clocks = status_distances
             .into_iter()
             .zip(running_tools)
@@ -3503,7 +3502,6 @@ fn paint_running_tool_clocks<W: Write>(
                 now_ms,
             ),
             clock.width,
-            false,
         );
         let row = rows
             .first()
@@ -5769,7 +5767,7 @@ fn worker_activity_rows(
                 ToolResultState::Failed | ToolResultState::Cancelled | ToolResultState::Interrupted,
             ) => MarkdownColorRole::Error,
         };
-        let brief = worker_tool_brief(tool);
+        let brief = tool_brief(tool);
         let mut spans = vec![
             MarkdownSpan::new("  ● ", MarkdownTextStyle::colored(marker_color).bold()),
             MarkdownSpan::new(tool.name.clone(), MarkdownTextStyle::default()),
@@ -5823,7 +5821,7 @@ fn worker_wait_state(wait: &ToolCard) -> WorkerActivityState {
     }
 }
 
-fn worker_tool_brief(tool: &ToolCard) -> String {
+fn tool_brief(tool: &ToolCard) -> String {
     if let Some(result) = tool.result.as_ref()
         && result.state != ToolResultState::Succeeded
     {
@@ -5852,6 +5850,7 @@ fn worker_tool_brief(tool: &ToolCard) -> String {
             "element_id",
             "query",
             "command",
+            "instruction",
             "name",
         ] {
             let Some(value) = arguments.get(key) else {
@@ -5875,7 +5874,6 @@ fn worker_tool_brief(tool: &ToolCard) -> String {
 }
 
 fn tool_rows(tool: &ToolCard, width: usize, expanded: bool, now_ms: u64) -> Vec<UiRow> {
-    let mut rows = Vec::new();
     let (icon, tone) = match (tool.result.as_ref().map(|result| result.state), tool.queued) {
         (None, true) => ("●", RowTone::ToolQueued),
         (None, false) => ("●", RowTone::ToolRunning),
@@ -5884,24 +5882,54 @@ fn tool_rows(tool: &ToolCard, width: usize, expanded: bool, now_ms: u64) -> Vec<
         (Some(ToolResultState::Cancelled), _) => ("●", RowTone::ToolFailed),
         (Some(ToolResultState::Interrupted), _) => ("●", RowTone::ToolFailed),
     };
+    if !expanded {
+        let marker_color = match tone {
+            RowTone::ToolRunning => MarkdownColorRole::Primary,
+            RowTone::ToolQueued => MarkdownColorRole::Muted,
+            RowTone::ToolSucceeded => MarkdownColorRole::Success,
+            RowTone::ToolFailed => MarkdownColorRole::Error,
+            _ => unreachable!("tool summary has an invalid row tone"),
+        };
+        let visible_name = truncate_with_ellipsis(&tool.name, width.saturating_sub(2));
+        let mut spans = vec![
+            MarkdownSpan::new(
+                format!("{icon} "),
+                MarkdownTextStyle::colored(marker_color).bold(),
+            ),
+            MarkdownSpan::new(visible_name.clone(), MarkdownTextStyle::default()),
+        ];
+        let brief = tool_brief(tool);
+        let available = width
+            .saturating_sub(2 + display_width(&visible_name))
+            .saturating_sub(1);
+        if !brief.is_empty() && available > 0 {
+            spans.push(MarkdownSpan::new(
+                format!(" {}", truncate_with_ellipsis(&brief, available)),
+                MarkdownTextStyle::colored(MarkdownColorRole::Muted),
+            ));
+        }
+        return vec![UiRow::markdown(spans, tone)];
+    }
+
+    let mut rows = Vec::new();
     rows.push(UiRow::new(format!("{icon} {}", tool.name), tone));
 
     let argument_session = terminal_argument(&tool.arguments, "session_id");
     if let Some(session_id) = tool.session_id.as_deref().or(argument_session.as_deref()) {
-        append_tool_field(&mut rows, "Session", session_id, width, expanded);
+        append_tool_field(&mut rows, "Session", session_id, width);
     }
     if let Some(input) = terminal_input(&tool.arguments) {
-        append_tool_field(&mut rows, "Input", &input, width, expanded);
+        append_tool_field(&mut rows, "Input", &input, width);
     }
     if tool.name == "WebBrowser.RequireHumanAction"
         && let Some(instruction) = terminal_argument(&tool.arguments, "instruction")
     {
-        append_tool_field(&mut rows, "Action", &instruction, width, expanded);
+        append_tool_field(&mut rows, "Action", &instruction, width);
     }
 
     let output = visible_tool_output(tool);
     if !output.is_empty() {
-        append_tool_field(&mut rows, "Output", &output, width, expanded);
+        append_tool_field(&mut rows, "Output", &output, width);
     }
 
     let finished_at = tool
@@ -5911,7 +5939,7 @@ fn tool_rows(tool: &ToolCard, width: usize, expanded: bool, now_ms: u64) -> Vec<
         .unwrap_or(now_ms);
     let elapsed = finished_at.saturating_sub(tool.started_at_ms);
     if tool.queued {
-        append_tool_status(&mut rows, "Queued", width, expanded);
+        append_tool_status(&mut rows, "Queued", width);
     } else if tool.result.is_none() {
         append_running_tool_status(
             &mut rows,
@@ -5922,40 +5950,35 @@ fn tool_rows(tool: &ToolCard, width: usize, expanded: bool, now_ms: u64) -> Vec<
                 now_ms,
             ),
             width,
-            expanded,
         );
     } else {
         append_tool_status(
             &mut rows,
             &format!("Time use: {}", format_duration(elapsed)),
             width,
-            expanded,
         );
     }
     rows
 }
 
-const TOOL_EXPAND_HINT: &str = " (Ctrl+O to expand)";
-
-fn append_tool_field(rows: &mut Vec<UiRow>, name: &str, value: &str, width: usize, expanded: bool) {
+fn append_tool_field(rows: &mut Vec<UiRow>, name: &str, value: &str, width: usize) {
     let label = format!("  ├ {name:<7}: ");
     let label_width = display_width(&label);
     let continuation = format!("  │ {}", " ".repeat(label_width.saturating_sub(4)));
-    append_tool_item(rows, &label, &continuation, value, width, expanded);
+    append_tool_item(rows, &label, &continuation, value, width);
 }
 
-fn append_tool_status(rows: &mut Vec<UiRow>, value: &str, width: usize, expanded: bool) {
-    append_tool_item(rows, "  └ ", "    ", value, width, expanded);
+fn append_tool_status(rows: &mut Vec<UiRow>, value: &str, width: usize) {
+    append_tool_item(rows, "  └ ", "    ", value, width);
 }
 
-fn append_running_tool_status(rows: &mut Vec<UiRow>, value: &str, width: usize, expanded: bool) {
+fn append_running_tool_status(rows: &mut Vec<UiRow>, value: &str, width: usize) {
     append_tool_item_with_tone(
         rows,
         "  └ ",
         "    ",
         value,
         width,
-        expanded,
         RowTone::ToolRunningStatus,
     );
 }
@@ -5966,7 +5989,6 @@ fn append_tool_item(
     continuation: &str,
     value: &str,
     width: usize,
-    expanded: bool,
 ) {
     append_tool_item_with_tone(
         rows,
@@ -5974,7 +5996,6 @@ fn append_tool_item(
         continuation,
         value,
         width,
-        expanded,
         RowTone::ToolDetail,
     );
 }
@@ -5985,19 +6006,9 @@ fn append_tool_item_with_tone(
     continuation: &str,
     value: &str,
     width: usize,
-    expanded: bool,
     tone: RowTone,
 ) {
     let available = width.saturating_sub(display_width(prefix)).max(1);
-    if !expanded {
-        let value = collapsed_tool_value(value, available);
-        rows.push(UiRow::new(
-            truncate(&format!("{prefix}{value}"), width),
-            tone,
-        ));
-        return;
-    }
-
     let wrapped = wrap(value, available);
     for (index, line) in wrapped.into_iter().enumerate() {
         let prefix = if index == 0 { prefix } else { continuation };
@@ -6026,23 +6037,6 @@ fn running_tool_status_text(
     format!(
         "Running ... {}{timeout}",
         format_duration(now_ms.saturating_sub(started_at_ms))
-    )
-}
-
-fn collapsed_tool_value(value: &str, width: usize) -> String {
-    let flattened = value.replace(['\r', '\n'], " ");
-    let expandable = wrap(value, width).len() > 1 || display_width(&flattened) > width;
-    if !expandable {
-        return flattened;
-    }
-
-    let hint_width = display_width(TOOL_EXPAND_HINT);
-    if width <= hint_width {
-        return truncate_with_ellipsis(TOOL_EXPAND_HINT.trim(), width);
-    }
-    format!(
-        "{}{TOOL_EXPAND_HINT}",
-        truncate_with_ellipsis(&flattened, width - hint_width)
     )
 }
 
@@ -7867,7 +7861,7 @@ mod tests {
         assert_eq!(running.state, WorkerActivityState::Running);
         assert_eq!(running.tools.len(), 1);
         assert_eq!(running.tools[0].name, "File.Stat");
-        assert_eq!(worker_tool_brief(&running.tools[0]), "src/main.rs");
+        assert_eq!(tool_brief(&running.tools[0]), "src/main.rs");
         assert_eq!(
             worker_activity_rows(&wait, Some(&running), 80)[0],
             UiRow::new("● 正在执行", RowTone::ToolRunning)
@@ -7884,7 +7878,7 @@ mod tests {
             output: String::new(),
             result: None,
         };
-        assert_eq!(worker_tool_brief(&current_directory_search), ". NTC");
+        assert_eq!(tool_brief(&current_directory_search), ". NTC");
         let search_rows = worker_activity_rows(
             &wait,
             Some(&WorkerActivity {
@@ -9120,25 +9114,23 @@ mod tests {
             result: None,
         };
         let running_rows = tool_rows(&running, 100, false, 2_200);
+        assert_eq!(running_rows.len(), 1);
         assert_eq!(running_rows[0].tone, RowTone::ToolRunning);
-        assert!(
-            running_rows[1..running_rows.len() - 1]
-                .iter()
-                .all(|row| row.tone == RowTone::ToolDetail)
-        );
-        assert_eq!(
-            running_rows.last().map(|row| row.tone),
-            Some(RowTone::ToolRunningStatus)
-        );
         let running_text = running_rows
             .into_iter()
             .map(|row| row.text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(running_text.contains("● Terminal.Interact"));
-        assert!(running_text.contains("Session: pty-4"));
-        assert!(running_text.contains("Input  : pwd↵"));
-        assert!(running_text.contains("Running ... 1.2s (timeout 3s)"));
+        assert_eq!(running_text, "● Terminal.Interact pty-4 pwd↵");
+
+        let running_detail = tool_rows(&running, 100, true, 2_200)
+            .into_iter()
+            .map(|row| row.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(running_detail.contains("Session: pty-4"));
+        assert!(running_detail.contains("Input  : pwd↵"));
+        assert!(running_detail.contains("Running ... 1.2s (timeout 3s)"));
 
         let human_action = ToolCard {
             id: 8,
@@ -9158,8 +9150,10 @@ mod tests {
             .map(|row| row.text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(human_action_text.contains("Action : Complete the visible verification"));
-        assert!(human_action_text.contains("等待浏览器人工操作 ... 1.2s"));
+        assert_eq!(
+            human_action_text,
+            "● WebBrowser.RequireHumanAction p0000001 Complete the visible verification"
+        );
 
         let completed = ToolCard {
             output: "/root\nproject".to_owned(),
@@ -9178,9 +9172,7 @@ mod tests {
             .map(|row| row.text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(collapsed.contains("● Terminal.Interact"));
-        assert!(collapsed.contains("Output : /root project (Ctrl+O to expand)"));
-        assert!(collapsed.contains("Time use: 2.5s"));
+        assert_eq!(collapsed, "● Terminal.Interact pty-4 pwd↵");
 
         let expanded = tool_rows(&completed, 100, true, 9_999)
             .into_iter()
@@ -9189,7 +9181,7 @@ mod tests {
             .join("\n");
         assert!(expanded.contains("Output : /root"));
         assert!(expanded.contains("│          project"));
-        assert!(!expanded.contains("Ctrl+O to expand"));
+        assert!(expanded.contains("Time use: 2.5s"));
 
         let failed = ToolCard {
             result: Some(ToolCardResult {
@@ -9215,7 +9207,7 @@ mod tests {
             }),
             ..completed
         };
-        let empty = tool_rows(&empty, 100, false, 9_999)
+        let empty = tool_rows(&empty, 100, true, 9_999)
             .into_iter()
             .map(|row| row.text)
             .collect::<Vec<_>>()
@@ -9270,7 +9262,8 @@ mod tests {
         );
         let queued_rows = tool_rows(tools[1], 80, false, 1_000);
         assert_eq!(queued_rows[0].tone, RowTone::ToolQueued);
-        assert_eq!(queued_rows.last().unwrap().text, "  └ Queued");
+        assert_eq!(queued_rows.len(), 1);
+        assert_eq!(queued_rows[0].text, "● File.Stat b");
 
         edb.append_tool_result(first, ToolResultState::Failed, None, "failed")
             .unwrap();
@@ -9335,7 +9328,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_tool_information_items_are_single_line_and_expand_consistently() {
+    fn collapsed_tool_call_is_one_summary_line_and_expands_to_complete_details() {
         let session_id = format!("pty-{}", "session".repeat(12));
         let input = format!("printf {}", "argument ".repeat(12));
         let tool = ToolCard {
@@ -9363,45 +9356,19 @@ mod tests {
         };
         let width = 60;
         let collapsed = tool_rows(&tool, width, false, 2_000);
-        assert_eq!(collapsed.len(), 5);
-        assert!(
-            collapsed
-                .iter()
-                .all(|row| !row.text.contains(['\r', '\n']) && display_width(&row.text) <= width)
-        );
-        assert_eq!(
-            collapsed
-                .iter()
-                .filter(|row| row.text.contains(TOOL_EXPAND_HINT.trim()))
-                .count(),
-            3
-        );
+        assert_eq!(collapsed.len(), 1);
+        assert!(!collapsed[0].text.contains(['\r', '\n']));
+        assert!(display_width(&collapsed[0].text) <= width);
+        assert!(collapsed[0].text.starts_with("● Terminal.Interact pty-"));
+        assert!(collapsed[0].text.ends_with('…'));
 
         let expanded = tool_rows(&tool, width, true, 2_000);
         assert!(expanded.len() > collapsed.len());
-        assert!(
-            expanded
-                .iter()
-                .all(|row| !row.text.contains(TOOL_EXPAND_HINT.trim()))
-        );
-
-        let mut collapsed_status = Vec::new();
-        append_tool_status(
-            &mut collapsed_status,
-            "Running with an intentionally long status message",
-            32,
-            false,
-        );
-        assert_eq!(collapsed_status.len(), 1);
-        assert!(collapsed_status[0].text.contains(TOOL_EXPAND_HINT.trim()));
-        assert!(display_width(&collapsed_status[0].text) <= 32);
-
         let mut expanded_status = Vec::new();
         append_tool_status(
             &mut expanded_status,
             "Running with an intentionally long status message",
             32,
-            true,
         );
         assert!(expanded_status.len() > 1);
     }
@@ -9446,10 +9413,6 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.text.contains("terminal output line 79"))
-        );
-        assert!(
-            rows.iter()
-                .all(|row| !row.text.contains(TOOL_EXPAND_HINT.trim()))
         );
         assert_eq!(
             rows.get(rows.len() - 2),
@@ -10258,10 +10221,11 @@ mod tests {
         assert_eq!(
             collapsed
                 .iter()
-                .filter(|row| row.text.contains("Ctrl+O to expand"))
+                .filter(|row| row.tone == RowTone::ToolSucceeded)
                 .count(),
             2
         );
+        assert!(collapsed.iter().all(|row| !row.text.contains("Output")));
 
         let expanded = chat_rows(&projection, 80, true, 10);
         let expanded = expanded
@@ -10273,6 +10237,5 @@ mod tests {
         assert!(expanded.contains("│          two"));
         assert!(expanded.contains("Output : three"));
         assert!(expanded.contains("│          four"));
-        assert!(!expanded.contains("Ctrl+O to expand"));
     }
 }
