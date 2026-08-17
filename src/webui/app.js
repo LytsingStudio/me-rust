@@ -1,6 +1,8 @@
 "use strict";
 
-const POLL_MS = 200;
+const REALTIME_SYNC_MS = 200;
+const REALTIME_SYNC_TIMEOUT_MS = 15000;
+const RECONNECT_MAX_MS = 5000;
 const INPUT_ANIMATION_QUIET_MS = 250;
 const TRANSCRIPT_BOTTOM_THRESHOLD_PX = 24;
 const API_ACTIVE = new Set(["Requesting", "Streaming", "Retrying"]);
@@ -51,7 +53,20 @@ const state = {
   authRequired: false,
   authenticated: false,
   connected: false,
-  polling: false,
+  connecting: false,
+  snapshotInitialized: false,
+  socket: null,
+  socketGeneration: 0,
+  syncInFlight: false,
+  syncTimer: null,
+  syncWatchdog: null,
+  reconnectTimer: null,
+  reconnectAttempt: 0,
+  nextRequestId: 1,
+  pendingSocketRequests: new Map(),
+  terminalFrames: new Map(),
+  terminalFramesUnavailable: new Set(),
+  pageClosing: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -62,6 +77,10 @@ const elements = {
   loginPassword: $("#login-password"),
   loginError: $("#login-error"),
   loginSubmit: $("#login-submit"),
+  connectionOverlay: $("#connection-overlay"),
+  connectionOverlayTitle: $("#connection-overlay-title"),
+  connectionOverlayMessage: $("#connection-overlay-message"),
+  connectionRetry: $("#connection-retry"),
   connection: $("#connection-label"),
   environment: $("#environment-footer"),
   agents: $("#agent-list"),
@@ -183,8 +202,10 @@ async function api(path, options = {}) {
 }
 
 function showLogin(message = "") {
+  stopRealtime();
   state.authenticated = false;
   state.connected = false;
+  hideConnectionOverlay();
   elements.app.classList.add("hidden");
   elements.loginScreen.classList.remove("hidden");
   elements.loginError.textContent = message;
@@ -208,7 +229,7 @@ async function initializeAuthentication() {
     }
     showApplication();
     restoreDraft();
-    poll();
+    connectRealtime();
   } catch (error) {
     showLogin(`无法读取登录状态：${error.message}`);
   }
@@ -228,7 +249,7 @@ async function submitLogin(event) {
     state.authenticated = true;
     showApplication();
     restoreDraft();
-    poll();
+    connectRealtime();
   } catch (error) {
     showLogin(error.message);
     elements.loginPassword.select();
@@ -237,58 +258,273 @@ async function submitLogin(event) {
   }
 }
 
-async function command(payload) {
-  return api("/api/command", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+function websocketUrl() {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/api/ws`;
+}
+
+function connectRealtime() {
+  if (state.pageClosing || (state.authRequired && !state.authenticated)) return;
+  if (state.socket?.readyState === WebSocket.OPEN
+      || state.socket?.readyState === WebSocket.CONNECTING) return;
+  clearTimeout(state.reconnectTimer);
+  state.reconnectTimer = null;
+  state.connected = false;
+  state.connecting = true;
+  renderConnection();
+  showConnectionOverlay(
+    state.reconnectAttempt ? "正在重新连接" : "正在连接",
+    state.reconnectAttempt
+      ? `连接已断开，正在进行第 ${state.reconnectAttempt + 1} 次重试。`
+      : "正在同步当前界面，请稍候。",
+  );
+  const generation = ++state.socketGeneration;
+  const socket = new WebSocket(websocketUrl());
+  state.socket = socket;
+  socket.addEventListener("open", () => {
+    if (generation !== state.socketGeneration) return;
+    state.syncInFlight = false;
+    requestRealtimeSync();
+  });
+  socket.addEventListener("message", (event) => {
+    if (generation !== state.socketGeneration) return;
+    handleRealtimeMessage(event.data);
+  });
+  socket.addEventListener("error", () => {
+    if (generation === state.socketGeneration) socket.close();
+  });
+  socket.addEventListener("close", () => {
+    if (generation === state.socketGeneration) handleRealtimeDisconnect();
   });
 }
 
-async function poll() {
-  if (state.polling) return;
-  state.polling = true;
-  try {
-    const previousSnapshot = state.snapshot;
-    const wasConnected = state.connected;
-    const snapshot = await api("/api/snapshot");
-    const presentationChanged = snapshotPresentationSignature(previousSnapshot)
-      !== snapshotPresentationSignature(snapshot);
-    state.connected = true;
-    state.snapshot = snapshot;
-    const selectionChanged = reconcileAgents();
-    const apiActivityChanged = await syncApiActivity();
-    const eventChanges = await Promise.all(snapshot.agents.map(syncAgentEvents));
-    const selectedEventsChanged = eventChanges.some((change) =>
-      change.changed && change.agentId === state.selectedAgent);
-    const selectedWorkerChanged = eventChanges.some((change) =>
-      change.changed && isWorkerForSelectedAgent(change.agentId));
-    const agentSummaryChanged = eventChanges.some((change) => change.summaryChanged);
-    const terminalChanged = state.selectedAgent ? await syncTerminals() : false;
-    requestRender({
-      full: !wasConnected || selectionChanged,
-      connection: !wasConnected,
-      agents: presentationChanged || agentSummaryChanged,
-      tabs: presentationChanged || terminalChanged,
-      currentEvents: selectedEventsChanged,
-      workerEvents: selectedWorkerChanged,
-      apiActivity: apiActivityChanged,
-      status: apiActivityChanged,
-    });
-    if (!inputHasPriority()) flushPendingRender();
-    else if (state.view.kind === "terminal") void renderTerminal();
-  } catch (error) {
-    if (error.status === 401) {
-      showLogin("登录已失效，请重新登录。");
-      return;
+function stopRealtime() {
+  clearTimeout(state.syncTimer);
+  clearTimeout(state.syncWatchdog);
+  clearTimeout(state.reconnectTimer);
+  state.syncTimer = null;
+  state.syncWatchdog = null;
+  state.reconnectTimer = null;
+  state.syncInFlight = false;
+  state.socketGeneration += 1;
+  const socket = state.socket;
+  state.socket = null;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+  rejectPendingSocketRequests("连接已关闭，操作状态未知");
+}
+
+function handleRealtimeDisconnect() {
+  clearTimeout(state.syncTimer);
+  clearTimeout(state.syncWatchdog);
+  state.syncTimer = null;
+  state.syncWatchdog = null;
+  state.socket = null;
+  state.connected = false;
+  state.connecting = false;
+  state.syncInFlight = false;
+  rejectPendingSocketRequests("连接已断开，操作状态未知");
+  renderConnection();
+  if (state.pageClosing || (state.authRequired && !state.authenticated)) return;
+  state.reconnectAttempt += 1;
+  const delay = Math.min(RECONNECT_MAX_MS, 250 * (2 ** Math.min(state.reconnectAttempt - 1, 5)));
+  showConnectionOverlay(
+    "正在重新连接",
+    `连接已断开，将在 ${Math.max(1, Math.ceil(delay / 1000))} 秒内重试。`,
+  );
+  const generation = state.socketGeneration;
+  state.reconnectTimer = setTimeout(async () => {
+    if (generation !== state.socketGeneration || state.pageClosing) return;
+    if (state.authRequired) {
+      try {
+        const status = await api("/api/auth/status");
+        if (generation !== state.socketGeneration || state.pageClosing) return;
+        if (!status.authenticated) {
+          showLogin("登录已失效，请重新登录");
+          return;
+        }
+      } catch (_) {
+        // The server can be temporarily unreachable. Keep the reconnect loop active.
+      }
     }
-    if (state.connected) toast(`连接已断开：${error.message}`, true);
-    state.connected = false;
-    renderConnection();
-  } finally {
-    state.polling = false;
-    if (!state.authRequired || state.authenticated) setTimeout(poll, POLL_MS);
+    connectRealtime();
+  }, delay);
+}
+
+function rejectPendingSocketRequests(message) {
+  for (const pending of state.pendingSocketRequests.values()) pending.reject(new Error(message));
+  state.pendingSocketRequests.clear();
+}
+
+function showConnectionOverlay(title, message) {
+  elements.connectionOverlayTitle.textContent = title;
+  elements.connectionOverlayMessage.textContent = message;
+  elements.connectionOverlay.classList.remove("hidden");
+  elements.app.inert = true;
+  if (elements.app.contains(document.activeElement)) document.activeElement.blur();
+}
+
+function hideConnectionOverlay() {
+  elements.connectionOverlay.classList.add("hidden");
+  elements.app.inert = false;
+}
+
+function scheduleRealtimeSync(delay = REALTIME_SYNC_MS) {
+  clearTimeout(state.syncTimer);
+  if (!state.connected && state.socket?.readyState !== WebSocket.OPEN) return;
+  state.syncTimer = setTimeout(requestRealtimeSync, delay);
+}
+
+function requestRealtimeSync() {
+  if (state.syncInFlight || state.socket?.readyState !== WebSocket.OPEN) return;
+  const requestId = state.nextRequestId++;
+  const terminalKey = state.view.kind === "terminal" && state.selectedAgent && state.view.sessionId
+    ? `${state.selectedAgent}:${state.view.sessionId}` : null;
+  state.syncInFlight = true;
+  try {
+    state.socket.send(JSON.stringify({
+      type: "sync",
+      request_id: requestId,
+      snapshot_revision: state.snapshotInitialized ? state.snapshot.revision : null,
+      agents: [...state.stores].map(([id, store]) => ({
+        id,
+        event_count: store.events.length,
+        mutation_revision: store.mutationRevision,
+      })),
+      selected_agent: state.selectedAgent,
+      terminal_session: state.view.kind === "terminal" ? state.view.sessionId : null,
+      terminal_revision: terminalKey ? state.terminalRevisions.get(terminalKey) ?? null : null,
+    }));
+    clearTimeout(state.syncWatchdog);
+    state.syncWatchdog = setTimeout(() => state.socket?.close(), REALTIME_SYNC_TIMEOUT_MS);
+  } catch (_) {
+    state.syncInFlight = false;
+    state.socket?.close();
   }
+}
+
+function requestRealtimeSyncNow() {
+  clearTimeout(state.syncTimer);
+  state.syncTimer = null;
+  if (!state.syncInFlight) requestRealtimeSync();
+}
+
+function handleRealtimeMessage(raw) {
+  let message;
+  try { message = JSON.parse(raw); }
+  catch (_) { return state.socket?.close(); }
+  if (message.type === "state") {
+    clearTimeout(state.syncWatchdog);
+    state.syncWatchdog = null;
+    state.syncInFlight = false;
+    try {
+      applyRealtimeState(message);
+      scheduleRealtimeSync();
+    } catch (_) {
+      state.socket?.close();
+    }
+    return;
+  }
+  if (message.type === "sync_error") {
+    clearTimeout(state.syncWatchdog);
+    state.syncWatchdog = null;
+    state.syncInFlight = false;
+    return state.socket?.close();
+  }
+  if (message.type === "command_result" || message.type === "query_result") {
+    const pending = state.pendingSocketRequests.get(Number(message.request_id));
+    if (!pending) return;
+    state.pendingSocketRequests.delete(Number(message.request_id));
+    if (message.ok) pending.resolve(message);
+    else pending.reject(new Error(message.error || "操作失败"));
+    requestRealtimeSyncNow();
+    return;
+  }
+  state.socket?.close();
+}
+
+function sendSocketQuery(type, fields = {}) {
+  if (!state.connected || state.socket?.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("连接尚未恢复，请稍候"));
+  }
+  const requestId = state.nextRequestId++;
+  return new Promise((resolve, reject) => {
+    state.pendingSocketRequests.set(requestId, { resolve, reject });
+    try {
+      state.socket.send(JSON.stringify({ type, request_id: requestId, ...fields }));
+    } catch (error) {
+      state.pendingSocketRequests.delete(requestId);
+      reject(error);
+      state.socket?.close();
+    }
+  });
+}
+
+function sendSocketCommand(payload) {
+  if (!state.connected || state.socket?.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error("连接尚未恢复，请稍候"));
+  }
+  const requestId = state.nextRequestId++;
+  return new Promise((resolve, reject) => {
+    state.pendingSocketRequests.set(requestId, { resolve, reject });
+    try {
+      state.socket.send(JSON.stringify({ type: "command", request_id: requestId, payload }));
+    } catch (error) {
+      state.pendingSocketRequests.delete(requestId);
+      reject(error);
+      state.socket?.close();
+    }
+  });
+}
+
+function applyRealtimeState(payload) {
+  const previousSnapshot = state.snapshot;
+  const wasConnected = state.connected;
+  if (payload.snapshot) {
+    state.snapshot = payload.snapshot;
+    state.snapshotInitialized = true;
+  }
+  if (!state.snapshotInitialized) throw new Error("实时连接未提供初始状态");
+  const presentationChanged = snapshotPresentationSignature(previousSnapshot)
+    !== snapshotPresentationSignature(state.snapshot);
+  const selectionChanged = reconcileAgents();
+  const updates = new Map((payload.event_updates || []).map((update) => [update.agent_id, update]));
+  const eventChanges = state.snapshot.agents.map((meta) => syncAgentEvents(meta, updates.get(meta.id)));
+  const selectedEventsChanged = eventChanges.some((change) =>
+    change.changed && change.agentId === state.selectedAgent);
+  const selectedWorkerChanged = eventChanges.some((change) =>
+    change.changed && isWorkerForSelectedAgent(change.agentId));
+  const agentSummaryChanged = eventChanges.some((change) => change.summaryChanged);
+  const responseMatchesSelection = (payload.selected_agent ?? null) === state.selectedAgent;
+  const apiActivityChanged = responseMatchesSelection
+    ? syncApiActivity(payload.api_activity || {}) : false;
+  const terminalChanged = responseMatchesSelection
+    ? syncTerminals(payload.terminals || []) : false;
+  if (responseMatchesSelection && payload.terminal_frame_updated) {
+    syncTerminalFrame(payload.terminal_session, payload.terminal_frame ?? null);
+  }
+  const fullyRecovered = responseMatchesSelection || wasConnected;
+  state.connected = fullyRecovered;
+  state.connecting = !fullyRecovered;
+  if (fullyRecovered) {
+    state.reconnectAttempt = 0;
+    hideConnectionOverlay();
+  }
+  requestRender({
+    full: !wasConnected || selectionChanged,
+    connection: !wasConnected,
+    agents: presentationChanged || agentSummaryChanged,
+    tabs: presentationChanged || terminalChanged,
+    currentEvents: selectedEventsChanged,
+    workerEvents: selectedWorkerChanged,
+    apiActivity: apiActivityChanged,
+    status: apiActivityChanged,
+  });
+  if (!inputHasPriority()) flushPendingRender();
+  else if (state.view.kind === "terminal") renderTerminal();
+  for (const [agentId, sync] of state.draftSync) {
+    if (sync.sent !== sync.desired) void runDraftSync(agentId, sync);
+  }
+  if (!responseMatchesSelection) requestRealtimeSyncNow();
 }
 
 function inputHasPriority() {
@@ -308,11 +544,8 @@ function emptyRenderRequest() {
   };
 }
 
-async function syncApiActivity() {
+function syncApiActivity(next) {
   const agentId = state.selectedAgent;
-  const next = agentId
-    ? await api(`/api/api-activity/${agentId}`)
-    : { active: false, received_sse_events: 0 };
   const normalized = {
     agentId,
     active: Boolean(next.active),
@@ -378,7 +611,7 @@ function reconcileAgents() {
     || previousView !== `${state.view.kind}:${state.view.sessionId || ""}`;
 }
 
-async function syncAgentEvents(meta) {
+function syncAgentEvents(meta, payload) {
   let store = state.stores.get(meta.id);
   let changed = false;
   if (!store) {
@@ -410,7 +643,7 @@ async function syncAgentEvents(meta) {
     observePromptSubmission(meta, store);
     return { agentId: meta.id, changed, summaryChanged: false };
   }
-  const payload = await api(`/api/events/${meta.id}?after=${store.events.length}&mutation=${store.mutationRevision}`);
+  if (!payload) throw new Error(`Agent ${meta.id} 的增量状态不完整`);
   const previousSummary = JSON.stringify(store.summary);
   if (payload.reset) {
     store.events = payload.events;
@@ -439,7 +672,7 @@ function observeInputDraft(meta, store) {
   if (sync?.paused) return false;
   const content = String(meta.input_draft || "");
 
-  // A snapshot can observe this page's write before the POST response arrives.
+  // A state sync can observe this page's write before its command response arrives.
   // Advance the shared baseline without replacing newer text still being typed.
   const flight = sync?.inFlight;
   if (flight && revision === flight.expectedRevision + 1 && content === flight.content) {
@@ -454,6 +687,15 @@ function observeInputDraft(meta, store) {
     if (!sync.pendingRemote || revision > sync.pendingRemote.revision) {
       sync.pendingRemote = { revision, content };
     }
+    return false;
+  }
+
+  // Preserve a local edit that lost its acknowledgement during a disconnect. The
+  // recovered server revision becomes the next compare-and-set base, then the draft
+  // is safely submitted again instead of replacing text already visible to the user.
+  if (sync && !sync.paused && !sync.inFlight && sync.desired !== sync.sent) {
+    store.inputDraftRevision = revision;
+    sync.sent = content;
     return false;
   }
   adoptInputDraft(meta.id, store, revision, content);
@@ -504,9 +746,7 @@ function observePromptSubmission(meta, store) {
   return true;
 }
 
-async function syncTerminals() {
-  const payload = await api(`/api/terminals/${state.selectedAgent}`);
-  const sessions = payload.sessions || [];
+function syncTerminals(sessions) {
   let changed = terminalListSignature(state.terminals) !== terminalListSignature(sessions);
   state.terminals = sessions;
   if (state.view.kind === "terminal"
@@ -515,6 +755,20 @@ async function syncTerminals() {
     changed = true;
   }
   return changed;
+}
+
+function syncTerminalFrame(sessionId, frame) {
+  if (!sessionId || !state.selectedAgent) return;
+  const key = `${state.selectedAgent}:${sessionId}`;
+  if (frame) {
+    state.terminalFrames.set(key, frame);
+    state.terminalRevisions.set(key, Number(frame.revision) || 0);
+    state.terminalFramesUnavailable.delete(key);
+  } else {
+    state.terminalFrames.delete(key);
+    state.terminalRevisions.delete(key);
+    state.terminalFramesUnavailable.add(key);
+  }
 }
 
 function terminalListSignature(sessions) {
@@ -1315,8 +1569,8 @@ function suspendTranscriptAutoFollow() {
 }
 
 function renderConnection() {
-  elements.connection.textContent = state.connected ? "已连接" : "连接已断开";
-  elements.connection.style.color = state.connected ? "var(--green)" : "var(--red)";
+  elements.connection.textContent = state.connected ? "已连接" : state.connecting ? "正在连接" : "连接已断开";
+  elements.connection.style.color = state.connected ? "var(--green)" : state.connecting ? "var(--muted)" : "var(--red)";
   const environment = state.snapshot.environment;
   elements.environment.textContent = environment
     ? `${environment.system} · ${window.location.host}`
@@ -1404,6 +1658,7 @@ function selectAgent(id) {
   delete elements.terminalScreen.dataset.revision;
   restoreDraft();
   renderAll();
+  requestRealtimeSyncNow();
 }
 
 function renderTabs() {
@@ -2263,18 +2518,19 @@ function confirmContextClear() {
   openConfirm("清空上下文？", "", "清空上下文", () => sendCommand({ command: "clear_context", agent_id: agentId }), true);
 }
 
-async function renderTerminal() {
+function renderTerminal() {
   const sessionId = state.view.sessionId;
   if (!sessionId || !state.selectedAgent) return;
-  try {
-    const payload = await api(`/api/terminal/${state.selectedAgent}/${sessionId}`);
-    if (state.view.kind !== "terminal" || state.view.sessionId !== sessionId) return;
-    const frame = payload.frame;
-    if (!frame) {
-      showTerminalMessage(`Terminal ${sessionId} 已不可用`);
-      return;
-    }
-    const revisionKey = `${state.selectedAgent}:${sessionId}`;
+  const revisionKey = `${state.selectedAgent}:${sessionId}`;
+  const frame = state.terminalFrames.get(revisionKey);
+  if (!frame) {
+    showTerminalMessage(state.terminalFramesUnavailable.has(revisionKey)
+      ? `Terminal ${sessionId} 已不可用`
+      : `正在同步 Terminal ${sessionId}…`);
+    requestRealtimeSyncNow();
+    return;
+  }
+  if (state.view.kind !== "terminal" || state.view.sessionId !== sessionId) return;
     const previousRevision = state.terminalRevisions.get(revisionKey) || 0;
     if (frame.revision < previousRevision) return;
     const sameRenderedFrame = elements.terminalScreen.dataset.terminalKey === revisionKey
@@ -2303,9 +2559,6 @@ async function renderTerminal() {
     elements.terminalScreen.dataset.revision = String(frame.revision);
     restoreTerminalScroll(elements.terminalView, scroll);
     state.terminalFollowBottom = scroll.followBottom;
-  } catch (error) {
-    showTerminalMessage(error.message);
-  }
 }
 
 function showTerminalMessage(message) {
@@ -2456,7 +2709,7 @@ async function openDeleteAgent(agentId = state.selectedAgent) {
     const agent = state.snapshot.agents.find((candidate) => candidate.id === agentId);
     if (!agent) return toast("该会话已不存在", true);
     const label = agent.title || agent.id;
-    const payload = await api(`/api/deletion-blocker/${agentId}`);
+    const payload = await sendSocketQuery("deletion_blocker", { agent_id: agentId });
     if (payload.blocker) return openConfirm("无法删除会话", `“${label}”当前不可删除：${payload.blocker}`, "返回", async () => {});
     openConfirm("删除会话？", `将永久删除“${label}”及其全部记录。此操作不可恢复。`, "永久删除", async () => {
       await sendCommand({ command: "delete_agent", agent_id: agentId });
@@ -2554,7 +2807,7 @@ async function confirmModal() {
 }
 
 async function sendCommand(payload) {
-  return command(payload);
+  return sendSocketCommand(payload);
 }
 
 async function submitPrompt() {
@@ -2672,8 +2925,10 @@ function queueDraftUpdate(agentId, content) {
 }
 
 async function runDraftSync(agentId, sync) {
-  if (sync.sending || sync.paused) return;
+  if (sync.sending || sync.paused || !state.connected
+      || (sync.retryAfter && Date.now() < sync.retryAfter)) return;
   sync.sending = true;
+  let failed = false;
   try {
     while (!sync.paused
         && !(state.composing && state.selectedAgent === agentId)
@@ -2705,16 +2960,24 @@ async function runDraftSync(agentId, sync) {
       }
       store.inputDraftRevision = revision;
       sync.sent = content;
+      sync.errorNotified = false;
+      sync.retryAfter = 0;
     }
   } catch (error) {
+    failed = true;
     sync.sent = null;
-    toast(`输入同步失败：${error.message}`, true);
+    sync.retryAfter = Date.now() + 1000;
+    if (state.connected && !sync.errorNotified) {
+      sync.errorNotified = true;
+      toast(`输入同步失败：${error.message}`, true);
+    }
   } finally {
     const shouldRetry = sync.sent !== sync.desired;
     sync.sending = false;
     const waiters = sync.waiters.splice(0);
     waiters.forEach((resolve) => resolve());
-    if (!sync.paused && !(state.composing && state.selectedAgent === agentId) && shouldRetry) {
+    if (!failed && state.connected && !sync.paused
+        && !(state.composing && state.selectedAgent === agentId) && shouldRetry) {
       void runDraftSync(agentId, sync);
     }
   }
@@ -2763,21 +3026,19 @@ function flushDraftBeforePageCloses() {
   }
   for (const [agentId, content] of drafts) {
     const expectedRevision = state.stores.get(agentId)?.inputDraftRevision ?? 0;
-    const body = JSON.stringify({
-      command: "update_input_draft",
-      agent_id: agentId,
-      expected_revision: expectedRevision,
-      content,
-    });
-    if (navigator.sendBeacon
-      && navigator.sendBeacon("/api/command", new Blob([body], { type: "application/json" }))) continue;
-    void fetch("/api/command", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      cache: "no-store",
-      keepalive: true,
-    });
+    if (state.socket?.readyState !== WebSocket.OPEN) continue;
+    try {
+      state.socket.send(JSON.stringify({
+        type: "command",
+        request_id: state.nextRequestId++,
+        payload: {
+          command: "update_input_draft",
+          agent_id: agentId,
+          expected_revision: expectedRevision,
+          content,
+        },
+      }));
+    } catch (_) {}
   }
 }
 
@@ -2866,6 +3127,20 @@ elements.tabs.querySelectorAll("button[data-view]").forEach((button) => button.a
   showView({ kind: button.dataset.view, sessionId: null });
 }));
 elements.loginForm.addEventListener("submit", submitLogin);
+elements.connectionRetry.addEventListener("click", () => {
+  clearTimeout(state.reconnectTimer);
+  clearTimeout(state.syncWatchdog);
+  state.reconnectTimer = null;
+  state.syncWatchdog = null;
+  const socket = state.socket;
+  state.socketGeneration += 1;
+  state.socket = null;
+  state.connected = false;
+  state.connecting = false;
+  state.syncInFlight = false;
+  if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+  connectRealtime();
+});
 elements.addAgent.addEventListener("click", () => { closeMobileSidebar(); openAddAgent(); });
 elements.mobileDeleteAgent.addEventListener("click", () => { closeMobileSidebar(); openDeleteAgent(); });
 elements.mobileSidebarToggle.addEventListener("click", openMobileSidebar);
@@ -2972,7 +3247,14 @@ window.addEventListener("resize", () => {
     void renderTerminal();
   }
 });
-window.addEventListener("pagehide", flushDraftBeforePageCloses);
+window.addEventListener("pagehide", () => {
+  state.pageClosing = true;
+  flushDraftBeforePageCloses();
+});
+window.addEventListener("pageshow", () => {
+  state.pageClosing = false;
+  if ((!state.authRequired || state.authenticated) && !state.connected) connectRealtime();
+});
 const transcriptBottomFollower = createTranscriptBottomFollower(
   elements.transcript,
   elements.transcriptContent,

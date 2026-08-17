@@ -48,6 +48,14 @@ button { color: inherit; }
 .login-card > button { width: 100%; min-height: 41px; }
 
 .app-shell { display: grid; grid-template-columns: 250px minmax(0, 1fr); height: 100vh; overflow: hidden; }
+.connection-overlay { position: fixed; inset: 0; z-index: 120; display: grid; place-items: center; padding: 24px; background: rgb(7 8 12 / 76%); backdrop-filter: blur(7px); }
+.connection-card { display: grid; justify-items: center; width: min(360px, 100%); padding: 28px 25px 24px; border: 1px solid var(--border-bright); border-radius: 16px; background: var(--panel); box-shadow: var(--shadow); text-align: center; }
+.connection-card h2 { margin: 16px 0 7px; font-size: 18px; }
+.connection-card p { min-height: 38px; margin: 0 0 18px; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.connection-card button { min-width: 112px; }
+.connection-spinner { width: 26px; height: 26px; border: 3px solid var(--border-bright); border-top-color: var(--violet); border-radius: 50%; animation: connection-spin .8s linear infinite; }
+@keyframes connection-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .connection-spinner { animation-duration: 1.8s; } }
 .sidebar { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border); background: #0e1015; }
 .brand { display: flex; align-items: center; gap: 12px; padding: 20px 18px 18px; }
 .brand-mark { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 11px; background: linear-gradient(145deg, #5367df, #9a60e9); font-weight: 900; letter-spacing: -.08em; box-shadow: 0 8px 28px rgb(113 94 225 / 28%); }

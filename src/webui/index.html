@@ -90,6 +90,15 @@
     </main>
   </div>
 
+  <div id="connection-overlay" class="connection-overlay hidden" role="alertdialog" aria-modal="true" aria-labelledby="connection-overlay-title">
+    <div class="connection-card">
+      <span class="connection-spinner" aria-hidden="true"></span>
+      <h2 id="connection-overlay-title">正在重新连接</h2>
+      <p id="connection-overlay-message">连接已断开，正在恢复当前界面。</p>
+      <button id="connection-retry" class="primary-button" type="button">立即重试</button>
+    </div>
+  </div>
+
   <div id="user-message-menu" class="user-message-menu hidden" role="menu">
     <button id="copy-user-message" type="button" role="menuitem">复制</button>
     <button id="rewind-user-message" class="danger" type="button" role="menuitem">撤回</button>

@@ -123,4 +123,31 @@ describe("WebUI authoritative input draft synchronization", () => {
     expect(store.inputDraftRevision).toBe(4);
     expect(state.draftSync.get("main").desired).toBe("next message");
   });
+
+  test("an unacknowledged local draft survives reconnect state recovery", () => {
+    const { state, elements, observeInputDraft } = loadDraftRuntime();
+    const store = { inputDraftRevision: 8 };
+    state.selectedAgent = "main";
+    state.drafts.set("main", "本地尚未确认的输入");
+    elements.input.value = "本地尚未确认的输入";
+    state.draftSync.set("main", {
+      desired: "本地尚未确认的输入",
+      sent: "旧服务端草稿",
+      sending: false,
+      paused: false,
+      inFlight: null,
+      pendingRemote: null,
+      waiters: [],
+    });
+
+    expect(observeInputDraft({
+      id: "main",
+      input_draft_revision: 9,
+      input_draft: "另一页面写入的草稿",
+    }, store)).toBe(false);
+    expect(store.inputDraftRevision).toBe(9);
+    expect(elements.input.value).toBe("本地尚未确认的输入");
+    expect(state.draftSync.get("main").desired).toBe("本地尚未确认的输入");
+    expect(state.draftSync.get("main").sent).toBe("另一页面写入的草稿");
+  });
 });
