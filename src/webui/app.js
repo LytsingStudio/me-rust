@@ -1732,15 +1732,16 @@ function reconcileTranscript(messages, changedFrom = 0) {
     const message = messages[index];
     const visible = messageIsVisible(message);
     const afterTool = visible && isToolLikeKind(previousKind) && message.kind === "assistant";
+    const followsTool = visible && previousKind === "tool" && message.kind === "tool";
     const key = messageDomKey(message, index);
-    const revision = messageRenderRevision(message, afterTool);
+    const revision = messageRenderRevision(message, afterTool, followsTool);
     const current = elements.transcriptContent.children[index];
     if (!current || current.dataset.messageKey !== key) {
       while (elements.transcriptContent.children.length > index) elements.transcriptContent.lastElementChild.remove();
       elements.transcriptContent.append(createMessageFragment(messages, index, previousKind));
       return;
     }
-    if (current.meRenderRevision !== revision) updateMessageNode(current, message, afterTool, index);
+    if (current.meRenderRevision !== revision) updateMessageNode(current, message, afterTool, followsTool, index);
     if (visible) previousKind = message.kind;
   }
   while (elements.transcriptContent.children.length > messages.length) elements.transcriptContent.lastElementChild.remove();
@@ -1767,34 +1768,35 @@ function createMessageFragment(messages, start, previousKind) {
     const message = messages[index];
     const visible = messageIsVisible(message);
     const afterTool = visible && isToolLikeKind(previous) && message.kind === "assistant";
-    descriptors.push({ message, afterTool, index });
+    const followsTool = visible && previous === "tool" && message.kind === "tool";
+    descriptors.push({ message, afterTool, followsTool, index });
     if (visible) previous = message.kind;
   }
   const template = document.createElement("template");
-  template.innerHTML = descriptors.map(({ message, afterTool }) => renderMessageHtml(message, afterTool)).join("");
+  template.innerHTML = descriptors.map(({ message, afterTool, followsTool }) => renderMessageHtml(message, afterTool, followsTool)).join("");
   [...template.content.children].forEach((node, offset) => {
-    const { message, afterTool, index } = descriptors[offset];
-    initializeMessageNode(node, message, afterTool, index);
+    const { message, afterTool, followsTool, index } = descriptors[offset];
+    initializeMessageNode(node, message, afterTool, followsTool, index);
   });
   return template.content;
 }
 
-function createMessageNode(message, afterTool, index) {
+function createMessageNode(message, afterTool, followsTool, index) {
   const template = document.createElement("template");
-  template.innerHTML = renderMessageHtml(message, afterTool).trim();
+  template.innerHTML = renderMessageHtml(message, afterTool, followsTool).trim();
   const node = template.content.firstElementChild;
-  initializeMessageNode(node, message, afterTool, index);
+  initializeMessageNode(node, message, afterTool, followsTool, index);
   return node;
 }
 
-function updateMessageNode(node, message, afterTool, index) {
+function updateMessageNode(node, message, afterTool, followsTool, index) {
   const visible = messageIsVisible(message);
   if (node.dataset.messageVisible !== String(visible)) {
-    node.replaceWith(createMessageNode(message, afterTool, index));
+    node.replaceWith(createMessageNode(message, afterTool, followsTool, index));
     return;
   }
   if (!visible) {
-    node.meRenderRevision = messageRenderRevision(message, afterTool);
+    node.meRenderRevision = messageRenderRevision(message, afterTool, followsTool);
     return;
   }
   if (message.kind === "assistant") {
@@ -1802,27 +1804,27 @@ function updateMessageNode(node, message, afterTool, index) {
     const markdown = node.querySelector(":scope > .markdown");
     const rendered = renderMarkdown(message.content.trim());
     if (markdown.innerHTML !== rendered) markdown.innerHTML = rendered;
-    node.meRenderRevision = messageRenderRevision(message, afterTool);
+    node.meRenderRevision = messageRenderRevision(message, afterTool, followsTool);
     return;
   }
   if (message.kind === "worker-activity") {
     updateWorkerActivityNode(node, message.tool);
-    node.meRenderRevision = messageRenderRevision(message, afterTool);
+    node.meRenderRevision = messageRenderRevision(message, afterTool, followsTool);
     return;
   }
   if (message.kind === "tool") {
-    updateToolCardNode(node, message.tool);
-    node.meRenderRevision = messageRenderRevision(message, afterTool);
+    updateToolCardNode(node, message.tool, followsTool);
+    node.meRenderRevision = messageRenderRevision(message, afterTool, followsTool);
     return;
   }
-  node.replaceWith(createMessageNode(message, afterTool, index));
+  node.replaceWith(createMessageNode(message, afterTool, followsTool, index));
 }
 
-function initializeMessageNode(node, message, afterTool, index) {
+function initializeMessageNode(node, message, afterTool, followsTool, index) {
   node.dataset.messageKey = messageDomKey(message, index);
   node.dataset.messageVisible = String(messageIsVisible(message));
   node.dataset.messageKind = messageIsVisible(message) ? message.kind : "";
-  node.meRenderRevision = messageRenderRevision(message, afterTool);
+  node.meRenderRevision = messageRenderRevision(message, afterTool, followsTool);
   if (message.kind === "tool") bindToolCard(node);
   if (message.kind === "user") bindUserMessage(node, message);
   if (message.kind === "turn-toolbar") bindTurnToolbar(node, message);
@@ -1832,12 +1834,12 @@ function messageDomKey(message, index) {
   return `${state.selectedAgent}:${message.key || `${message.kind}:${message.timestamp}:${index}`}`;
 }
 
-function renderMessageHtml(message, afterTool) {
+function renderMessageHtml(message, afterTool, followsTool = false) {
   if (!messageIsVisible(message)) return `<div class="message-block projection-hidden hidden" aria-hidden="true"></div>`;
   if (message.kind === "user") return `<div class="message-block user"><div class="user-message-content"> ${escapeHtml(message.content)}</div><button class="user-message-actions" type="button" aria-label="消息操作" aria-haspopup="menu" aria-expanded="false">···</button></div>`;
   if (message.kind === "assistant") return `<div class="message-block assistant ${afterTool ? "after-tool" : ""}"><span class="block-marker">●</span><div class="markdown">${renderMarkdown(message.content.trim())}</div></div>`;
   if (message.kind === "turn-toolbar") return `<div class="message-block turn-toolbar" aria-label="本轮用时"><span>▶ 用时 ${formatTurnElapsed(message.durationMs)} · ${formatTurnTokens(message.tokenCount)} · ${formatTurnCompletedAt(message.timestamp)}</span><div class="turn-actions"><button class="clone-turn" type="button">克隆</button><button class="regenerate-turn" type="button">重新生成</button></div></div>`;
-  if (message.kind === "tool") return renderToolCard(message.tool);
+  if (message.kind === "tool") return renderToolCard(message.tool, followsTool);
   if (message.kind === "worker-activity") return renderWorkerActivity(message.tool);
   const className = message.kind === "session" ? "session" : "notice";
   return `<div class="message-block ${className}"><span class="block-marker">●</span><div class="${className}-content">${escapeHtml(message.content)}</div></div>`;
@@ -1969,14 +1971,14 @@ async function copyTextToClipboard(content) {
   if (!copied) throw new Error("浏览器未允许复制到剪贴板");
 }
 
-function messageRenderRevision(message, afterTool) {
+function messageRenderRevision(message, afterTool, followsTool = false) {
   const expanded = message.kind === "tool"
     && state.expandedTools.has(`${state.selectedAgent}:${message.tool.id}`);
   const revision = message.kind === "tool" || message.kind === "worker-activity"
     ? message.tool.revision : message.revision;
   const workerRevision = message.kind === "worker-activity"
     ? workerActivityForWait(message.tool)?.revision || 0 : 0;
-  return `${revision ?? message.timestamp}:${message.presentationRevision || 0}:${workerRevision}:${afterTool ? 1 : 0}:${expanded ? 1 : 0}`;
+  return `${revision ?? message.timestamp}:${message.presentationRevision || 0}:${workerRevision}:${afterTool ? 1 : 0}:${followsTool ? 1 : 0}:${expanded ? 1 : 0}`;
 }
 
 function isToolLikeKind(kind) {
@@ -1993,7 +1995,7 @@ function bindToolCard(card) {
       message.kind === "tool" && String(message.tool.id) === card.dataset.toolCard);
     if (index >= 0) {
       updateToolCardNode(card, messages[index].tool);
-      card.meRenderRevision = messageRenderRevision(messages[index], false);
+      card.meRenderRevision = messageRenderRevision(messages[index], false, card.classList.contains("follows-tool"));
     }
   };
   card.addEventListener("click", toggle);
@@ -2002,10 +2004,10 @@ function bindToolCard(card) {
   });
 }
 
-function renderToolCard(tool) {
+function renderToolCard(tool, followsTool = false) {
   const view = toolCardView(tool);
   const marker = "●";
-  return `<div class="tool-card ${view.status} ${view.expanded ? "expanded" : ""}" data-tool-card="${escapeAttr(tool.id)}" role="button" tabindex="0" aria-expanded="${view.expanded}">
+  return `<div class="tool-card ${view.status} ${view.expanded ? "expanded" : ""} ${followsTool ? "follows-tool" : ""}" data-tool-card="${escapeAttr(tool.id)}" role="button" tabindex="0" aria-expanded="${view.expanded}">
     <div class="tool-header"><span class="tool-marker">${marker}</span><span class="tool-name">${escapeHtml(tool.name)}</span><span class="tool-brief">${escapeHtml(view.brief)}</span></div>
     ${view.expanded ? renderToolDetails(view.rows) : ""}
   </div>`;
@@ -2026,9 +2028,9 @@ function renderToolDetails(rows) {
   return `<div class="tool-details">${rows.map((row, index) => `<div class="tool-row"><span class="tool-tree">${index + 1 === rows.length ? "└" : "├"}─</span><span class="tool-key">${escapeHtml(row.key)}</span><${row.pre ? "pre" : "span"} class="tool-value ${row.pre ? "tool-output" : ""}"${row.runningStarted == null ? "" : ` data-running-started="${row.runningStarted}"`}>${escapeHtml(row.value)}</${row.pre ? "pre" : "span"}></div>`).join("")}</div>`;
 }
 
-function updateToolCardNode(node, tool) {
+function updateToolCardNode(node, tool, followsTool = node.classList.contains("follows-tool")) {
   const view = toolCardView(tool);
-  node.className = `tool-card ${view.status} ${view.expanded ? "expanded" : ""}`;
+  node.className = `tool-card ${view.status} ${view.expanded ? "expanded" : ""} ${followsTool ? "follows-tool" : ""}`;
   node.setAttribute("aria-expanded", String(view.expanded));
   const name = node.querySelector(":scope > .tool-header .tool-name");
   const brief = node.querySelector(":scope > .tool-header .tool-brief");

@@ -1,6 +1,6 @@
 [package]
 name = "me"
-version = "0.0.299"
+version = "0.0.300"
 edition = "2024"
 description = "A lightweight local agent runtime optimized for long-running work"
 license = "MIT"

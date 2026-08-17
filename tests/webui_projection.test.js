@@ -23,6 +23,7 @@ function loadProjectionRuntime() {
       estimateContextBreakdown,
       toolBrief,
       renderToolCard,
+      renderMessageHtml,
     };`);
   const runtime = factory(
     { querySelector: () => null },
@@ -101,6 +102,11 @@ describe("WebUI incremental event projections", () => {
       result: null,
     };
     expect(runtime.toolBrief(terminal)).toBe("pty-8 pwd↵");
+
+    const compact = runtime.renderMessageHtml({ kind: "tool", tool }, false, true);
+    const separated = runtime.renderMessageHtml({ kind: "tool", tool }, false, false);
+    expect(compact).toContain("follows-tool");
+    expect(separated).not.toContain("follows-tool");
   });
 
   test("uses the persisted normalized context categories", () => {

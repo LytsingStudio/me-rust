@@ -1434,7 +1434,7 @@ mod tests {
         assert!(APP_JS.contains("function toolCardView(tool)"));
         assert!(APP_JS.contains("rows: expanded ? toolRows(tool, true) : []"));
         assert!(APP_JS.contains("view.expanded ? renderToolDetails(view.rows) : \"\""));
-        assert!(APP_JS.contains("function updateToolCardNode(node, tool)"));
+        assert!(APP_JS.contains("function updateToolCardNode(node, tool, followsTool ="));
         assert!(APP_JS.contains("if (message.kind === \"tool\")"));
         assert!(APP_JS.contains("class=\"tool-name\""));
         assert!(APP_JS.contains("class=\"tool-brief\""));
@@ -1443,6 +1443,7 @@ mod tests {
         ));
         assert!(STYLE_CSS.contains(".tool-brief { min-width: 0; overflow: hidden;"));
         assert!(STYLE_CSS.contains("text-overflow: ellipsis; white-space: nowrap;"));
+        assert!(STYLE_CSS.contains(".tool-card.follows-tool { margin-top: -20px; }"));
     }
 
     #[test]
@@ -1737,13 +1738,17 @@ mod tests {
 
     #[test]
     fn streaming_assistant_updates_keep_the_stable_message_node() {
-        assert!(APP_JS.contains("function updateMessageNode(node, message, afterTool, index)"));
+        assert!(
+            APP_JS.contains(
+                "function updateMessageNode(node, message, afterTool, followsTool, index)"
+            )
+        );
         assert!(APP_JS.contains("if (message.kind === \"assistant\")"));
         assert!(
             APP_JS.contains("if (markdown.innerHTML !== rendered) markdown.innerHTML = rendered")
         );
         assert!(APP_JS.contains(
-            "if (current.meRenderRevision !== revision) updateMessageNode(current, message, afterTool, index)"
+            "if (current.meRenderRevision !== revision) updateMessageNode(current, message, afterTool, followsTool, index)"
         ));
         assert!(APP_JS.contains("viewport.scrollTop = viewport.scrollHeight"));
         assert!(

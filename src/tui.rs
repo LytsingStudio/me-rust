@@ -5647,6 +5647,9 @@ fn message_blocks_need_gap(previous: &ChatMessage, current: &ChatMessage) -> boo
     if previous.kind == ChatBlockKind::Assistant && current.kind == ChatBlockKind::TurnToolbar {
         return false;
     }
+    if previous.kind == ChatBlockKind::ToolCall && current.kind == ChatBlockKind::ToolCall {
+        return false;
+    }
     previous.kind != current.kind
         || (previous.kind == current.kind
             && matches!(
@@ -9911,6 +9914,26 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_tool_calls_are_compact_but_other_block_boundaries_keep_their_gap() {
+        let tool = ChatMessage {
+            kind: ChatBlockKind::ToolCall,
+            content: String::new(),
+            timestamp_ms: 1,
+            tool: None,
+        };
+        let notice = ChatMessage {
+            kind: ChatBlockKind::StateNotice,
+            content: "notice".into(),
+            timestamp_ms: 2,
+            tool: None,
+        };
+
+        assert!(!message_blocks_need_gap(&tool, &tool));
+        assert!(message_blocks_need_gap(&tool, &notice));
+        assert!(message_blocks_need_gap(&notice, &tool));
+    }
+
+    #[test]
     fn assistant_markdown_uses_agent_markdown_renderer() {
         let markdown = "# Heading\n\n**bold** and `inline code`\n\n| A | B |\n|---|---|";
         let projection = ChatProjection {
@@ -10216,7 +10239,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.tone == RowTone::Spacer)
                 .count(),
-            1
+            0
         );
         assert_eq!(
             collapsed
