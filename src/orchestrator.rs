@@ -43,7 +43,7 @@ use crate::{
 };
 
 pub const AVAILABLE_ORCHESTRATORS: &[&str] = &["main-agent", "manager-agent", "chatbot"];
-pub const API_RETRY_LIMIT: u8 = 10;
+pub const API_RETRY_LIMIT: u8 = 5;
 
 const EMPTY_MODEL_RESPONSE_ERROR: &str =
     "model completed without any assistant text characters or a valid tool call";
@@ -4072,12 +4072,6 @@ fn api_call_states(
             ));
         }
         if update.state == ApiState::Retrying {
-            if update.retry_limit != API_RETRY_LIMIT {
-                return Err(format!(
-                    "API call {} uses retry limit {}, expected {}",
-                    update.api_call_id, update.retry_limit, API_RETRY_LIMIT
-                ));
-            }
             if call.state != ApiState::Error {
                 return Err(format!(
                     "API call {} scheduled a retry from {}",
@@ -8334,7 +8328,8 @@ data: [DONE]
         runtime
             .submit_user_prompt("retry until exhausted".into())
             .unwrap();
-        wait_for_runtime_events(&mut runtime, 36);
+        let exhausted_event_count = 9 + usize::from(API_RETRY_LIMIT) * 3;
+        wait_for_runtime_events(&mut runtime, exhausted_event_count);
         server.join().unwrap();
         runtime.poll_edb().unwrap();
 
@@ -8363,7 +8358,10 @@ data: [DONE]
             event,
             Event::ApiStateUpdate(update)
                 if update.state == ApiState::Interrupted
-                    && update.detail.contains("retry limit exhausted")
+                    && update.detail.contains(&format!(
+                        "after {} attempts; retry limit exhausted",
+                        u16::from(API_RETRY_LIMIT) + 1
+                    ))
         )));
         assert!(matches!(
             latest_agent_turn(events).unwrap(),
@@ -8371,7 +8369,7 @@ data: [DONE]
         ));
 
         runtime.submit_effort_change("unset".into()).unwrap();
-        wait_for_runtime_events(&mut runtime, 37);
+        wait_for_runtime_events(&mut runtime, exhausted_event_count + 1);
     }
 
     #[test]
@@ -8797,7 +8795,7 @@ data: [DONE]
     }
 
     #[test]
-    fn rejects_missing_or_inconsistent_api_retry_metadata() {
+    fn accepts_historical_retry_limits_and_rejects_inconsistent_metadata() {
         let mut missing = EventDataBase::new();
         initialize_chatbot_for_test(&mut missing, "unset");
         let prompt_id = missing.append_user_prompt("hello").unwrap();
@@ -8821,14 +8819,37 @@ data: [DONE]
             .append_api_state(failed_call, prompt_id, ApiState::Error, "network")
             .unwrap();
         inconsistent
-            .append_api_retrying(failed_call, prompt_id, 1, API_RETRY_LIMIT - 1, "network")
+            .append_api_retrying(failed_call, prompt_id, 1, 10, "network")
+            .unwrap();
+        let next_call = inconsistent.append_api_requesting(prompt_id).unwrap();
+        inconsistent
+            .append_api_state(next_call, prompt_id, ApiState::Error, "network")
+            .unwrap();
+        inconsistent
+            .append_api_retrying(next_call, prompt_id, 2, 9, "network")
             .unwrap();
         assert!(
             Chatbot::new(None)
                 .supports_edb(&inconsistent)
                 .unwrap_err()
-                .contains("uses retry limit")
+                .contains("invalid retry")
         );
+
+        let mut historical = EventDataBase::new();
+        initialize_chatbot_for_test(&mut historical, "unset");
+        let prompt_id = historical.append_user_prompt("hello").unwrap();
+        let failed_call = historical.append_api_requesting(prompt_id).unwrap();
+        historical
+            .append_api_state(failed_call, prompt_id, ApiState::Error, "network")
+            .unwrap();
+        historical
+            .append_api_retrying(failed_call, prompt_id, 1, 10, "network")
+            .unwrap();
+        let next_call = historical.append_api_requesting(prompt_id).unwrap();
+        historical
+            .append_api_state(next_call, prompt_id, ApiState::Interrupted, "stopped")
+            .unwrap();
+        assert!(Chatbot::new(None).supports_edb(&historical).is_ok());
     }
 
     #[test]

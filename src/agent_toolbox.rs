@@ -2323,7 +2323,7 @@ mod tests {
                 api_call,
                 prompt,
                 ApiState::Interrupted,
-                "API request interrupted after 11 attempts: network unavailable",
+                "API request interrupted after 6 attempts: network unavailable",
             )
             .unwrap();
         api_failed
@@ -2349,7 +2349,7 @@ mod tests {
                 Vec::new(),
                 ToolSurface::Worker,
             )["error"],
-            "API request interrupted after 11 attempts: network unavailable"
+            "API request interrupted after 6 attempts: network unavailable"
         );
 
         let mut completed = EventDataBase::new();
