@@ -25,7 +25,23 @@ const DEVICE_AUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MODEL_SOURCE_URL: &str =
     "https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.6-sol";
 
-pub const MODEL_NAMES: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+const BASE_MODEL_NAMES: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+const LEGACY_MODEL_NAMES: [&str; 3] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+pub const MODEL_NAMES: [&str; 9] = [
+    "gpt-5.6-sol-272k",
+    "gpt-5.6-sol-512k",
+    "gpt-5.6-sol-1000k",
+    "gpt-5.6-terra-272k",
+    "gpt-5.6-terra-512k",
+    "gpt-5.6-terra-1000k",
+    "gpt-5.6-luna-272k",
+    "gpt-5.6-luna-512k",
+    "gpt-5.6-luna-1000k",
+];
+
+pub fn is_legacy_model_name(name: &str) -> bool {
+    LEGACY_MODEL_NAMES.contains(&name)
+}
 
 pub struct CodexRequestCredential {
     pub access_token: String,
@@ -145,9 +161,10 @@ fn add_models_if_logged_in_at(global: &mut GlobalConfig, path: &Path) -> Result<
     if !status_at(path)?.logged_in {
         return Ok(());
     }
-    global
-        .models
-        .retain(|model| !MODEL_NAMES.contains(&model.name.as_str()));
+    global.models.retain(|model| {
+        !MODEL_NAMES.contains(&model.name.as_str())
+            && !LEGACY_MODEL_NAMES.contains(&model.name.as_str())
+    });
     global.models.extend(model_configs(path.to_path_buf()));
     global.validate()
 }
@@ -333,45 +350,75 @@ fn status_at(path: &Path) -> Result<CodexStatus> {
 }
 
 fn model_configs(credential_file: PathBuf) -> Vec<ModelConfig> {
-    MODEL_NAMES
-        .into_iter()
-        .map(|name| {
-            let reasoning_efforts = if name == "gpt-5.6-luna" {
-                ["unset", "low", "medium", "high", "xhigh", "max"]
-                    .map(str::to_owned)
-                    .to_vec()
-            } else {
-                ["unset", "low", "medium", "high", "xhigh", "max", "ultra"]
-                    .map(str::to_owned)
-                    .to_vec()
-            };
-            ModelConfig {
-                name: name.to_owned(),
-                provider: ProviderType::CodexOauth,
-                reserve_output_context: true,
-                base_url: CODEX_BASE_URL.to_owned(),
-                endpoint: "/responses".to_owned(),
-                api_key: None,
-                api_key_env: None,
-                credential_file: Some(credential_file.to_string_lossy().into_owned()),
-                model: name.to_owned(),
-                source_url: Some(MODEL_SOURCE_URL.to_owned()),
-                timeout_seconds: 300,
-                capabilities: ModelCapabilities {
-                    context_window: 1_000_000,
-                    max_output_tokens: Some(128_000),
-                    input_modalities: vec!["text".into(), "image".into()],
-                    output_modalities: vec!["text".into()],
-                    reasoning_modes: Vec::new(),
-                    reasoning_efforts,
-                    tools: true,
-                    streaming: true,
-                },
-                parameters: toml::Table::new(),
-                effort_parameters: Default::default(),
-            }
-        })
-        .collect()
+    let mut models = Vec::with_capacity(MODEL_NAMES.len() + LEGACY_MODEL_NAMES.len());
+    for base_name in BASE_MODEL_NAMES {
+        for (suffix, context_window, reserve_output_context) in [
+            ("272k", 272_000, false),
+            ("512k", 512_000, false),
+            ("1000k", 1_000_000, true),
+        ] {
+            models.push(model_config(
+                format!("{base_name}-{suffix}"),
+                base_name,
+                context_window,
+                reserve_output_context,
+                &credential_file,
+            ));
+        }
+    }
+    for name in LEGACY_MODEL_NAMES {
+        models.push(model_config(
+            name.to_owned(),
+            name,
+            512_000,
+            false,
+            &credential_file,
+        ));
+    }
+    models
+}
+
+fn model_config(
+    name: String,
+    api_model: &str,
+    context_window: u64,
+    reserve_output_context: bool,
+    credential_file: &Path,
+) -> ModelConfig {
+    let reasoning_efforts = if api_model == "gpt-5.6-luna" {
+        ["unset", "low", "medium", "high", "xhigh", "max"]
+            .map(str::to_owned)
+            .to_vec()
+    } else {
+        ["unset", "low", "medium", "high", "xhigh", "max", "ultra"]
+            .map(str::to_owned)
+            .to_vec()
+    };
+    ModelConfig {
+        name,
+        provider: ProviderType::CodexOauth,
+        reserve_output_context,
+        base_url: CODEX_BASE_URL.to_owned(),
+        endpoint: "/responses".to_owned(),
+        api_key: None,
+        api_key_env: None,
+        credential_file: Some(credential_file.to_string_lossy().into_owned()),
+        model: api_model.to_owned(),
+        source_url: Some(MODEL_SOURCE_URL.to_owned()),
+        timeout_seconds: 300,
+        capabilities: ModelCapabilities {
+            context_window,
+            max_output_tokens: Some(128_000),
+            input_modalities: vec!["text".into(), "image".into()],
+            output_modalities: vec!["text".into()],
+            reasoning_modes: Vec::new(),
+            reasoning_efforts,
+            tools: true,
+            streaming: true,
+        },
+        parameters: toml::Table::new(),
+        effort_parameters: Default::default(),
+    }
 }
 
 fn oauth_client() -> Result<Client> {
@@ -747,23 +794,34 @@ mod tests {
         assert_eq!(
             models
                 .iter()
+                .filter(|model| !is_legacy_model_name(&model.name))
                 .map(|model| model.name.as_str())
                 .collect::<Vec<_>>(),
             MODEL_NAMES
         );
-        assert_eq!(models[0].capabilities.context_window, 1_000_000);
+        assert_eq!(models.len(), 12);
         assert!(
             models
                 .iter()
                 .all(|model| model.capabilities.max_output_tokens == Some(128_000))
         );
-        assert_eq!(models[2].capabilities.context_window, 1_000_000);
-        assert!(models.iter().all(|model| model.reserve_output_context));
-        assert!(
-            models
-                .iter()
-                .all(|model| model.output_token_reservation(Some("unset")) == 128_000)
-        );
+        for models in models[..9].chunks_exact(3) {
+            assert_eq!(models[0].capabilities.context_window, 272_000);
+            assert_eq!(models[1].capabilities.context_window, 512_000);
+            assert_eq!(models[2].capabilities.context_window, 1_000_000);
+            assert!(!models[0].reserve_output_context);
+            assert!(!models[1].reserve_output_context);
+            assert!(models[2].reserve_output_context);
+            assert_eq!(models[0].output_token_reservation(Some("unset")), 0);
+            assert_eq!(models[1].output_token_reservation(Some("unset")), 0);
+            assert_eq!(models[2].output_token_reservation(Some("unset")), 128_000);
+            assert!(models.iter().all(|model| model.model == models[0].model));
+        }
+        assert!(models[9..].iter().all(|model| {
+            is_legacy_model_name(&model.name)
+                && model.capabilities.context_window == 512_000
+                && !model.reserve_output_context
+        }));
         assert!(models.iter().all(|model| model.parameters.is_empty()));
         assert!(
             models[0]
@@ -772,7 +830,7 @@ mod tests {
                 .contains(&"ultra".to_owned())
         );
         assert!(
-            !models[2]
+            !models[6]
                 .capabilities
                 .reasoning_efforts
                 .contains(&"ultra".to_owned())
@@ -823,14 +881,19 @@ mod tests {
         };
 
         add_models_if_logged_in_at(&mut global, &path).unwrap();
-        assert_eq!(global.models.len(), 4);
+        assert_eq!(global.models.len(), 13);
         assert!(MODEL_NAMES.iter().all(|name| global.model(name).is_some()));
+        assert!(
+            LEGACY_MODEL_NAMES
+                .iter()
+                .all(|name| global.model(name).is_some())
+        );
         assert!(
             global
                 .models
                 .iter()
                 .filter(|model| model.provider == ProviderType::CodexOauth)
-                .all(|model| model.api_key.is_none() && model.reserve_output_context)
+                .all(|model| model.api_key.is_none())
         );
 
         fs::remove_dir_all(directory).unwrap();

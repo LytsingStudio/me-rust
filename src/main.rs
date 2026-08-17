@@ -518,6 +518,7 @@ fn list_models(global: &GlobalConfig, selected: Option<&str>) {
     let rows = global
         .models
         .iter()
+        .filter(|model| !codex_oauth::is_legacy_model_name(&model.name))
         .map(|model| {
             let marker = if Some(model.name.as_str()) == selected {
                 '●'

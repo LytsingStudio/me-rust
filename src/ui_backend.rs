@@ -241,6 +241,7 @@ pub fn workflow_ui_ports(workflow: Workflow) -> (WorkflowUiBackend, WorkflowUiCo
         workflow
             .model_configs()
             .iter()
+            .filter(|model| !crate::codex_oauth::is_legacy_model_name(&model.name))
             .map(|model| {
                 let mut output_token_reservations = BTreeMap::from([(
                     UNSET_EFFORT.to_owned(),
