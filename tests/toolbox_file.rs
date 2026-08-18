@@ -470,6 +470,14 @@ fn generated_file_toolbox_is_self_describing_while_stdin_remains_open() {
     let search_input = toolbox.query("getInputSchema", Some("Search"));
     assert_eq!(search_input["output"]["properties"]["depth"]["minimum"], 1);
     assert_eq!(search_input["output"]["properties"]["depth"]["maximum"], 32);
+    assert_eq!(
+        search_input["output"]["properties"]["context_before"]["maximum"],
+        10_000
+    );
+    assert_eq!(
+        search_input["output"]["properties"]["context_after"]["maximum"],
+        10_000
+    );
     assert!(
         search_input["output"]["properties"]["depth"]
             .get("default")
@@ -1939,6 +1947,55 @@ fn read_list_find_search_stat_and_bytes_have_stable_structured_results() {
     assert_eq!(padded_match["after"], json!({"11":"line 11"}));
     assert!(padded_match.get("line").is_none());
     assert!(padded_match.get("text").is_none());
+
+    toolbox.finish();
+    fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn search_accepts_ten_thousand_context_lines_on_each_side() {
+    let workspace = temporary_workspace();
+    let mut content = (1..=10_000)
+        .map(|number| format!("before {number}\n"))
+        .collect::<String>();
+    content.push_str("unique needle\n");
+    content.extend((1..=10_000).map(|number| format!("after {number}\n")));
+    fs::write(workspace.join("large-context.txt"), content).unwrap();
+
+    let script = generated_file_toolbox(&workspace);
+    let mut toolbox = ToolboxProcess::start(&workspace, &script);
+    let result = toolbox.execute(
+        "Search",
+        json!({
+            "path":"large-context.txt",
+            "query":"unique needle",
+            "context_before":10_000,
+            "context_after":10_000
+        }),
+    );
+    assert_eq!(
+        result["type"], "result",
+        "large context search failed: {result}"
+    );
+    let matched = &result["output"]["matches"][0];
+    assert_eq!(matched["before"].as_object().unwrap().len(), 10_000);
+    assert_eq!(matched["after"].as_object().unwrap().len(), 10_000);
+    assert_eq!(matched["before"]["00001"], "before 1");
+    assert_eq!(matched["match_text"]["10001"], "unique needle");
+    assert_eq!(matched["after"]["20001"], "after 10000");
+
+    let rejected = toolbox.execute(
+        "Search",
+        json!({"path":"large-context.txt", "query":"needle", "context_before":10_001}),
+    );
+    assert_eq!(rejected["type"], "error");
+    assert_eq!(rejected["error"]["code"], "invalid_arguments");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("0..=10000")
+    );
 
     toolbox.finish();
     fs::remove_dir_all(workspace).unwrap();

@@ -437,13 +437,13 @@ INPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "context_before": {
                 "type": "integer",
                 "minimum": 0,
-                "maximum": 20,
+                "maximum": 10000,
                 "default": 0,
             },
             "context_after": {
                 "type": "integer",
                 "minimum": 0,
-                "maximum": 20,
+                "maximum": 10000,
                 "default": 0,
             },
             "max_matches": {
@@ -1931,8 +1931,8 @@ def execute_search(data: dict[str, Any]) -> dict[str, Any]:
     case_sensitive = bool_arg(data, "case_sensitive", True)
     globs = string_list(data, "globs")
     depth = optional_int_arg(data, "depth", 1, 32)
-    context_before = int_arg(data, "context_before", 0, 0, 20)
-    context_after = int_arg(data, "context_after", 0, 0, 20)
+    context_before = int_arg(data, "context_before", 0, 0, 10000)
+    context_after = int_arg(data, "context_after", 0, 0, 10000)
     max_matches = int_arg(data, "max_matches", 500, 1, 5000)
     flags = 0 if case_sensitive else re.IGNORECASE
     try:
