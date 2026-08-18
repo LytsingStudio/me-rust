@@ -1,14 +1,20 @@
 (function (root, factory) {
   if (typeof module === "object" && module.exports) {
-    module.exports = factory(require("./vendor/markdown-it.min.js"));
+    module.exports = factory(
+      require("./vendor/markdown-it.min.js"),
+      require("./vendor/katex.min.js"),
+    );
   } else {
-    root.MeMarkdown = factory(root.markdownit);
+    root.MeMarkdown = factory(root.markdownit, root.katex);
   }
-}(typeof globalThis !== "undefined" ? globalThis : this, function (markdownitFactory) {
+}(typeof globalThis !== "undefined" ? globalThis : this, function (markdownitFactory, katexEngine) {
   "use strict";
 
   if (typeof markdownitFactory !== "function") {
     throw new Error("Markdown renderer is unavailable");
+  }
+  if (!katexEngine || typeof katexEngine.renderToString !== "function") {
+    throw new Error("LaTeX renderer is unavailable");
   }
 
   const parser = markdownitFactory({
@@ -17,6 +23,159 @@
     breaks: true,
     typographer: false,
   });
+
+  const KATEX_OPTIONS = Object.freeze({
+    throwOnError: true,
+    trust: false,
+    strict: "ignore",
+    output: "htmlAndMathml",
+    maxExpand: 1000,
+    maxSize: 500,
+  });
+
+  function escapeHtml(value) {
+    return parser.utils.escapeHtml(value);
+  }
+
+  function closingDelimiter(opening) {
+    if (opening === "\\(") return "\\)";
+    if (opening === "\\[") return "\\]";
+    return opening;
+  }
+
+  function renderMath(content, displayMode, opening) {
+    try {
+      const rendered = katexEngine.renderToString(content, {
+        ...KATEX_OPTIONS,
+        displayMode,
+      });
+      if (displayMode) {
+        return `<div class="math-display">${rendered}</div>\n`;
+      }
+      return `<span class="math-inline">${rendered}</span>`;
+    } catch (_error) {
+      const source = `${opening}${content}${closingDelimiter(opening)}`;
+      const tag = displayMode ? "div" : "span";
+      return `<${tag} class="math-error">${escapeHtml(source)}</${tag}>${displayMode ? "\n" : ""}`;
+    }
+  }
+
+  function findUnescaped(source, delimiter, from) {
+    for (let cursor = source.indexOf(delimiter, from); cursor >= 0; cursor = source.indexOf(delimiter, cursor + delimiter.length)) {
+      if (!isEscaped(source, cursor)) return cursor;
+    }
+    return -1;
+  }
+
+  function mathInlineRule(state, silent) {
+    const source = state.src;
+    const start = state.pos;
+    let opening = "";
+    let closing = "";
+
+    if (source[start] === "$" && source[start - 1] !== "$" && source[start + 1] !== "$" && !isEscaped(source, start)) {
+      opening = "$";
+      closing = "$";
+    } else if ((source.startsWith("\\(", start) || source.startsWith("\\[", start)) && !isEscaped(source, start)) {
+      opening = source.slice(start, start + 2);
+      closing = closingDelimiter(opening);
+    } else {
+      return false;
+    }
+
+    const contentStart = start + opening.length;
+    const end = findUnescaped(source, closing, contentStart);
+    if (end < 0) {
+      if (opening === "$") return false;
+      if (!silent) {
+        const token = state.push("text", "", 0);
+        token.content = source.slice(start);
+      }
+      state.pos = source.length;
+      return true;
+    }
+
+    const content = source.slice(contentStart, end);
+    if (!content || /^\s|\s$/u.test(content) || content.includes("\n")) return false;
+    if (opening === "$" && source[end + 1] === "$") return false;
+    if (opening === "$" && /^\d/u.test(content) && /(?:\s|\\\$|[;`])/u.test(content)) {
+      const previous = source[start - 1] || "";
+      const hasClearMathOperator = /[=+*/^_{}<>]/u.test(content);
+      if ((!previous || /[\s([{,:;]/u.test(previous)) && (!hasClearMathOperator || /(?:\\\$|[;`])/u.test(content))) {
+        return false;
+      }
+    }
+
+    if (!silent) {
+      const token = state.push("math_inline", "math", 0);
+      token.content = content;
+      token.markup = opening;
+    }
+    state.pos = end + closing.length;
+    return true;
+  }
+
+  function mathBlockRule(state, startLine, endLine, silent) {
+    const start = state.bMarks[startLine] + state.tShift[startLine];
+    const finish = state.eMarks[startLine];
+    const firstLine = state.src.slice(start, finish);
+    let opening = "";
+    let closing = "";
+    if (firstLine.startsWith("$$")) {
+      opening = "$$";
+      closing = "$$";
+    } else if (firstLine.startsWith("\\[")) {
+      opening = "\\[";
+      closing = "\\]";
+    } else {
+      return false;
+    }
+
+    if (silent) return true;
+    const firstContent = firstLine.slice(opening.length);
+    const sameLineEnd = findUnescaped(firstContent, closing, 0);
+    let content = "";
+    let nextLine = startLine + 1;
+
+    if (sameLineEnd >= 0) {
+      if (firstContent.slice(sameLineEnd + closing.length).trim()) return false;
+      content = firstContent.slice(0, sameLineEnd);
+    } else {
+      const lines = [firstContent];
+      let closed = false;
+      for (let line = startLine + 1; line < endLine; line += 1) {
+        const lineStart = state.bMarks[line] + state.tShift[line];
+        const lineEnd = state.eMarks[line];
+        const value = state.src.slice(lineStart, lineEnd);
+        const closingAt = findUnescaped(value, closing, 0);
+        if (closingAt >= 0) {
+          if (value.slice(closingAt + closing.length).trim()) return false;
+          lines.push(value.slice(0, closingAt));
+          nextLine = line + 1;
+          closed = true;
+          break;
+        }
+        lines.push(value);
+      }
+      if (!closed) return false;
+      content = lines.join("\n");
+    }
+
+    const token = state.push("math_block", "math", 0);
+    token.block = true;
+    token.content = content.trim();
+    token.markup = opening;
+    token.map = [startLine, nextLine];
+    state.line = nextLine;
+    return true;
+  }
+
+  parser.inline.ruler.before("escape", "math_inline", mathInlineRule);
+  parser.block.ruler.before("fence", "math_block", mathBlockRule, {
+    alt: ["paragraph", "reference", "blockquote", "list"],
+  });
+  parser.renderer.rules.math_inline = (tokens, index) => renderMath(tokens[index].content, false, tokens[index].markup);
+  parser.renderer.rules.math_block = (tokens, index) => renderMath(tokens[index].content, true, tokens[index].markup);
 
   const defaultLinkOpen = parser.renderer.rules.link_open
     || ((tokens, index, options, environment, renderer) => renderer.renderToken(tokens, index, options));
@@ -188,7 +347,7 @@
   }
 
   return Object.freeze({
-    engine: "markdown-it 15.0.0",
+    engine: "markdown-it 15.0.0 + KaTeX 0.16.22",
     render,
   });
 }));

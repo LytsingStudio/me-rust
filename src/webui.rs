@@ -31,7 +31,91 @@ const INDEX_HTML: &str = include_str!("webui/index.html");
 const APP_JS: &str = include_str!("webui/app.js");
 const MARKDOWN_JS: &str = include_str!("webui/markdown.js");
 const MARKDOWN_IT_JS: &str = include_str!("webui/vendor/markdown-it.min.js");
+const KATEX_JS: &str = include_str!("webui/vendor/katex.min.js");
+const KATEX_CSS: &str = include_str!("webui/vendor/katex.min.css");
 const STYLE_CSS: &str = include_str!("webui/style.css");
+const KATEX_FONTS: &[(&str, &[u8])] = &[
+    (
+        "/fonts/KaTeX_AMS-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_AMS-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Caligraphic-Bold.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Caligraphic-Bold.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Caligraphic-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Caligraphic-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Fraktur-Bold.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Fraktur-Bold.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Fraktur-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Fraktur-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Main-Bold.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Main-Bold.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Main-BoldItalic.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Main-BoldItalic.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Main-Italic.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Main-Italic.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Main-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Main-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Math-BoldItalic.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Math-BoldItalic.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Math-Italic.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Math-Italic.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_SansSerif-Bold.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_SansSerif-Bold.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_SansSerif-Italic.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_SansSerif-Italic.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_SansSerif-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_SansSerif-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Script-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Script-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Size1-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Size1-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Size2-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Size2-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Size3-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Size3-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Size4-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Size4-Regular.woff2"),
+    ),
+    (
+        "/fonts/KaTeX_Typewriter-Regular.woff2",
+        include_bytes!("webui/vendor/katex-fonts/KaTeX_Typewriter-Regular.woff2"),
+    ),
+];
 const MAX_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_EVENT_BATCH_BYTES: usize = 512 * 1024;
 const MAX_LOGIN_BYTES: usize = 4096;
@@ -405,6 +489,11 @@ fn route(
     auth: &WebAuth,
 ) -> Result<HttpResponse> {
     let (path, query) = split_url(request.url());
+    if request.method() == &Method::Get
+        && let Some((_, font)) = KATEX_FONTS.iter().find(|(font_path, _)| *font_path == path)
+    {
+        return Ok(bytes_response("font/woff2", font));
+    }
     match (request.method(), path) {
         (&Method::Get, "/") => {
             return Ok(text_response("text/html; charset=utf-8", INDEX_HTML));
@@ -420,6 +509,12 @@ fn route(
                 "text/javascript; charset=utf-8",
                 MARKDOWN_IT_JS,
             ));
+        }
+        (&Method::Get, "/katex.js") => {
+            return Ok(text_response("text/javascript; charset=utf-8", KATEX_JS));
+        }
+        (&Method::Get, "/katex.css") => {
+            return Ok(text_response("text/css; charset=utf-8", KATEX_CSS));
         }
         (&Method::Get, "/style.css") => {
             return Ok(text_response("text/css; charset=utf-8", STYLE_CSS));
@@ -1051,6 +1146,13 @@ fn text_response(content_type_value: &'static str, content: &'static str) -> Htt
         .with_header(no_store())
 }
 
+fn bytes_response(content_type_value: &'static str, content: &'static [u8]) -> HttpResponse {
+    Response::from_data(content.to_vec())
+        .with_status_code(StatusCode(200))
+        .with_header(content_type(content_type_value))
+        .with_header(no_store())
+}
+
 fn content_type(value: &'static str) -> Header {
     Header::from_bytes("Content-Type", value).expect("static Content-Type header is valid")
 }
@@ -1490,16 +1592,27 @@ mod tests {
     }
 
     #[test]
-    fn embedded_webui_uses_the_packaged_commonmark_renderer() {
+    fn embedded_webui_uses_packaged_commonmark_and_latex_renderers() {
         let engine = INDEX_HTML.find("/markdown-it.js").unwrap();
+        let latex = INDEX_HTML.find("/katex.js").unwrap();
         let adapter = INDEX_HTML.find("/markdown.js").unwrap();
         let application = INDEX_HTML.find("/app.js").unwrap();
-        assert!(engine < adapter && adapter < application);
+        let latex_style = INDEX_HTML.find("/katex.css").unwrap();
+        let application_style = INDEX_HTML.find("/style.css").unwrap();
+        assert!(engine < latex && latex < adapter && adapter < application);
+        assert!(latex_style < application_style);
         assert!(MARKDOWN_IT_JS.contains("markdownit=t()"));
-        assert!(MARKDOWN_JS.contains("markdown-it 15.0.0"));
+        assert!(KATEX_JS.contains("KaTeX"));
+        assert!(KATEX_CSS.contains("KaTeX_Main-Regular"));
+        assert_eq!(KATEX_FONTS.len(), 20);
+        assert!(MARKDOWN_JS.contains("markdown-it 15.0.0 + KaTeX 0.16.22"));
         assert!(MARKDOWN_JS.contains("html: false"));
         assert!(MARKDOWN_JS.contains("linkify: true"));
         assert!(MARKDOWN_JS.contains("breaks: true"));
+        assert!(MARKDOWN_JS.contains("trust: false"));
+        assert!(MARKDOWN_JS.contains("output: \"htmlAndMathml\""));
+        assert!(MARKDOWN_JS.contains("mathInlineRule"));
+        assert!(MARKDOWN_JS.contains("mathBlockRule"));
         assert!(MARKDOWN_JS.contains("task-list-item"));
         assert!(MARKDOWN_JS.contains("markdown-table-wrap"));
         assert!(MARKDOWN_JS.contains("function normalizeCjkEmphasis(source)"));
@@ -1509,6 +1622,8 @@ mod tests {
         assert!(!APP_JS.contains("function inlineMarkdown"));
         assert!(STYLE_CSS.contains(".markdown li::marker"));
         assert!(STYLE_CSS.contains(".markdown li.task-list-item.task-completed::before"));
+        assert!(STYLE_CSS.contains(".markdown .math-display"));
+        assert!(STYLE_CSS.contains("overflow-x: auto"));
     }
 
     #[test]
@@ -2533,6 +2648,33 @@ mod tests {
             .text()
             .unwrap();
         assert!(markdown_engine.contains("markdownit=t()"));
+        let latex_engine = reqwest::blocking::get(format!("{address}/katex.js"))
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(latex_engine.contains("KaTeX"));
+        let latex_style = reqwest::blocking::get(format!("{address}/katex.css"))
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(latex_style.contains("fonts/KaTeX_Main-Regular.woff2"));
+        let latex_font =
+            reqwest::blocking::get(format!("{address}/fonts/KaTeX_Main-Regular.woff2"))
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        assert_eq!(
+            latex_font
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .unwrap(),
+            "font/woff2"
+        );
+        assert!(latex_font.bytes().unwrap().len() > 10_000);
 
         let socket = address.strip_prefix("http://").unwrap().to_owned();
         drop(server);

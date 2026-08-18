@@ -136,9 +136,81 @@ describe("WebUI Markdown renderer", () => {
     }
   });
 
-  test("does not turn display-math-like text into unsafe HTML", () => {
+  test("renders common inline and display LaTeX delimiters", () => {
     const html = markdown.render("Inline $E = mc^2$\n\n$$\\sum_{i=1}^{n} i = n(n+1)/2$$");
-    expect(html).toContain("$E = mc^2$");
-    expect(html).toContain("$$\\sum_{i=1}^{n} i = n(n+1)/2$$");
+    expect(count(html, 'class="math-inline"')).toBe(1);
+    expect(count(html, 'class="math-display"')).toBe(1);
+    expect(count(html, 'class="katex-mathml"')).toBe(2);
+    expect(html).toContain('<annotation encoding="application/x-tex">E = mc^2</annotation>');
+
+    const alternate = markdown.render(String.raw`Inline \(x^2 + y^2\)
+
+\[\frac{-b \pm \sqrt{b^2-4ac}}{2a}\]`);
+    expect(count(alternate, 'class="math-inline"')).toBe(1);
+    expect(count(alternate, 'class="math-display"')).toBe(1);
+    expect(alternate).toContain("\\frac");
+  });
+
+  test("renders complex LaTeX in surrounding Markdown structures", () => {
+    const html = markdown.render(String.raw`- Euler: $e^{i\pi}+1=0$
+- Integral: $\int_0^1 x^2\,dx$
+
+| name | value |
+| --- | --- |
+| norm | $\lVert x\rVert_2$ |
+
+> $$
+> \begin{aligned}
+> a+b &= c \\
+> d-e &= f
+> \end{aligned}
+> $$
+
+$$\begin{bmatrix}a&b\\c&d\end{bmatrix}$$`);
+    expect(count(html, 'class="math-inline"')).toBe(3);
+    expect(count(html, 'class="math-display"')).toBe(2);
+    expect(html).toContain("<table>");
+    expect(html).toContain("<blockquote>");
+    expect(html).toContain("begin{aligned}");
+    expect(html).toContain("begin{bmatrix}");
+  });
+
+  test("keeps code currency escaped dollars and unfinished formulas literal", () => {
+    const source = "Price $5, then $10; escaped \\$20; code `$x^2$`.\n\n\\(x^2 + y^2";
+    const html = markdown.render(source);
+    expect(html).toContain("Price $5, then $10; escaped $20;");
+    expect(html).toContain("<code>$x^2$</code>");
+    expect(html).toContain("\\(x^2 + y^2");
+    expect(html).not.toContain('class="katex"');
+
+    const fenced = markdown.render("```tex\n$x^2$\n$$y^2$$\n```");
+    expect(fenced).toContain("$x^2$");
+    expect(fenced).not.toContain('class="katex"');
+  });
+
+  test("fails closed for invalid or untrusted LaTeX", () => {
+    const invalid = markdown.render(String.raw`$\definitelyUnknownCommand{x}$`);
+    expect(invalid).toContain('class="math-error"');
+    expect(invalid).toContain("\\definitelyUnknownCommand");
+    expect(invalid).not.toContain("<script");
+
+    const untrusted = markdown.render(String.raw`$\href{javascript:alert(1)}{click}$ $\htmlStyle{color:red}{x}$`);
+    expect(untrusted).not.toContain('href="javascript:');
+    expect(untrusted).not.toContain("style=\"color:red\"");
+  });
+
+  test("is deterministic and safe for every streamed LaTeX prefix", () => {
+    const source = String.raw`Before $\frac{a_1+b^2}{\sqrt{x}}$ then
+
+$$
+\sum_{i=1}^{n} i = \frac{n(n+1)}{2}
+$$`;
+    let prefix = "";
+    for (const character of source) {
+      prefix += character;
+      expect(() => markdown.render(prefix)).not.toThrow();
+      expect(markdown.render(prefix)).toBe(markdown.render(prefix));
+    }
+    expect(markdown.render(String.raw`\[\frac{1}{2}`)).toContain(String.raw`\[\frac{1}{2}`);
   });
 });

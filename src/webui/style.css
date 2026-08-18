@@ -257,6 +257,11 @@ button { color: inherit; }
 .markdown tbody tr:last-child td:first-child { border-bottom-left-radius: 8px; }.markdown tbody tr:last-child td:last-child { border-bottom-right-radius: 8px; }
 .markdown hr { border: 0; border-top: 1px solid var(--border-bright); }
 .markdown img { display: block; max-width: 100%; height: auto; margin: 12px 0; border-radius: 10px; }
+.markdown .math-inline { display: inline; color: inherit; }
+.markdown .math-display { max-width: 100%; margin: .9em 0; padding: .15em 0 .35em; overflow-x: auto; overflow-y: hidden; color: inherit; text-align: center; overscroll-behavior-inline: contain; }
+.markdown .math-display > .katex-display { min-width: max-content; margin: 0; }
+.markdown .katex { color: inherit; font-size: 1.03em; }
+.markdown .math-error { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px; background: rgb(0 0 0 / 60%); backdrop-filter: blur(5px); }
 .modal { width: min(560px, 100%); max-height: min(720px, 90vh); display: flex; flex-direction: column; border: 1px solid var(--border-bright); border-radius: 15px; background: #151820; box-shadow: var(--shadow); }
