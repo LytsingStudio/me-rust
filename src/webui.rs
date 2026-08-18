@@ -1389,12 +1389,19 @@ mod tests {
         assert!(STYLE_CSS.contains("body.mobile-sidebar-open .sidebar"));
         assert!(STYLE_CSS.contains("env(safe-area-inset-bottom)"));
         assert!(APP_JS.contains("const PORTRAIT_LAYOUT = matchMedia(\"(orientation: portrait)\")"));
-        assert!(APP_JS.contains(
-            "return event.key === \"Enter\" && !event.shiftKey && !PORTRAIT_LAYOUT.matches"
-        ));
-        assert!(APP_JS.contains("visible && enterSubmitsInCurrentLayout(event)"));
         assert!(APP_JS.contains("agent.title || agent.id"));
         assert!(APP_JS.contains("function toolIsChatVisible(name)"));
+    }
+
+    #[test]
+    fn embedded_webui_uses_multiline_enter_and_explicit_send_shortcuts_everywhere() {
+        assert!(INDEX_HTML.contains("Enter 换行 · Shift/Alt+Enter 发送"));
+        assert!(
+            APP_JS.contains("return event.key === \"Enter\" && (event.shiftKey || event.altKey)")
+        );
+        assert!(APP_JS.contains("visible && enterSubmitsPrompt(event)"));
+        assert!(APP_JS.contains("state.composing || event.isComposing || event.keyCode === 229"));
+        assert!(!APP_JS.contains("enterSubmitsInCurrentLayout"));
     }
 
     #[test]

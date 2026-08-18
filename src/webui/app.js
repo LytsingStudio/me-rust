@@ -2347,7 +2347,7 @@ function renderComposer() {
   elements.send.disabled = readOnly;
   elements.stop.disabled = !canStop;
   elements.input.placeholder = readOnly ? `${worker ? "Worker" : "子 Agent"} 对话只读 · ${childStateLabel(currentStore()?.events || [])}` : "发送消息，输入 / 查看命令";
-  elements.inputHint.textContent = worker ? "可调整模型、推理强度或停止当前任务" : readOnly ? "子 Agent 仅允许查看" : "Enter 发送 · Shift+Enter 换行 · Esc 中止/撤回/清空";
+  elements.inputHint.textContent = worker ? "可调整模型、推理强度或停止当前任务" : readOnly ? "子 Agent 仅允许查看" : "Enter 换行 · Shift/Alt+Enter 发送 · Esc 中止/撤回/清空";
   renderSlashMenu();
 }
 
@@ -3242,8 +3242,8 @@ elements.input.addEventListener("input", () => {
 });
 elements.input.addEventListener("compositionstart", beginInputComposition);
 elements.input.addEventListener("compositionend", endInputComposition);
-function enterSubmitsInCurrentLayout(event) {
-  return event.key === "Enter" && !event.shiftKey && !PORTRAIT_LAYOUT.matches;
+function enterSubmitsPrompt(event) {
+  return event.key === "Enter" && (event.shiftKey || event.altKey);
 }
 elements.input.addEventListener("keydown", (event) => {
   if (state.composing || event.isComposing || event.keyCode === 229) return;
@@ -3253,9 +3253,9 @@ elements.input.addEventListener("keydown", (event) => {
     event.preventDefault();
     state.slashIndex = (state.slashIndex + (event.key === "ArrowDown" ? 1 : -1) + matches.length) % matches.length;
     renderSlashMenu();
-  } else if (visible && enterSubmitsInCurrentLayout(event)) {
+  } else if (visible && enterSubmitsPrompt(event)) {
     event.preventDefault(); openSlashCommand(matches[state.slashIndex]?.[0]);
-  } else if (enterSubmitsInCurrentLayout(event)) {
+  } else if (enterSubmitsPrompt(event)) {
     event.preventDefault(); submitPrompt();
   } else if (event.key === "Escape") {
     event.preventDefault(); escapeAction();
