@@ -79,6 +79,13 @@ fn default_timeout() -> u64 {
 }
 
 impl ModelConfig {
+    pub fn request_api_key(&self) -> Result<Option<String>> {
+        if self.api_key.is_none() && self.api_key_env.is_none() && self.credential_file.is_none() {
+            return Ok(None);
+        }
+        self.api_key().map(Some)
+    }
+
     pub fn api_key(&self) -> Result<String> {
         if let Some(key) = self.api_key.as_deref().filter(|key| !key.is_empty()) {
             return Ok(key.to_owned());
@@ -507,6 +514,12 @@ mod tests {
         let config = default_global_config(&directory).unwrap();
 
         for model in config.models {
+            if model.name == "local-llama-server" {
+                assert!(!model.reserve_output_context);
+                assert_eq!(model.capabilities.max_output_tokens, None);
+                assert!(model.parameters.is_empty());
+                continue;
+            }
             assert!(
                 model.reserve_output_context,
                 "{} must explicitly reserve its configured output budget",
@@ -527,6 +540,20 @@ mod tests {
                 model.name
             );
         }
+    }
+
+    #[test]
+    fn built_in_local_llama_server_is_credentialless_and_unset_only() {
+        let directory = temporary_path("default-local-llama-server");
+        let config = default_global_config(&directory).unwrap();
+        let model = config.model("local-llama-server").unwrap();
+
+        assert_eq!(model.base_url, "http://39.108.58.109:8000/");
+        assert_eq!(model.endpoint, "/v1/chat/completions");
+        assert_eq!(model.model, "local");
+        assert_eq!(model.capabilities.context_window, 262_144);
+        assert_eq!(model.capabilities.reasoning_efforts, vec![UNSET_EFFORT]);
+        assert_eq!(model.request_api_key().unwrap(), None);
     }
 
     #[test]

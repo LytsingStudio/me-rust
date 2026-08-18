@@ -523,7 +523,8 @@ mod tests {
         assert!(!result.reset);
         assert!(!result.cancelled);
         let config = GlobalConfig::load(&result.config_file).unwrap();
-        assert_eq!(config.models.len(), 13);
+        assert_eq!(config.models.len(), 14);
+        assert!(config.model("local-llama-server").is_some());
         assert_eq!(config.default_model, "cometapi-deepseek-v4-flash");
 
         let auth = home.join("codex/auth.json");

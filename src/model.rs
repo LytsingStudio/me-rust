@@ -148,12 +148,11 @@ impl ModelApi {
         if self.model.provider == ProviderType::CodexOauth {
             return self.send_codex(body);
         }
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(self.model.api_key()?)
-            .json(&body)
-            .send()?;
+        let mut request = self.client.post(self.endpoint()).json(&body);
+        if let Some(api_key) = self.model.request_api_key()? {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send()?;
         if response.status().is_success() {
             return Ok(response);
         }
@@ -651,7 +650,12 @@ fn toml_table_to_json(table: &toml::Table) -> Result<Map<String, Value>> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     use crate::config::{ModelCapabilities, ProviderType};
 
@@ -720,6 +724,48 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn credentialless_openai_compatible_request_omits_authorization() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0_u8; 1024];
+                let count = stream.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(!headers.contains("\r\nauthorization:"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                )
+                .unwrap();
+        });
+
+        let mut configured = config();
+        configured.base_url = format!("http://{address}");
+        configured.endpoint = "/v1/chat/completions".into();
+        configured.api_key = None;
+        configured.api_key_env = None;
+        configured.credential_file = None;
+        let response = ModelApi::new(configured)
+            .unwrap()
+            .complete(&ModelContext::user("hello"), None)
+            .unwrap();
+
+        assert_eq!(response["ok"], true);
+        server.join().unwrap();
     }
 
     #[test]

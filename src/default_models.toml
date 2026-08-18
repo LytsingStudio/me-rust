@@ -168,3 +168,13 @@ timeout_seconds = 120
 capabilities = { context_window = 1048576, max_output_tokens = 131072, input_modalities = ["text", "image", "audio", "video"], output_modalities = ["text"], reasoning_modes = ["none", "thinking"], reasoning_efforts = ["none", "high"], tools = true, streaming = true }
 parameters = { max_completion_tokens = 131072 }
 effort_parameters = { none = { thinking = { type = "disabled" } }, high = { thinking = { type = "enabled" } } }
+
+[[models]]
+name = "local-llama-server"
+provider = "openai-compatible"
+reserve_output_context = false
+base_url = "http://39.108.58.109:8000/"
+endpoint = "/v1/chat/completions"
+model = "local"
+timeout_seconds = 120
+capabilities = { context_window = 262144, input_modalities = ["text"], output_modalities = ["text"], reasoning_modes = ["none"], reasoning_efforts = ["unset"], tools = true, streaming = true }
