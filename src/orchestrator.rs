@@ -3674,7 +3674,9 @@ fn validate_follow_up_prompts(edb: &EventDataBase) -> std::result::Result<(), St
 
         let mut api_calls_with_tools = BTreeMap::new();
         let mut open_tools = BTreeMap::new();
-        let mut turn_ended = false;
+        let mut has_agent_turn = false;
+        let mut explicit_turn_ended = false;
+        let mut legacy_turn_ended = false;
         for prior in edb
             .events()
             .iter()
@@ -3687,10 +3689,15 @@ fn validate_follow_up_prompts(edb: &EventDataBase) -> std::result::Result<(), St
                         follow_up.id, prompt.id
                     ));
                 }
+                Event::AgentTurn(turn) if turn.prompt_id == follow_up.prompt_id => {
+                    has_agent_turn = true;
+                    explicit_turn_ended |= turn.state.is_terminal();
+                }
                 Event::ApiStateUpdate(update) if update.prompt_id == follow_up.prompt_id => {
-                    turn_ended = match update.state {
+                    legacy_turn_ended = match update.state {
                         ApiState::Completed => {
-                            turn_ended || !api_calls_with_tools.contains_key(&update.api_call_id)
+                            legacy_turn_ended
+                                || !api_calls_with_tools.contains_key(&update.api_call_id)
                         }
                         ApiState::Error | ApiState::Interrupted => true,
                         ApiState::Requesting | ApiState::Streaming | ApiState::Retrying => false,
@@ -3706,6 +3713,11 @@ fn validate_follow_up_prompts(edb: &EventDataBase) -> std::result::Result<(), St
                 _ => {}
             }
         }
+        let turn_ended = if has_agent_turn {
+            explicit_turn_ended
+        } else {
+            legacy_turn_ended
+        };
         if turn_ended {
             return Err(format!(
                 "follow-up prompt {} appears after turn {} ended",
@@ -7134,6 +7146,90 @@ mod tests {
             .unwrap();
         edb.append_api_state(api_call_id, prompt_id, ApiState::Completed, "")
             .unwrap();
+        edb.append_follow_up_prompt(prompt_id, "too late").unwrap();
+
+        let error = agent.supports_edb(&edb).unwrap_err();
+        assert!(error.contains("after turn"));
+    }
+
+    #[test]
+    fn follow_up_after_completed_compact_remains_in_open_agent_turn() {
+        let mut edb = EventDataBase::new();
+        let agent = MainAgent::new(None);
+        initialize_main_for_test(&agent, &mut edb);
+        let prompt_id = edb.append_user_prompt("start a long task").unwrap();
+        edb.append_agent_turn(prompt_id, prompt_id, AgentTurnState::Started, "")
+            .unwrap();
+
+        let api_call_id = edb.append_api_requesting(prompt_id).unwrap();
+        edb.append_api_state(api_call_id, prompt_id, ApiState::Streaming, "")
+            .unwrap();
+        edb.append_assist_response(prompt_id, "", true).unwrap();
+        let compact_call = edb
+            .append_tool_call(
+                api_call_id,
+                prompt_id,
+                "provider-compact",
+                compact::TOOL_NAME,
+                "{}",
+            )
+            .unwrap();
+        edb.append_api_state(api_call_id, prompt_id, ApiState::Completed, "")
+            .unwrap();
+        edb.append_tool_result(compact_call, ToolResultState::Succeeded, None, "{}")
+            .unwrap();
+
+        let compact_id = edb
+            .append_compact_started(compact_call, prompt_id, CompactKind::WorkerSingleTurn)
+            .unwrap();
+        let compact_api = edb.append_api_requesting(prompt_id).unwrap();
+        edb.append_api_state(compact_api, prompt_id, ApiState::Streaming, "")
+            .unwrap();
+        edb.append_api_state(compact_api, prompt_id, ApiState::Completed, "")
+            .unwrap();
+        edb.append_compact_terminal(
+            compact_id,
+            CompactState::Completed,
+            "Summary:\ncontinue the open turn",
+            "",
+        )
+        .unwrap();
+
+        edb.append_follow_up_prompt(prompt_id, "also inspect the other branch")
+            .unwrap();
+        edb.append_agent_turn(
+            prompt_id,
+            prompt_id,
+            AgentTurnState::Completed,
+            "final answer completed",
+        )
+        .unwrap();
+
+        agent.supports_edb(&edb).unwrap();
+    }
+
+    #[test]
+    fn main_agent_rejects_follow_up_after_explicit_agent_turn_terminal() {
+        let mut edb = EventDataBase::new();
+        let agent = MainAgent::new(None);
+        initialize_main_for_test(&agent, &mut edb);
+        let prompt_id = edb.append_user_prompt("start").unwrap();
+        edb.append_agent_turn(prompt_id, prompt_id, AgentTurnState::Started, "")
+            .unwrap();
+        let api_call_id = edb.append_api_requesting(prompt_id).unwrap();
+        edb.append_api_state(api_call_id, prompt_id, ApiState::Streaming, "")
+            .unwrap();
+        edb.append_assist_response(prompt_id, "final", true)
+            .unwrap();
+        edb.append_api_state(api_call_id, prompt_id, ApiState::Completed, "")
+            .unwrap();
+        edb.append_agent_turn(
+            prompt_id,
+            prompt_id,
+            AgentTurnState::Completed,
+            "final answer completed",
+        )
+        .unwrap();
         edb.append_follow_up_prompt(prompt_id, "too late").unwrap();
 
         let error = agent.supports_edb(&edb).unwrap_err();
