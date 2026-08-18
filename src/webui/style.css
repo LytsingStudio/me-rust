@@ -72,7 +72,9 @@ button { color: inherit; }
 .agent-actions { width: 31px; height: 31px; margin-right: 5px; padding: 0 3px; border: 0; border-radius: 7px; background: transparent; color: var(--dim); cursor: pointer; font-weight: 800; line-height: 1; letter-spacing: 1px; }
 .agent-actions:hover, .agent-actions[aria-expanded="true"] { background: rgb(255 255 255 / 8%); color: var(--text); }
 .agent-dot { width: 9px; height: 9px; flex: 0 0 auto; border: 2px solid var(--muted); border-radius: 50%; }
-.agent-dot.active { border-color: var(--cyan); background: var(--cyan); box-shadow: 0 0 10px rgb(125 216 223 / 45%); }
+.agent-dot.active { border-color: var(--cyan); background: var(--cyan); box-shadow: 0 0 10px rgb(125 216 223 / 45%); animation: agent-dot-breathe 1.4s ease-in-out infinite; will-change: opacity; }
+@keyframes agent-dot-breathe { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .agent-dot.active { animation: none; } }
 .agent-label { flex: 1; min-width: 0; }
 .agent-label strong, .agent-label span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-label strong { font-size: 14px; }

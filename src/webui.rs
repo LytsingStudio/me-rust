@@ -1937,6 +1937,29 @@ mod tests {
     }
 
     #[test]
+    fn active_sidebar_agent_dot_breathes_without_javascript_animation() {
+        assert!(
+            APP_JS
+                .contains("row.querySelector(\".agent-dot\").classList.toggle(\"active\", active)")
+        );
+        assert_eq!(
+            APP_JS.matches("<span class=\"agent-dot\"></span>").count(),
+            1
+        );
+        assert!(
+            STYLE_CSS.contains(
+                ".agent-dot.active { border-color: var(--cyan); background: var(--cyan);"
+            )
+        );
+        assert!(STYLE_CSS.contains("animation: agent-dot-breathe 1.4s ease-in-out infinite"));
+        assert!(STYLE_CSS.contains("@keyframes agent-dot-breathe"));
+        assert!(STYLE_CSS.contains(
+            "@media (prefers-reduced-motion: reduce) { .agent-dot.active { animation: none; } }"
+        ));
+        assert!(!APP_JS.contains("agentDotAnimation"));
+    }
+
+    #[test]
     fn embedded_webui_projects_appended_events_incrementally() {
         assert!(APP_JS.contains("pendingRender: emptyRenderRequest()"));
         assert!(APP_JS.contains("projectedOrder: 0"));
