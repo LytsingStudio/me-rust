@@ -54,7 +54,7 @@ const TERMINAL_OBSERVE_ACTIVE_SESSIONS: &str = "__activeSessions";
 const TERMINAL_OBSERVE_FRAME: &str = "__terminalFrame";
 const TERMINAL_OBSERVE_BACKEND: &str = "__terminalBackend";
 const WEB_BROWSER_OBSERVE_ACTIVE_PAGES: &str = "__activePages";
-const TERMINAL_OBSERVER_TIMEOUT: Duration = Duration::from_millis(250);
+const TERMINAL_OBSERVER_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug)]
 pub struct ToolboxTool {
@@ -2871,6 +2871,7 @@ for line in sys.stdin:
 
     #[test]
     fn terminal_observer_worker_handles_sustained_preview_polling_in_order() {
+        assert_eq!(TERMINAL_OBSERVER_TIMEOUT, Duration::from_secs(3));
         let workspace = temporary_workspace("terminal-observer-polling");
         let input = (1_u64..=512)
             .map(|id| {
