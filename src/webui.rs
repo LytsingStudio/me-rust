@@ -1496,12 +1496,16 @@ mod tests {
     }
 
     #[test]
-    fn embedded_webui_uses_multiline_enter_and_explicit_send_shortcuts_everywhere() {
+    fn embedded_webui_offers_a_cookie_backed_send_shortcut_preference() {
         assert!(INDEX_HTML.contains("Enter 换行 · Shift/Alt+Enter 发送"));
+        assert!(APP_JS.contains("const SEND_SHORTCUT_COOKIE = \"me_send_shortcut\""));
+        assert!(APP_JS.contains("Max-Age=31536000; Path=/; SameSite=Lax"));
+        assert!(APP_JS.contains("openChoiceDrawer(\"发送设置\""));
         assert!(
-            APP_JS.contains("return event.key === \"Enter\" && (event.shiftKey || event.altKey)")
+            APP_JS.contains("elements.send.addEventListener(\"click\", submitOrOpenSendSettings)")
         );
         assert!(APP_JS.contains("visible && enterSubmitsPrompt(event)"));
+        assert!(APP_JS.contains("sendShortcutPressed(event, state.sendShortcut)"));
         assert!(APP_JS.contains("state.composing || event.isComposing || event.keyCode === 229"));
         assert!(!APP_JS.contains("enterSubmitsInCurrentLayout"));
     }

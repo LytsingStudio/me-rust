@@ -6,6 +6,9 @@ const HTTP_SYNC_TIMEOUT_MS = 15000;
 const RECONNECT_MAX_MS = 5000;
 const INPUT_ANIMATION_QUIET_MS = 250;
 const TRANSCRIPT_BOTTOM_THRESHOLD_PX = 24;
+const SEND_SHORTCUT_COOKIE = "me_send_shortcut";
+const SEND_SHORTCUT_ENTER = "enter";
+const SEND_SHORTCUT_MODIFIED_ENTER = "modified-enter";
 const API_ACTIVE = new Set(["Requesting", "Streaming", "Retrying"]);
 const API_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const COMMANDS = [
@@ -42,6 +45,7 @@ const state = {
   apiAnimationTick: 0,
   lastInputAt: Number.NEGATIVE_INFINITY,
   composing: false,
+  sendShortcut: readSendShortcutCookie(typeof document.cookie === "string" ? document.cookie : ""),
   slashIndex: 0,
   userMenu: null,
   agentMenu: null,
@@ -154,6 +158,41 @@ function eventParts(event) {
 function replaceElementChildren(element, ...children) {
   while (element.firstChild) element.removeChild(element.firstChild);
   for (const child of children) element.appendChild(child);
+}
+
+function normalizeSendShortcut(value) {
+  return value === SEND_SHORTCUT_ENTER ? SEND_SHORTCUT_ENTER : SEND_SHORTCUT_MODIFIED_ENTER;
+}
+
+function readSendShortcutCookie(cookieHeader) {
+  const prefix = `${SEND_SHORTCUT_COOKIE}=`;
+  for (const part of String(cookieHeader || "").split(";")) {
+    const cookie = part.trim();
+    if (!cookie.startsWith(prefix)) continue;
+    try { return normalizeSendShortcut(decodeURIComponent(cookie.slice(prefix.length))); }
+    catch (_) { return SEND_SHORTCUT_MODIFIED_ENTER; }
+  }
+  return SEND_SHORTCUT_MODIFIED_ENTER;
+}
+
+function setSendShortcut(value) {
+  state.sendShortcut = normalizeSendShortcut(value);
+  document.cookie = `${SEND_SHORTCUT_COOKIE}=${encodeURIComponent(state.sendShortcut)}; Max-Age=31536000; Path=/; SameSite=Lax`;
+  renderComposer();
+  elements.input.focus();
+}
+
+function sendShortcutHint() {
+  return state.sendShortcut === SEND_SHORTCUT_ENTER
+    ? "Enter 发送 · Shift/Alt+Enter 换行"
+    : "Enter 换行 · Shift/Alt+Enter 发送";
+}
+
+function sendShortcutPressed(event, mode) {
+  if (event.key !== "Enter" || event.ctrlKey || event.metaKey) return false;
+  return normalizeSendShortcut(mode) === SEND_SHORTCUT_ENTER
+    ? !event.shiftKey && !event.altKey
+    : event.shiftKey || event.altKey;
 }
 
 function agentMeta() {
@@ -2347,7 +2386,7 @@ function renderComposer() {
   elements.send.disabled = readOnly;
   elements.stop.disabled = !canStop;
   elements.input.placeholder = readOnly ? `${worker ? "Worker" : "子 Agent"} 对话只读 · ${childStateLabel(currentStore()?.events || [])}` : "发送消息，输入 / 查看命令";
-  elements.inputHint.textContent = worker ? "可调整模型、推理强度或停止当前任务" : readOnly ? "子 Agent 仅允许查看" : "Enter 换行 · Shift/Alt+Enter 发送 · Esc 中止/撤回/清空";
+  elements.inputHint.textContent = worker ? "可调整模型、推理强度或停止当前任务" : readOnly ? "子 Agent 仅允许查看" : `${sendShortcutHint()} · Esc 中止/撤回/清空`;
   renderSlashMenu();
 }
 
@@ -2891,6 +2930,21 @@ async function submitPrompt() {
   }
 }
 
+function openSendSettings() {
+  openChoiceDrawer("发送设置", "选择键盘发送方式。", [
+    { value: SEND_SHORTCUT_ENTER, label: "Enter 发送", detail: "Shift/Alt+Enter 换行" },
+    { value: SEND_SHORTCUT_MODIFIED_ENTER, label: "Shift/Alt+Enter 发送", detail: "Enter 换行" },
+  ], state.sendShortcut, async (value) => setSendShortcut(value));
+}
+
+function submitOrOpenSendSettings() {
+  if (!elements.input.value.trim()) {
+    openSendSettings();
+    return;
+  }
+  void submitPrompt();
+}
+
 async function stopGeneration() {
   if (!state.selectedAgent || !canControlRuntime()) return;
   if (currentProjection().turnState?.state !== "active") return;
@@ -3231,7 +3285,7 @@ elements.deleteUserTurn.addEventListener("click", () => {
   }), true);
 });
 elements.stop.addEventListener("click", stopGeneration);
-elements.send.addEventListener("click", submitPrompt);
+elements.send.addEventListener("click", submitOrOpenSendSettings);
 elements.scrollToBottom.addEventListener("click", scrollTranscriptToBottomAfterLayout);
 elements.statusModelTrigger.addEventListener("click", openModelDrawer);
 elements.statusEffortTrigger.addEventListener("click", openEffortDrawer);
@@ -3243,7 +3297,7 @@ elements.input.addEventListener("input", () => {
 elements.input.addEventListener("compositionstart", beginInputComposition);
 elements.input.addEventListener("compositionend", endInputComposition);
 function enterSubmitsPrompt(event) {
-  return event.key === "Enter" && (event.shiftKey || event.altKey);
+  return sendShortcutPressed(event, state.sendShortcut);
 }
 elements.input.addEventListener("keydown", (event) => {
   if (state.composing || event.isComposing || event.keyCode === 229) return;

@@ -1,0 +1,52 @@
+"use strict";
+
+const { describe, expect, test } = require("bun:test");
+const { readFileSync } = require("node:fs");
+const { join } = require("node:path");
+
+function loadSendShortcutRuntime(cookie = "") {
+  const source = readFileSync(join(import.meta.dir, "../src/webui/app.js"), "utf8");
+  const eventBindings = source.indexOf("\nelements.tabs.querySelectorAll");
+  if (eventBindings < 0) throw new Error("could not isolate WebUI send shortcut runtime");
+  const factory = new Function("document", "performance", "matchMedia", `${source.slice(0, eventBindings)}
+    return { state, readSendShortcutCookie, sendShortcutHint, sendShortcutPressed };`);
+  const input = { value: "", style: {}, scrollHeight: 0 };
+  return factory(
+    { cookie, querySelector: (selector) => selector === "#prompt-input" ? input : null },
+    { now: () => 0 },
+    () => ({ matches: false, addEventListener: () => {} }),
+  );
+}
+
+function key(overrides = {}) {
+  return { key: "Enter", shiftKey: false, altKey: false, ctrlKey: false, metaKey: false, ...overrides };
+}
+
+describe("WebUI browser-local send shortcut preference", () => {
+  test("the default keeps plain Enter multiline and modifiers submit", () => {
+    const { state, sendShortcutHint, sendShortcutPressed } = loadSendShortcutRuntime();
+    expect(state.sendShortcut).toBe("modified-enter");
+    expect(sendShortcutHint()).toBe("Enter 换行 · Shift/Alt+Enter 发送");
+    expect(sendShortcutPressed(key(), state.sendShortcut)).toBe(false);
+    expect(sendShortcutPressed(key({ shiftKey: true }), state.sendShortcut)).toBe(true);
+    expect(sendShortcutPressed(key({ altKey: true }), state.sendShortcut)).toBe(true);
+  });
+
+  test("the cookie can make plain Enter submit and modifiers multiline", () => {
+    const runtime = loadSendShortcutRuntime("other=value; me_send_shortcut=enter; session=opaque");
+    expect(runtime.state.sendShortcut).toBe("enter");
+    expect(runtime.sendShortcutHint()).toBe("Enter 发送 · Shift/Alt+Enter 换行");
+    expect(runtime.sendShortcutPressed(key(), "enter")).toBe(true);
+    expect(runtime.sendShortcutPressed(key({ shiftKey: true }), "enter")).toBe(false);
+    expect(runtime.sendShortcutPressed(key({ altKey: true }), "enter")).toBe(false);
+  });
+
+  test("unknown cookies fall back safely and control/meta chords never submit", () => {
+    const runtime = loadSendShortcutRuntime("me_send_shortcut=unknown");
+    expect(runtime.state.sendShortcut).toBe("modified-enter");
+    expect(runtime.readSendShortcutCookie("me_send_shortcut=%E0%A4%A")).toBe("modified-enter");
+    expect(runtime.sendShortcutPressed(key({ ctrlKey: true, shiftKey: true }), "modified-enter")).toBe(false);
+    expect(runtime.sendShortcutPressed(key({ metaKey: true }), "enter")).toBe(false);
+    expect(runtime.sendShortcutPressed({ ...key(), key: "a" }, "enter")).toBe(false);
+  });
+});
